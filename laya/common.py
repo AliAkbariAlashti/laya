@@ -142,6 +142,7 @@ def build_sequence(
     truncate_left: bool = False,
     state_ids: Optional[List[int]] = None,
     return_stats: bool = False,
+    return_truncation_stats: bool = False,
 ):
     """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP].
 
@@ -151,6 +152,19 @@ def build_sequence(
     `return_stats` adds a third return value describing what the head budget did to the options:
     `options` (how many the question defines), `options_distinct` (how many still have a token
     span of their own) and `tokens_per_option` (the cap applied to each, or None when none was).
+
+    The state is clamped to whatever room is left after the head, so a long state loses tokens
+    here silently. `return_truncation_stats=True` adds one more return value, after the option
+    stats when both are asked for, reporting that clamp:
+
+        {"state_tokens": int, "state_tokens_used": int, "state_tokens_dropped": int,
+         "truncated": bool}
+
+    Callers cannot reconstruct this from the outside. The budget is in tokens, not characters,
+    and the room left for the state depends on `max_len`, `head_max_len`, the instruction and
+    the rendered options - so it moves per checkpoint and per question. A caller guessing with a
+    fixed character threshold is wrong in both directions: it reports truncation that did not
+    happen, and stays silent while evidence is being dropped (issue #174).
     """
     mask_tok = tok.mask_token
     opts = render_options(q)
@@ -192,19 +206,28 @@ def build_sequence(
     st = state_ids[max(0, len(state_ids) - room):] if truncate_left else state_ids[:room]
     ids = ids + st + [tok.sep_token_id]
     ids, markers = ids[:max_len], [m for m in markers if m < max_len]
+    extra = ()
+    if return_truncation_stats:
+        # `room` leaves space for the closing [SEP], so every token in `st` survives the [:max_len] clamp
+        extra = ({
+            "state_tokens": len(state_ids),
+            "state_tokens_used": len(st),
+            "state_tokens_dropped": len(state_ids) - len(st),
+            "truncated": len(st) < len(state_ids),
+        },)
     if not return_stats:
-        return ids, markers
+        return (ids, markers) + extra
     # Two options that share a prefix can come out of the cut as the same token span: the marker
     # count still matches the option count, so the guard in `Agent._encode_state` passes and
     # nothing downstream can tell that the question lost the ability to name them apart. Counted
     # on the capped option ids, before assembly: re-slicing the finished sequence cannot close
     # the last option's span -- it runs on into the serialized state, which differs per request,
     # so the last option always looks distinguishable however it collided (#538).
-    return ids, markers, {
+    return (ids, markers, {
         "options": len(opt_ids),
         "options_distinct": len({tuple(o) for o in opt_ids}),
         "tokens_per_option": per_option,
-    }
+    }) + extra
 
 
 def collapsed_options(qids, items) -> Dict[str, Dict[str, Optional[int]]]:
