@@ -12,8 +12,8 @@ a stable tool interface. Both use Laya's `Router` to select a checkpoint and ret
 `choice`, `score`, and `noul` decisions; neither is an open-ended question-answering or text
 generation interface.
 
-For the routing decision itself, see the [Routing guide](https://github.com/NandhaKishorM/laya/blob/main/docs/routing.md).
-For question shapes, answer fields, confidence, and presets, see [Questions and answers](https://github.com/NandhaKishorM/laya/blob/main/docs/questions-and-answers.md).
+For the routing decision and typed-question examples, see the README's [Route Mode quickstart](https://github.com/NandhaKishorM/laya#quickstart-route-mode-recommended).
+For confidence and built-in workflows, see the README's [confidence gating](https://github.com/NandhaKishorM/laya#automated-confidence-gating) and [workflow presets](https://github.com/NandhaKishorM/laya#built-in-workflow-presets).
 
 ## 1. Command line
 
@@ -59,7 +59,7 @@ with its choice probability, score, or `noul` value, plus the routing decision.
 The main controls are:
 
 - `--model english|multilingual|typed-decisions` pins a checkpoint instead of auto-routing.
-- `--lang en|de|...` forces language detection and the checkpoint's language setting.
+- `--lang en|de|...` supplies an explicit language code instead of automatic detection.
 - `--task NAME` forces the typed-decisions workflow instead of detecting one.
 - `--device cpu|cuda|...` passes a device choice to the Router.
 - `--json` emits machine-readable output.
