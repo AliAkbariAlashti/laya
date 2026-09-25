@@ -49,9 +49,7 @@ SKIP_DIRS = {".git", ".github", ".cache", ".venv", "site", "__pycache__", "node_
 # Documented elsewhere already, by a pull request that has not merged. Each entry has to
 # stay *undocumented* to remain valid, so the row retires itself the moment the page lands
 # and cannot become a permanent hole in the sweep.
-DEFERRED = {
-    "LAYA_SHA256_DIGESTS": "#528 (docs(security)) documents digest verification",
-}
+DEFERRED: dict = {}
 
 
 def check(what: str, got: object, want: object) -> None:
