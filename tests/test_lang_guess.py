@@ -181,6 +181,12 @@ for label, s, want in BEFORE:
 # checkpoint (ModernBERT-large, 50k English BPE) has no Devanagari tokens, so any
 # state written in Hindi must reach the multilingual checkpoint. These cases cover
 # the four main customer-support scenarios: billing, technical, account and cancellation.
+#
+# NOTE on future disambiguation: both Hindi and Marathi use Devanagari (U+0900-U+097F).
+# Script detection routes by Unicode block, so it cannot distinguish between languages
+# sharing the same script. Both currently route to `multilingual`. If a future language-specific
+# checkpoint is added (e.g. a dedicated Hindi or Marathi model), these tests would need to
+# assert the specific checkpoint name rather than the generic `multilingual` bucket.
 
 HINDI_CASES = [
     # billing & payment
@@ -222,13 +228,24 @@ HINDI_CASES = [
 for label, text, want in HINDI_CASES:
     check(label, r0.route(text, GENERIC)["model"], want)
 
-# lang_guess codes for Hindi
-check("hindi/lang_guess hi routes multilingual",
-      r0.route("मुझे मदद चाहिए।", GENERIC, lang_guess="hi")["model"], "multilingual")
-check("hindi/lang_guess hi-IN routes multilingual",
-      r0.route("मुझे मदद चाहिए।", GENERIC, lang_guess="hi-IN")["model"], "multilingual")
+# lang_guess codes for Hindi: assert model and that detection is None (showing the hint
+# was decisive and bypassed built-in script detection).
+# We test with English text where lang_guess="hi" forces multilingual routing;
+# if lang_guess were ignored, plain English would route to english.
+d_hi_dev = r0.route("मुझे मदद चाहिए।", GENERIC, lang_guess="hi")
+check("hindi/lang_guess hi routes multilingual on devanagari", d_hi_dev["model"], "multilingual")
+check_true("hindi/lang_guess hi bypasses detection (detection is None)", d_hi_dev["detection"] is None)
+check_true("hindi/lang_guess hi recorded in reason", "lang_guess" in d_hi_dev["reason"])
 
-# script is reported correctly
+d_hi_en = r0.route("I need help with my account billing.", GENERIC, lang_guess="hi")
+check("hindi/lang_guess hi overrides English text to multilingual", d_hi_en["model"], "multilingual")
+check_true("hindi/lang_guess hi on English sets detection to None", d_hi_en["detection"] is None)
+
+d_hi_in = r0.route("I need help with my account billing.", GENERIC, lang_guess="hi-IN")
+check("hindi/lang_guess hi-IN routes multilingual", d_hi_in["model"], "multilingual")
+check_true("hindi/lang_guess hi-IN sets detection to None", d_hi_in["detection"] is None)
+
+# script is reported correctly for native Devanagari text (no lang_guess needed)
 check("hindi/script detected as devanagari",
       r0.route("यह एक हिंदी वाक्य है।", GENERIC)["detection"]["script"], "devanagari")
 
@@ -237,12 +254,28 @@ check("hindi/mixed Hindi-English dict reaches multilingual",
       r0.route({"subject": "Payment issue", "body": "मेरा भुगतान विफल हो गया।"}, GENERIC)["model"],
       "multilingual")
 
+# script detection is not length-weighted: a long English subject must not outvote
+# a short Devanagari body field.
+check("hindi/long English field does not outvote short Hindi field",
+      r0.route(
+          {"subject": ("We have been experiencing persistent difficulties with our account billing "
+                       "over the past several months and need urgent support from customer care."),
+           "body": "कृपया मेरा भुगतान वापस करें।"},
+          GENERIC)["model"],
+      "multilingual")
+
 
 # ------------------------------------------------------------------ Marathi (Devanagari script)
 # Marathi shares Devanagari with Hindi (same Unicode block, U+0900-U+097F) but is a
 # distinct language spoken by ~90 million people. Routing must reach multilingual for
 # both -- any regression sending Devanagari to the English checkpoint collapses
 # accuracy to near-random (measured at 0.100 on Hindi on MASSIVE at 20 options).
+#
+# NOTE on future disambiguation: both Hindi and Marathi use Devanagari (U+0900-U+097F).
+# Script detection routes by Unicode block, so it cannot distinguish between languages
+# sharing the same script. Both currently route to `multilingual`. If a future language-specific
+# checkpoint is added (e.g. a dedicated Hindi or Marathi model), these tests would need to
+# assert the specific checkpoint name rather than the generic `multilingual` bucket.
 
 MARATHI_CASES = [
     # billing & payment
@@ -255,11 +288,11 @@ MARATHI_CASES = [
     ("marathi/invoice not received",
      "मला एप्रिल महिन्याचे बिल अजून मिळाले नाही, कृपया पाठवा.",
      "multilingual"),
-    # technical support
-    ("marathi/app crash on open",
-     "अॅप्लिकेशन उघडत नाही, प्रत्येक वेळी बंद होते, कृपया लवकर सोडवा.",
+    # technical support (scenarios mirror Hindi exactly)
+    ("marathi/app crash on settings",
+     "अॅप्लिकेशन सेटिंग उघडताना प्रत्येक वेळी बंद होते, कृपया लवकर सोडवा.",
      "multilingual"),
-    ("marathi/login error",
+    ("marathi/login failure",
      "मी माझ्या खात्यात लॉग इन करू शकत नाही, पासवर्ड बरोबर असूनही चूक येते.",
      "multilingual"),
     ("marathi/OTP not received",
@@ -284,11 +317,19 @@ MARATHI_CASES = [
 for label, text, want in MARATHI_CASES:
     check(label, r0.route(text, GENERIC)["model"], want)
 
-# lang_guess codes for Marathi
-check("marathi/lang_guess mr routes multilingual",
-      r0.route("मला मदत हवी आहे.", GENERIC, lang_guess="mr")["model"], "multilingual")
-check("marathi/lang_guess mr-IN routes multilingual",
-      r0.route("मला मदत हवी आहे.", GENERIC, lang_guess="mr-IN")["model"], "multilingual")
+# lang_guess codes for Marathi: assert model and detection is None
+d_mr_dev = r0.route("मला मदत हवी आहे.", GENERIC, lang_guess="mr")
+check("marathi/lang_guess mr routes multilingual on devanagari", d_mr_dev["model"], "multilingual")
+check_true("marathi/lang_guess mr bypasses detection (detection is None)", d_mr_dev["detection"] is None)
+check_true("marathi/lang_guess mr recorded in reason", "lang_guess" in d_mr_dev["reason"])
+
+d_mr_en = r0.route("I need help with my account billing.", GENERIC, lang_guess="mr")
+check("marathi/lang_guess mr overrides English text to multilingual", d_mr_en["model"], "multilingual")
+check_true("marathi/lang_guess mr on English sets detection to None", d_mr_en["detection"] is None)
+
+d_mr_in = r0.route("I need help with my account billing.", GENERIC, lang_guess="mr-IN")
+check("marathi/lang_guess mr-IN routes multilingual", d_mr_in["model"], "multilingual")
+check_true("marathi/lang_guess mr-IN sets detection to None", d_mr_in["detection"] is None)
 
 # script is reported correctly for Marathi too
 check("marathi/script detected as devanagari",
@@ -297,6 +338,15 @@ check("marathi/script detected as devanagari",
 # one Marathi field in a mixed dict reaches multilingual
 check("marathi/mixed Marathi-English dict reaches multilingual",
       r0.route({"subject": "Billing problem", "body": "मला दोनदा शुल्क आकारले गेले."}, GENERIC)["model"],
+      "multilingual")
+
+# long English field must not outvote short Marathi field (mirrors the Hindi case above)
+check("marathi/long English field does not outvote short Marathi field",
+      r0.route(
+          {"subject": ("We have been experiencing persistent difficulties with our account billing "
+                       "over the past several months and need urgent support from customer care."),
+           "body": "कृपया माझे पैसे परत करा."},
+          GENERIC)["model"],
       "multilingual")
 
 
