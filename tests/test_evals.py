@@ -3,6 +3,7 @@
 Run: python -m pytest tests/test_evals.py -q
 """
 import json
+import re
 
 import pytest
 
@@ -34,6 +35,10 @@ def choice_answer(label, confidence=0.9):
 
 def noul_answer(prob):
     return {"type": "noul", "noul": prob, "confidence": max(prob, 1 - prob)}
+
+
+def score_answer(value, confidence=0.8):
+    return {"type": "score", "score": value, "confidence": confidence}
 
 
 class StubRunner:
@@ -229,3 +234,145 @@ def test_cli_rejects_a_malformed_tolerance():
 
     with pytest.raises(EvalError):
         evals_cli._parse_pairs(["choice_accuracy"])
+
+
+# ------------------------------------------------------------------ CLI run
+# One score row inside 0.25 of its label, one 0.3 away (inside 0.5 but not 0.25), plus a choice and
+# an noul row so every default metric is in the report too.
+RUN_ROWS = [
+    {"state": "near", "questions": QSCORE, "expected": {"quality": 4}},
+    {"state": "far", "questions": QSCORE, "expected": {"quality": 4}},
+    {"state": "intent", "questions": Q, "expected": {"intent": "a"}},
+    {"state": "flag", "questions": QNOUL, "expected": {"flag": True}},
+]
+RUN_ANSWERS = {
+    "near": {"quality": score_answer(4.0)},
+    "far": {"quality": score_answer(3.7)},
+    "intent": {"intent": choice_answer("a")},
+    "flag": {"flag": noul_answer(0.9)},
+}
+
+
+def _patch_router(monkeypatch, answers=None):
+    """Replace the checkpoint-loading `Router`, so `laya-evals run` needs no weights.
+
+    Returns the list the stand-in appends to when it is constructed, so a test can show a bad flag
+    fails before anything loads.
+    """
+    import laya
+
+    built: list = []
+
+    class FakeRouter:
+        def __init__(self, device=None, preload=False):
+            built.append(device)
+
+        def predict(self, state, questions, model=None):
+            return {"model": model or "stub", "answers": (answers or RUN_ANSWERS)[state]}
+
+    monkeypatch.setattr(laya, "Router", FakeRouter)
+    return built
+
+
+def _overall(stdout):
+    return {name: float(value) for name, value in
+            re.findall(r"^(\S+)\s+([0-9.]+)$", stdout, flags=re.M)}
+
+
+def test_cli_score_within_publishes_the_documented_metric(monkeypatch, tmp_path, capsys):
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    assert evals_cli.main(["run", dataset, "--score-within", "0.25"]) == 0
+    overall = _overall(capsys.readouterr().out)
+    assert overall["score_within_0.25"] == pytest.approx(0.5), "one of the two score rows is inside"
+    for name in ("choice_accuracy", "noul_accuracy", "score_mae", "mean_confidence", "ece"):
+        assert name in overall, "--score-within adds to the defaults, it does not replace them"
+
+
+def test_cli_score_within_is_repeatable_per_column(monkeypatch, tmp_path, capsys):
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    assert evals_cli.main(["run", dataset, "--score-within", "0.25", "--score-within", "0.5"]) == 0
+    overall = _overall(capsys.readouterr().out)
+    assert overall["score_within_0.25"] == pytest.approx(0.5)
+    assert overall["score_within_0.5"] == pytest.approx(1.0), "the far row is inside 0.5"
+
+
+def test_cli_score_within_gate_decides_on_the_number(monkeypatch, tmp_path, capsys):
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    assert evals_cli.main(["run", dataset, "--score-within", "0.25",
+                           "--min", "score_within_0.25=0.5"]) == 0
+    capsys.readouterr()
+    assert evals_cli.main(["run", dataset, "--score-within", "0.25",
+                           "--min", "score_within_0.25=0.6"]) == 1
+    assert "below the minimum" in capsys.readouterr().err
+
+
+def test_cli_score_within_without_score_rows_says_so(monkeypatch, tmp_path, capsys):
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    rows = [row for row in RUN_ROWS if row["state"] in ("intent", "flag")]
+    dataset = _write_dataset(tmp_path, rows)
+    assert evals_cli.main(["run", dataset, "--score-within", "0.25"]) == 0
+    captured = capsys.readouterr()
+    assert "score_within_0.25" not in captured.out, "no value is invented for it"
+    assert "score_within_0.25 has no value" in captured.err
+    assert "0 of 2 answered case(s) are score answers" in captured.err
+
+
+def test_cli_rejects_an_unusable_tolerance_before_loading_a_checkpoint(monkeypatch, tmp_path, capsys):
+    from laya import evals_cli
+
+    built = _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    for bad in ("0.25", "-0.1", "nan", "inf"):
+        capsys.readouterr()
+        code = evals_cli.main(["run", dataset, "--score-within", bad])
+        if bad == "0.25":
+            assert code == 0 and built == [None]
+            continue
+        assert code == 1, "%r would name a metric that is always 1.0 or always 0.0" % bad
+        assert "--score-within" in capsys.readouterr().err
+        assert built == [None], "the flag is rejected before a checkpoint is loaded"
+
+
+def test_cli_records_the_requested_tolerances(monkeypatch, tmp_path):
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    out = tmp_path / "report.json"
+    assert evals_cli.main(["run", dataset, "--score-within", "0.25", "--score-within", "0.5",
+                           "--json", str(out)]) == 0
+    report = json.loads(out.read_text(encoding="utf-8"))
+    assert report["config"]["score_within"] == [0.25, 0.5]
+    assert "score_within_0.5" in report["overall"]
+
+
+def test_docs_and_the_cli_name_the_same_flags():
+    import argparse
+    from pathlib import Path
+
+    from laya import evals_cli
+
+    page = (Path(__file__).resolve().parent.parent / "docs" / "evals.md").read_text(encoding="utf-8")
+    registered: set = set()
+    for action in evals_cli._build_parser()._actions:
+        if isinstance(action, argparse._SubParsersAction):
+            for sub in action.choices.values():
+                registered.update(sub._option_string_actions)
+    quickstart = page.split("```bash", 1)[1].split("```", 1)[0]
+    taught = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", quickstart))
+    assert taught <= registered, "the quickstart teaches %s" % sorted(taught - registered)
+    assert "--score-within" in taught, "the tolerance metric has to be reachable from the quickstart"
+    metrics = page.split("## Metrics", 1)[1].split("\n## ", 1)[0]
+    assert "score_within" in metrics and "--score-within" in metrics, \
+        "the page that publishes the metric has to carry the flag that reaches it"
