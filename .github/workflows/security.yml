@@ -61,14 +61,28 @@ jobs:
           # Audit what the package DECLARES, not a local install. Installing torch from the
           # PyTorch CPU index yields a local version (2.14.0+cpu) that does not exist on PyPI,
           # so pip-audit cannot resolve it and --strict fails the job on that alone.
+          #
+          # Every declared name, not just [project.dependencies]: the extras are what an
+          # install actually pulls in. `Dockerfile` ends with `pip install ".[serve]"`, so
+          # fastapi/uvicorn/python-multipart and their transitive closure ship in the image,
+          # and an advisory in any of them would be invisible to a core-only audit. Read the
+          # tables rather than transcribing a list, so an extra added later is audited by the
+          # commit that adds it and not by a follow-up that forgets.
           python - <<'PY' > requirements-audit.txt
-          import re
-          src = open("pyproject.toml").read()
-          block = re.search(r"dependencies = \[(.*?)\]", src, re.S).group(1)
-          for dep in re.findall(r'"([^"]+)"', block):
-              print(dep)
+          import tomllib
+          with open("pyproject.toml", "rb") as fh:
+              project = tomllib.load(fh)["project"]
+          specs = list(project.get("dependencies", []))
+          for extra in project.get("optional-dependencies", {}).values():
+              specs.extend(extra)
+          seen = set()
+          for spec in specs:          # `langchain` and `langgraph` repeat two of these
+              if spec not in seen:
+                  seen.add(spec)
+                  print(spec)
           PY
           cat requirements-audit.txt
+          echo "auditing $(wc -l < requirements-audit.txt) declared names: the core plus every extra"
           pip-audit --strict --desc -r requirements-audit.txt
 
   codeql:
