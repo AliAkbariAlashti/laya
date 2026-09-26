@@ -341,19 +341,33 @@ hooks.clear_default_hooks()
 
 ## Token budget
 
-Shape the token budget for one call, from a hook or a per-call argument.
+Shape the token budget for one call, from a hook or a per-call argument. A hook's value replaces
+the budget in force, so it has to read that budget first: size on the widest question of the call,
+stay above the token floor the core applies to the options, and widen `max_len` with `head_max_len`
+so the state keeps a window.
 
 ```python
 def widen(ctx):
-    k = len(next(iter(ctx.questions.values())).get("criteria", {}) or {})
-    if k >= 50:
-        ctx.head_max_len = 16 + 4 * k
+    k = max((len(q.get("criteria", {}) or {}) for q in ctx.questions.values()), default=0)
+    if k < 50:
+        return
+    cfg = getattr(ctx.agent, "cfg", None) or {}
+    head = ctx.head_max_len if ctx.head_max_len is not None else cfg.get("head_max_len", 192)
+    window = ctx.max_len if ctx.max_len is not None else cfg.get("max_len", 512)
+    need = 16 + 8 * k
+    if need > head:
+        ctx.head_max_len = need
+        ctx.max_len = max(window, need + 8 + 64)
 
 agent = laya.load("convaiinnovations/laya", on_predict_start=widen)
 
 # or per call
-agent.system_one(state, questions, head_max_len=324, max_len=1024)
+agent.system_one(state, questions, head_max_len=512, max_len=1024)
 ```
+
+[Token-budget shaping](patterns.md#token-budget-shaping) has the arithmetic behind each line, and
+[`predict_shortlist`](../reference/helpers.md) is the option when a label set cannot fit even a
+widened window.
 
 ## Async hooks
 

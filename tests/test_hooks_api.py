@@ -353,6 +353,104 @@ check("patterns.md/enrich stays aligned with states",
 enrich(ctx)
 check("patterns.md/enrich still guards the recursion", len(ctx.results), len(BATCH))
 
+# ------------------------------------------------ taught token-budget bodies size the whole call
+#
+# A start hook's ctx.head_max_len / ctx.max_len REPLACE the budgets in force (laya/agent.py), and
+# what is in force is the caller's per-call value or the checkpoint default in `agent.cfg`. Once a
+# question's options overflow the head, laya/common.py keeps each of them
+# `max(4, (head_max_len - 16) // k)` tokens -- so `16 + 4 * k` buys exactly the floor it is meant to
+# escape -- and the state is left with `max_len - head_max_len - 8` tokens, so widening the head
+# without widening the window truncates the state instead of the labels.
+
+WIDE_K = 60
+WIDE_Q = {"type": "choice", "instructions": "Which of these intents is it?",
+          "criteria": {"intent_%02d" % i: "intent number %02d about the account" % i
+                       for i in range(WIDE_K)}}
+SMALL_Q = {"type": "choice", "instructions": "Which team?",
+           "criteria": {"billing": "invoices and payments", "support": "product help"}}
+CFG192 = {"head_max_len": 192, "max_len": 512}
+CFG256 = {"head_max_len": 256, "max_len": 1024}
+
+
+def budget_ctx(questions, cfg=CFG192, **in_force):
+    """A start-hook context for one call, with the budgets the caller left in place."""
+    return PredictContext(states=["My invoice was charged twice."], questions=questions,
+                          model="english", agent=type("Ag", (), {"cfg": dict(cfg)})(), **in_force)
+
+
+def run_body(hook, ctx):
+    """The name of what the body raised, or None -- a start hook that raises aborts the call."""
+    try:
+        hook(ctx)
+        return None
+    except Exception as exc:
+        return exc.__class__.__name__
+
+
+BUDGET = [("docs/hooks/patterns.md", "widen_for_high_cardinality", "### Token-budget shaping"),
+          ("docs/hooks/examples.md", "widen", "## Token budget")]
+for path, name, anchor in BUDGET:
+    hook = taught(path, name, after=anchor)
+    check_true("%s/%s sizes on every question, not the first" % (path, name),
+               "next(iter(ctx.questions" not in hook.__taught_body__,
+               "the body still measures one question: %r" % hook.__taught_body__)
+
+    call = budget_ctx({"first": SMALL_Q, "second": WIDE_Q})
+    check("%s/%s/a call that needs no widening does not raise" % (path, name),
+          run_body(hook, call), None)
+    check_true("%s/%s/sizes on the widest question of the call" % (path, name),
+               call.head_max_len is not None and (call.head_max_len - 16) // WIDE_K > 4,
+               "wrote head=%s for a %d-option question: %s"
+               % (call.head_max_len, WIDE_K,
+                  "it wrote no budget at all" if call.head_max_len is None
+                  else "each label keeps %d tokens" % max(4, (call.head_max_len - 16) // WIDE_K)))
+    check_true("%s/%s/leaves the state a window" % (path, name),
+               call.max_len is not None and call.max_len - call.head_max_len - 8 >= 64,
+               "head=%s window=%s: %s"
+               % (call.head_max_len, call.max_len,
+                  "the state keeps no window of its own"
+                  if call.max_len is None or call.head_max_len is None
+                  else "the state keeps %d tokens" % (call.max_len - call.head_max_len - 8)))
+
+    empty = budget_ctx({})
+    check("%s/%s/a call with no questions neither raises nor rewrites" % (path, name),
+          (run_body(hook, empty), empty.head_max_len, empty.max_len), (None, None, None))
+    small = budget_ctx({"q": SMALL_Q})
+    run_body(hook, small)
+    check("%s/%s/a narrow question leaves the budget alone" % (path, name),
+          (small.head_max_len, small.max_len), (None, None))
+    caller = budget_ctx({"q": WIDE_Q}, head_max_len=324, max_len=2048)
+    run_body(hook, caller)
+    check_true("%s/%s/never lowers the caller's own per-call budget" % (path, name),
+               caller.head_max_len is not None and caller.head_max_len >= 324
+               and caller.max_len is not None and caller.max_len >= 2048,
+               "wrote (%s, %s) over a caller's (324, 2048)"
+               % (caller.head_max_len, caller.max_len))
+    wider = budget_ctx({"q": WIDE_Q}, head_max_len=640, max_len=4096)
+    run_body(hook, wider)
+    check_true("%s/%s/a caller who already went wider keeps their budget" % (path, name),
+               (wider.head_max_len, wider.max_len) == (640, 4096),
+               "wrote (%s, %s) over a caller's (640, 4096)"
+               % (wider.head_max_len, wider.max_len))
+    checkpoint = budget_ctx({"q": WIDE_Q}, cfg=CFG256)
+    run_body(hook, checkpoint)
+    check_true("%s/%s/never lowers the checkpoint default" % (path, name),
+               checkpoint.head_max_len is None or checkpoint.head_max_len >= 256,
+               "wrote head=%s where the checkpoint declares 256" % checkpoint.head_max_len)
+
+# The two pages teach one behaviour, on the same calls.
+_widest, _raised = budget_ctx({"first": SMALL_Q, "second": WIDE_Q}), budget_ctx({})
+_first_budget = taught(BUDGET[0][0], BUDGET[0][1], after=BUDGET[0][2])
+_first_budget(_widest)
+run_body(_first_budget, _raised)
+for path, name, anchor in BUDGET[1:]:
+    other = taught(path, name, after=anchor)
+    second, empty = budget_ctx({"first": SMALL_Q, "second": WIDE_Q}), budget_ctx({})
+    check("%s/%s/sizes like the pattern page" % (path, name),
+         (run_body(other, second), second.head_max_len, second.max_len,
+          run_body(other, empty), empty.head_max_len),
+         (None, _widest.head_max_len, _widest.max_len, None, _raised.head_max_len))
+
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:

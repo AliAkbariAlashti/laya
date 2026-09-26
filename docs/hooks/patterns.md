@@ -265,20 +265,44 @@ in tests so one test cannot leak a hook into the next.
 
 ### Token-budget shaping
 
-A start hook can raise the token budget for one call, for example when a question has many
-options and the default head budget would collapse the labels. This does not touch the shared
-agent config, so concurrent calls are unaffected.
+A start hook can raise the token budget for one call, for example when a question has many options
+and the default head budget would collapse the labels. Four details decide whether the hook helps
+or quietly makes the call worse:
+
+* A start hook's `ctx.head_max_len` *replaces* the budget for the call. What is in force before it
+  is the caller's own per-call value, or the checkpoint default in `ctx.agent.cfg` -- so compare
+  against that, and writing a plain number can lower the budget a caller already set.
+* One call answers every question it carries, so size on the widest of them rather than on
+  whichever happens to come first.
+* Once the options no longer fit the head, `laya/common.py` gives each of them
+  `max(4, (head_max_len - 16) // k)` tokens. `16 + 4 * k` therefore lands exactly on that floor:
+  every label is still cut down to the tokens it shares with the others, which is the collapse the
+  hook was written to avoid. `16 + 8 * k` leaves them distinguishable.
+* The state gets `max_len - head_max_len - 8` tokens, so a widened head has to widen `max_len`
+  with it or the state loses its window.
 
 ```python
 def widen_for_high_cardinality(ctx):
-    k = len(next(iter(ctx.questions.values())).get("criteria", {}) or {})
-    if k >= 50:
-        ctx.head_max_len = max(ctx.head_max_len or 192, 16 + 4 * k)
+    k = max((len(q.get("criteria", {}) or {}) for q in ctx.questions.values()), default=0)
+    if k < 50:
+        return
+    cfg = getattr(ctx.agent, "cfg", None) or {}
+    head = ctx.head_max_len if ctx.head_max_len is not None else cfg.get("head_max_len", 192)
+    window = ctx.max_len if ctx.max_len is not None else cfg.get("max_len", 512)
+    need = 16 + 8 * k                          # 8 tokens per label, not the core's floor of 4
+    if need > head:                            # only ever widen, never lower
+        ctx.head_max_len = need
+        ctx.max_len = max(window, need + 8 + 64)   # 8 reserved, then room for the state
 
 agent = laya.load("convaiinnovations/laya", on_predict_start=widen_for_high_cardinality)
 ```
 
-The same knobs are available per call: `agent.system_one(state, questions, head_max_len=324)`.
+This does not touch the shared agent config, so concurrent calls are unaffected. The same knobs are
+available per call: `agent.system_one(state, questions, head_max_len=512, max_len=1024)`.
+
+Widening is not free: a longer window means a larger tensor, and the checkpoints were trained at
+512 (`laya`) and 1,024 tokens. Past that, narrowing the candidates with
+[`predict_shortlist`](../reference/helpers.md) beats stretching the budget.
 
 ## Anti-patterns
 
