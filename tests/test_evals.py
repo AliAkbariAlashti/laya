@@ -370,9 +370,10 @@ def test_docs_and_the_cli_name_the_same_flags():
             for sub in action.choices.values():
                 registered.update(sub._option_string_actions)
     quickstart = page.split("```bash", 1)[1].split("```", 1)[0]
-    taught = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", quickstart))
-    assert taught <= registered, "the quickstart teaches %s" % sorted(taught - registered)
-    assert "--score-within" in taught, "the tolerance metric has to be reachable from the quickstart"
+    taught = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", page))
+    assert taught <= registered, "the page teaches %s, which no subcommand registers" % sorted(
+        taught - registered)
+    assert "--score-within" in quickstart, "the tolerance metric has to be reachable from the quickstart"
     metrics = page.split("## Metrics", 1)[1].split("\n## ", 1)[0]
     assert "score_within" in metrics and "--score-within" in metrics, \
-        "the page that publishes the metric has to carry the flag that reaches it"
+        "the section that publishes the metric has to carry the flag that reaches it"
