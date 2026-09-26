@@ -75,8 +75,8 @@ a = make_agent(lambda s, q: [])
 short = a.predict_long({"body": "x" * 50}, Q)   # 50 tokens <= budget 72
 check("short/delegates to system_one", short["answers"], {"_via": "system_one"})
 check("short/no predict_batch call", a._calls["batch_states"], None)
-check("short/one window is reported", short["usage"]["windows"], 1)
-check("short/system_one's own usage is kept", short["usage"]["input_tokens"], 1)
+check("short/one window is reported", short["usage"].get("windows", "<absent>"), 1)
+check("short/system_one's own usage is kept", short["usage"].get("input_tokens", "<absent>"), 1)
 
 # 1b. the count is added to a copy, because a start hook that skips hands back the caller's own
 # payload dict and that object may be cached and reused
