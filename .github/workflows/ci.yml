@@ -103,6 +103,7 @@ jobs:
           python tests/test_hooks_api.py
           python tests/test_structured.py
           python tests/test_structured_api.py
+          python tests/test_structured_docs.py
           python tests/test_onnx_lang_parity.py
           python tests/test_download.py
           python tests/test_shortlist.py
