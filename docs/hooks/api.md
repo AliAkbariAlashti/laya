@@ -244,7 +244,10 @@ agent.predict(...)          # alias of system_one
   once, and `ctx.states` holds the decoded window texts in scan order rather than the caller's
   state, which was tokenized to produce them. A start hook that answers with `ctx.skip(...)` is
   answering the document, so its one result is returned as-is with no `window` key and
-  `usage["windows"]` at `0` -- no window scored it.
+  `usage["windows"]` at `0` -- no window scored it. `usage["windows"]` is total over the three
+  paths: `0` here, `1` for a state that fit a single window (a hook that answered it is answering
+  that one window, so the count is the same as the model's), and `N` for a document scanned in `N`
+  overlapping windows.
 
 ### Router
 

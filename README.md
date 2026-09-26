@@ -576,7 +576,9 @@ result = agent.predict_long(state, questions, hooks=[AuditLog()])   # the scan, 
 - `noul` takes the strongest window (the statement holds if any window supports it).
 - `choice` / `score` take the most-confident window — averaging over a long, mostly-neutral
   document lets the neutral majority out-vote the one window that saw the deciding span.
-- A state that already fits one window is passed straight to `system_one` (identical output).
+- A state that already fits one window is passed straight to `system_one` (identical output, plus
+  `usage["windows"] = 1`). The key is total: `1` single window, `N` scanned windows, `0` a hook
+  answered a multi-window document before the model read any of it.
 - Hooks wrap the inference that answers the state, so on a scanned document `on_predict_start`
   fires once with `ctx.states` holding the decoded windows, not the state you passed in (it was
   tokenized to produce them). A start hook that answers with `ctx.skip(...)` is answering the

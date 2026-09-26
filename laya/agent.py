@@ -1011,6 +1011,9 @@ class Agent(HookRegistry):
             hooks_timeout: Override the Agent's `hooks_timeout` for this call.
 
         Returns a single result dict, the same shape as `system_one`, with `usage["windows"]` added.
+        The key is always present and counts the windows the answer was read from: `1` for a state
+        that fit one window, `N` for a document scanned in `N` overlapping windows, and `0` when a
+        start hook answered a multi-window document before any window was scored.
         """
         if aggregate != "auto":
             raise ValueError("predict_long: only aggregate='auto' is supported")
@@ -1023,9 +1026,15 @@ class Agent(HookRegistry):
 
         state_ids = self.tok(serialize_state(state).replace(self.tok.mask_token, " "),
                              add_special_tokens=False)["input_ids"]
-        # Fits in one window: identical to a plain call, no windowing overhead.
+        # Fits in one window: identical to a plain call, no windowing overhead. `windows` is still
+        # written, so the key is total over the three paths this method can take and a caller can
+        # ask "how much of the document did the model read?" without handling a KeyError on the
+        # shortest, most common inputs. The result is copied first: a start hook that answers with
+        # `ctx.skip(...)` hands back its own payload dict, and it may be a cached object.
         if len(state_ids) <= budget:
-            return self.system_one(state, questions, lang=lang, **hook_kwargs)
+            single = dict(self.system_one(state, questions, lang=lang, **hook_kwargs))
+            single["usage"] = {**(single.get("usage") or {}), "windows": 1}
+            return single
 
         step = stride if (stride and stride > 0) else max(1, budget // 2)
         windows, starts = [], []

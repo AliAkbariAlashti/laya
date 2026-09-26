@@ -7,6 +7,7 @@ window), and the per-call hook controls it forwards to whichever of those two ca
 behaviour on real weights is exercised in tests/test_local_e2e.py.
 """
 import os
+import re
 import sys
 import warnings
 
@@ -74,6 +75,17 @@ a = make_agent(lambda s, q: [])
 short = a.predict_long({"body": "x" * 50}, Q)   # 50 tokens <= budget 72
 check("short/delegates to system_one", short["answers"], {"_via": "system_one"})
 check("short/no predict_batch call", a._calls["batch_states"], None)
+check("short/one window is reported", short["usage"]["windows"], 1)
+check("short/system_one's own usage is kept", short["usage"]["input_tokens"], 1)
+
+# 1b. the count is added to a copy, because a start hook that skips hands back the caller's own
+# payload dict and that object may be cached and reused
+payload = {"model": "laya-rl-agent", "answers": {"_via": "system_one"}, "usage": {"input_tokens": 1}}
+a = make_agent(lambda s, q: [])
+a.system_one = lambda state, questions, lang=None, **controls: payload
+via_hook = a.predict_long({"body": "x" * 50}, Q)
+check("short/a new result dict comes back", via_hook is payload, False)
+check("short/the caller's payload is not written to", payload["usage"], {"input_tokens": 1})
 
 # 2. long state -> overlapping windows, aggregated per question
 def canned(states, q):
@@ -172,6 +184,31 @@ check("skip/the caller is told", [w.category.__name__ for w in caught], ["Runtim
 # 9. a payload that matches neither the document nor the windows is an error, not a guess
 a = make_agent(lambda s, q: [{"answers": {}, "usage": {}}] * 2)
 check_raises("skip/rejects a count matching nothing", ValueError, lambda: a.predict_long(LONG, Q))
+
+# 10. the count is total, so one question works on every result predict_long can return
+short_all = make_agent(lambda s, q: []).predict_long({"body": "x" * 50}, Q)
+scan_agent = make_agent(canned)
+scanned_all = scan_agent.predict_long(LONG, Q)
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore")
+    hook_all = make_agent(one_document_answer).predict_long(LONG, Q)
+check("total/no path leaves the key out",
+      [r["usage"].get("windows", "<absent>") for r in (short_all, scanned_all, hook_all)],
+      [1, len(scan_agent._calls["batch_states"]), 0])
+check("total/0 separates a hook answer from a single-window one",
+      (hook_all["usage"]["windows"], short_all["usage"]["windows"]), (0, 1))
+
+
+# 11. the page that teaches this key teaches the value the code actually writes
+README = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                           "README.md"), encoding="utf-8").read()
+bullet = README[README.index("A state that already fits one window"):][:600]
+check("docs/README pins the single-window value", 'usage["windows"] = 1' in bullet, True)
+check("docs/README states the key is total", "The key is total" in bullet, True)
+check("docs/README documents all three counts", sorted(set(re.findall(r"`([0-9N])`", bullet))),
+      ["0", "1", "N"])
+check("docs/predict_long's docstring says the key is total",
+      "always present" in (Agent.predict_long.__doc__ or ""), True)
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
