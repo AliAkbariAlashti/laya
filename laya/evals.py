@@ -264,6 +264,13 @@ def _group_cases(cases: Sequence[Dict[str, Any]], key: str) -> Dict[str, List[Di
     return groups
 
 
+def _percentiles(values: Sequence[float]) -> Tuple[float, float]:
+    """(median, 95th) using the nearest-rank rule the report has always used for latency."""
+    ordered = sorted(values)
+    return (float(statistics.median(ordered)),
+            float(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]))
+
+
 def _aggregate(cases: Sequence[Dict[str, Any]], evaluators: Sequence[Evaluator]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for evaluator in evaluators:
@@ -329,12 +336,22 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
 
     `on_error` is ``"fail"`` (re-raise a runner error) or ``"skip"`` (record it and continue),
     the latter for evaluating a flaky fleet without aborting the whole run.
+
+    A batched run has two honest timing answers, so the report gives both. ``latency_p50_ms`` /
+    ``latency_p95_ms`` are per request: every row of a chunk returns from the same call, so each
+    one waited that whole call. ``cost_per_decision_p50_ms`` / ``cost_per_decision_p95_ms``
+    divide a call by its own chunk size, which is the throughput figure. ``--batch-size`` therefore
+    lowers the second and raises the first. What the harness really did -- the runner shape it
+    resolved to and how many rows shared a call -- lands in ``report.config["timing"]``, because the
+    requested flag alone does not say whether anything was batched.
     """
     if on_error not in ("fail", "skip"):
         raise EvalError("on_error must be 'fail' or 'skip', got %r" % on_error)
     evaluators = list(evaluators) if evaluators is not None else default_evaluators()
     cases: List[Dict[str, Any]] = []
-    latencies: List[float] = []
+    waits: List[float] = []          # what each request actually waited: its chunk's whole call
+    shares: List[float] = []         # that call split across its chunk: throughput per decision
+    chunks = rows_grouped = rows_alone = max_chunk = 0
     errors: List[Dict[str, Any]] = []
     examples = dataset.examples
     # Only worth grouping if the runner can be handed the group in one call at all.
@@ -374,7 +391,18 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
             index += len(chunk)
             continue
         elapsed = (time.perf_counter() - started) * 1000.0
-        latencies.extend([elapsed / len(chunk)] * len(chunk))
+        # A chunk is one call, so each of its rows waited all of `elapsed`; the split figure is a
+        # throughput share, not a latency, and putting the two in one list made a batched run
+        # publish a per-decision cost under the name of the per-request one (#585).
+        waits.extend([elapsed] * len(chunk))
+        shares.extend([elapsed / len(chunk)] * len(chunk))
+        chunks += 1
+        if len(chunk) > 1:
+            rows_grouped += len(chunk)
+        else:
+            rows_alone += 1
+        if len(chunk) > max_chunk:
+            max_chunk = len(chunk)
         for offset, (example, result) in enumerate(zip(chunk, results)):
             answers = (result or {}).get("answers") or {}
             for qid, expected in example.expected.items():
@@ -400,10 +428,20 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
 
     report = EvalReport(config=dict(config or {}), cases=cases)
     report.overall = _aggregate(cases, evaluators)
-    if latencies:
-        ordered = sorted(latencies)
-        report.overall["latency_p50_ms"] = float(statistics.median(ordered))
-        report.overall["latency_p95_ms"] = float(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))])
+    if waits:
+        report.overall["latency_p50_ms"], report.overall["latency_p95_ms"] = _percentiles(waits)
+        (report.overall["cost_per_decision_p50_ms"],
+         report.overall["cost_per_decision_p95_ms"]) = _percentiles(shares)
+    report.config = dict(report.config, timing={
+        "latency_metric": "per request: the wall time of the call that returned it, unsplit",
+        "cost_metric": "per decision: that call divided by its own chunk size",
+        "batch_size": batch_size,
+        "batch_form": batch_form,
+        "chunks": chunks,
+        "rows_grouped": rows_grouped,
+        "rows_alone": rows_alone,
+        "max_chunk": max_chunk,
+    })
     for dimension in ("language", "model", "qid", "tag"):
         groups = _group_cases(cases, dimension)
         if groups:

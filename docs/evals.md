@@ -56,10 +56,25 @@ Each metric is computed per answer where it applies and aggregated over the data
 | `score_within_<tol>` | `score` | fraction within an absolute tolerance |
 | `ece` | any answer with a confidence | expected calibration error, 15 bins, computed on `answer["answer_confidence"]`, the calibrated probability Laya reports on every answer type |
 | `mean_confidence` | any answer with a confidence | mean reported `answer["answer_confidence"]` |
-| `latency_p50_ms`, `latency_p95_ms` | per request | wall time, informational |
+| `latency_p50_ms`, `latency_p95_ms` | per request | wall time each request waited, informational -- see [batching](#batching-and-timing) |
+| `cost_per_decision_p50_ms`, `cost_per_decision_p95_ms` | per decision | a call's wall time divided by the rows it carried, informational |
 
 Add `ScoreWithin(0.25)` to the evaluator list for a tolerance metric; the default set is
 `choice_accuracy`, `noul_accuracy`, `score_mae`, `mean_confidence`, plus `ece`.
+
+## Batching and timing
+
+`--batch-size N` scores up to N consecutive rows that share a checkpoint and a question schema in
+one call. Both timing metrics come from the same measurements and answer different questions:
+every row of a batch returns when the batch does, so its `latency` is the whole call, while its
+`cost_per_decision` is `1/N` of it. Batching therefore *raises* `latency_*` and *lowers*
+`cost_per_decision_*` on an unchanged set of decisions, and `--max latency_p50_ms=...` asks whether
+requests were served fast, not whether the run was cheap. With no `--batch-size` the two agree.
+
+`compare` ignores any `*_ms` metric unless a tolerance names it, so these never fail a baseline on
+timing noise. What the harness actually did -- the batch size asked for, the runner shape it
+resolved to, how many rows shared a call, and the largest chunk -- is recorded in the report's
+`config.timing`, because the flag alone does not say whether anything was batched.
 
 ## Slices
 
@@ -88,7 +103,8 @@ Two CI surfaces use this:
   PR.
 
 The harness is deterministic for a fixed checkpoint revision, so a report is reproducible.
-`run` records the dataset, model and device in the report's `config` block.
+`run` records the dataset, model and device, plus the [timing](#batching-and-timing) facts of the
+run, in the report's `config` block.
 
 ## Adding the real labelled set
 
