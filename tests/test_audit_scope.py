@@ -33,7 +33,9 @@ def check_true(name, cond, detail=""):
     if cond:
         PASS.append(name)
     else:
-        FAIL.append("%s%s" % (name, ": " + detail if detail else ""))
+        # %s, not concatenation: several details below are lists of names, and a gate that raises
+        # on the way to reporting a failure leaves the mutant's name unsaid.
+        FAIL.append("%s: %s" % (name, detail))
 
 
 def read(name):
