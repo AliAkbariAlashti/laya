@@ -353,6 +353,42 @@ check("patterns.md/enrich stays aligned with states",
 enrich(ctx)
 check("patterns.md/enrich still guards the recursion", len(ctx.results), len(BATCH))
 
+
+class ChildCaller(Enricher):
+    """The nested-call page's stand-in enricher: it remembers the child calls it is asked to make."""
+
+    def __init__(self):
+        self.calls = []
+
+    def predict(self, state, questions):
+        result = Enricher.predict(self, state, questions)
+        result["run_id"] = "child-%d" % (len(self.calls) + 1)
+        self.calls.append(state)
+        return result
+
+
+SPAN_LINKS, CHILD = [], ChildCaller()
+nested = taught("docs/hooks/tracing.md", "enrich", after="## Nested calls",
+                enricher=CHILD, EXTRA_QUESTIONS=ASK,
+                record_child_span=lambda **kw: SPAN_LINKS.append(kw))
+check_true("docs/hooks/tracing.md/enrich reads every state, not index 0",
+           "[0]" not in nested.__taught_body__,
+           "the body still indexes [0]: %r" % nested.__taught_body__)
+nested_ctx = taught_ctx()
+nested(nested_ctx)
+check("docs/hooks/tracing.md/enrich makes one child call per state", CHILD.calls, BATCH)
+check("docs/hooks/tracing.md/enrich links every child to the parent run_id",
+      [link.get("parent_run_id") for link in SPAN_LINKS], [nested_ctx.run_id] * len(BATCH))
+check("docs/hooks/tracing.md/enrich records each child's own run_id",
+      [link.get("child_run_id") for link in SPAN_LINKS],
+      ["child-%d" % i for i in range(1, len(BATCH) + 1)])
+SPAN_LINKS.clear()
+CHILD.calls.clear()
+one_child = taught_ctx(states=[BATCH[1]], confidence=[0.4])
+nested(one_child)
+check("docs/hooks/tracing.md/enrich on one state still links", SPAN_LINKS,
+      [{"parent_run_id": one_child.run_id, "child_run_id": "child-1"}])
+
 # ------------------------------------------------ taught token-budget bodies size the whole call
 #
 # A start hook's ctx.head_max_len / ctx.max_len REPLACE the budgets in force (laya/agent.py), and

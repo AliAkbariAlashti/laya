@@ -160,9 +160,13 @@ independent unless you link them yourself. Capture the parent id and pass it alo
 
 ```python
 def enrich(ctx):
-    child = enricher.predict(ctx.states[0], EXTRA_QUESTIONS)
-    record_child_span(parent_run_id=ctx.run_id, child_run_id=child.get("run_id"))
+    for state in ctx.states:                     # a hook sees every state of the call
+        child = enricher.predict(state, EXTRA_QUESTIONS)
+        record_child_span(parent_run_id=ctx.run_id, child_run_id=child.get("run_id"))
 ```
+
+One parent `run_id`, one child call per state. A body that reads `ctx.states[0]` links the first
+decision of a batch and silently drops the rest.
 
 Guard against recursion (see [anti-patterns](patterns.md#recursive-predict)); the easiest guard
 is a separate `enricher` agent with no hooks.
