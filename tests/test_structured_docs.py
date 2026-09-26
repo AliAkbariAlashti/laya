@@ -29,7 +29,7 @@ import json
 import os
 import re
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 PASS: List[str] = []
 FAIL: List[str] = []
@@ -389,6 +389,19 @@ def main() -> int:
     check_true("decide/forwards predict kwargs",
                any(p.kind is p.VAR_KEYWORD for p in inspect.signature(S.decide).parameters.values()),
                "the page promises `**predict_kwargs`")
+    # ...and the other direction: a public name of this module cannot go undocumented. The rule is
+    # per-kind, because a loose one is a fake: `plan_from_json_schema` also appears in the rejection
+    # tables, so "the name is somewhere on the page" passed with its API row deleted (mutant m5).
+    api_column = " ".join(row[0] for row in api)
+    for name in S.__all__:
+        target = getattr(S, name, None)
+        if inspect.isclass(target):
+            check_true("exports/%s is described on the page" % name, name in text,
+                       "a class no section explains")
+        else:
+            check_true("exports/%s has an API row" % name,
+                       re.search(r"\b%s\(" % re.escape(name), api_column) is not None,
+                       "not named as a callable in `The API`'s first column")
 
     # the module docstring teaches the same subset; it must not teach a key the code ignores
     doc = ast.get_docstring(tree) or ""
