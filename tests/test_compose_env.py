@@ -151,12 +151,14 @@ for rel in COMPOSE_FILES:
                        "%s is read by the runtime but the rendered container would not get it"
                        % name)
             if value is not None:
-                # A passthrough, not a decision made for every deployment: `${NAME:-...}` or
-                # `${NAME}`, so the host (or `.env`) still chooses the dtype.
+                # A passthrough *with a default*, not a bare `${NAME}`: without the `:-` a
+                # deployment that never mentions the variable is treated as asking for it, and
+                # the default here has a meaning the core implements (empty = the checkpoint's
+                # own amp_dtype).
                 check_true("compose/%s/%s/%s is a host passthrough" % (rel, service, name),
-                           re.match(r'^"\$\{%s(:-[^"}]*)?\}"$' % name, value) is not None,
-                           "%s: %r -- hardcoding a dtype here would pin it for every user"
-                           % (name, value))
+                           re.match(r'^"\$\{%s:-[^"}]*\}"$' % name, value) is not None,
+                           "%s: %r -- hardcoding or requiring a dtype here would pin it for "
+                           "every user" % (name, value))
 
 # 3. an empty default has to mean "the checkpoint's own dtype", which is what these images shipped
 #    before this change. Parsed out of the core so the claim is checked, not assumed.
