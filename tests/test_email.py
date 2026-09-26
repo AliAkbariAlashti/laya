@@ -403,9 +403,17 @@ for label, tail in [
     ("sent from tablet", "Sent from my iPad."),
     ("sent from android", "Sent from my Android"),
     ("sent from mobile", "Sent from my mobile"),
+    ("sent from iphone model", "Sent from my iPhone 15 Pro"),
+    ("sent from android phone", "Sent from my Android phone"),
+    ("sent from ipad model", "Sent from my iPad Pro"),
+    ("sent from iphone app", "Sent from my iPhone using Tapatalk"),
     ("dash delimiter", "--\nAnna Meier\nSupport"),
 ]:
     check("signoff cut/" + label, clean_email_body("%s\n\n%s" % (BODY, tail)), BODY)
+
+for suffix in ["device", "Max", "mini", "Plus"]:
+    tail = "Sent from my iPhone %s" % suffix
+    check("device footer suffix/" + suffix, clean_email_body("%s\n\n%s" % (BODY, tail)), BODY)
 
 # A device mention can describe the request rather than close the message.
 for sentence in [
@@ -413,6 +421,7 @@ for sentence in [
     "Sent from my iPad yesterday.",
     "Sent from my Android by mistake.",
     "Sent from my mobile yesterday.",
+    "Sent from my iPhone using Tapatalk to report a problem.",
 ]:
     body = "Hi support,\n%s\nPlease cancel the duplicate order." % sentence
     check("device sentence kept/" + sentence, clean_email_body(body), body)

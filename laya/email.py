@@ -75,7 +75,8 @@ _DEVICE = (r"iphone|ipad|android|ios|mobile|celular|telemóvel|móvil|galaxy|sma
            r"outlook|yahoo|mail|e-?mail|gmail|windows")
 _DEVICE_FOOTER = re.compile(
     r"^\s*((enviad[oa] (do|pelo|pela|via|desde|a partir do)( meu| minha| mi)?|sent from( my)?)"
-    r" (%s)( (%s|para|for|no|na|\d+))*|(obter o|get) outlook (para|for) (ios|android))[\s.!]*$"
+    r" (%s)( (%s|para|for|no|na|\d+|phone|device|pro|max|mini|plus|using [a-z][a-z0-9_.+-]*))*"
+    r"|(obter o|get) outlook (para|for) (ios|android))[\s.!]*$"
     % (_DEVICE, _DEVICE),
     re.I,
 )
