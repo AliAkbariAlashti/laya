@@ -196,7 +196,8 @@ check("total/no path leaves the key out",
       [r["usage"].get("windows", "<absent>") for r in (short_all, scanned_all, hook_all)],
       [1, len(scan_agent._calls["batch_states"]), 0])
 check("total/0 separates a hook answer from a single-window one",
-      (hook_all["usage"]["windows"], short_all["usage"]["windows"]), (0, 1))
+      (hook_all["usage"].get("windows", "<absent>"), short_all["usage"].get("windows", "<absent>")),
+      (0, 1))
 
 
 # 11. the page that teaches this key teaches the value the code actually writes
