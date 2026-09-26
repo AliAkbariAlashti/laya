@@ -189,9 +189,12 @@ devices = set()
 for rel in COMPOSE_FILES:
     devices.update(re.findall(r'LAYA_DEVICE: "\$\{LAYA_DEVICE:-([a-z0-9]+)\}"', read(rel)))
 check("compose/devices any file defaults to", sorted(devices), ["cpu", "cuda"])
+# The literal is deliberate, and matches how the rest of this repo gates prose: the reason is the
+# thing that goes stale, so it has to be pinned, not just the variable's name.
+mps_reason = re.search(r"`LAYA_MPS_AMP_MIN_ROWS`,[^.]*\.", docker_md, re.S)
 check_true("docs/docker.md says why MPS is not forwarded",
-           "LAYA_MPS_AMP_MIN_ROWS" in docker_md,
-           "the omission has to be written down where a reader meets it")
+           mps_reason is not None and "no image here can reach" in mps_reason.group(0),
+           "the omission has to be explained where a reader meets it")
 
 # 6. the real renderer, when this machine has one: the rendered environment must carry the value.
 if shutil.which("docker"):
