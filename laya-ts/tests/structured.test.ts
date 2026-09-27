@@ -154,7 +154,7 @@ describe("structured/rejections", () => {
 describe("structured/decide", () => {
   class FakeRunner {
     calls: { state: unknown; questions: unknown; opts: unknown }[] = [];
-    constructor(private answers: unknown) {}
+    constructor(private answers: any) {}
     async predict(state: unknown, questions: any, opts: any = {}) {
       this.calls.push({ state, questions, opts });
       return { answers: this.answers, usage: { input_tokens: 1, output_tokens: 0 },

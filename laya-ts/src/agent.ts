@@ -218,6 +218,12 @@ export function checkQuestion(qid: string, qdef: unknown): void {
   }
 }
 
+function isPlainDict(o: unknown): o is Record<string, unknown> {
+  if (typeof o !== "object" || o === null || Array.isArray(o)) return false;
+  const proto = Object.getPrototypeOf(o);
+  return proto === null || proto === Object.prototype;
+}
+
 export function toInternal(qdef: QuestionDef): { t: "choice" | "score" | "noul"; ins: string; crit: unknown; labels?: { false: string; true: string } } {
   const t = qdef["type"] as "choice" | "score" | "noul";
   let crit: unknown = qdef["criteria"];
@@ -384,6 +390,29 @@ export class Agent extends HookRegistry {
     try {
       await dispatchAsync(active, "onPredictStart", ctx, { raiseErrors });
       if (ctx.results === null) {
+        if (!Array.isArray(ctx.states)) {
+          throw new TypeError(
+            "predictBatch expects an array of states; pass a single state to predict()/systemOne().",
+          );
+        }
+        if (!isPlainDict(ctx.questions)) {
+          const typeName =
+            ctx.questions === null
+              ? "NoneType"
+              : Array.isArray(ctx.questions)
+              ? "list"
+              : typeof ctx.questions === "object"
+              ? ((ctx.questions as object).constructor?.name ?? "object")
+              : typeof ctx.questions;
+          throw new TypeError(
+            `questions must be a dict of question id -> definition, got ${typeName}`,
+          );
+        }
+        for (const st of ctx.states) {
+          if (st === null || st === undefined) {
+            throw new TypeError("state must not be None; pass a string, dict, or list");
+          }
+        }
         const out: SystemOneResult[] = [];
         for (const st of ctx.states) {
           out.push(
@@ -536,6 +565,17 @@ export class Agent extends HookRegistry {
     opts: PredictOptions = {},
   ): Promise<SystemOneResult> {
     return this.systemOne(state, questions, opts);
+  }
+
+  /**
+   * Evaluate typed questions across many states.
+   */
+  async predictBatch(
+    states: unknown[],
+    questions: Record<string, QuestionDef>,
+    opts: PredictOptions = {},
+  ): Promise<SystemOneResult[]> {
+    return this._predictHooked(states, questions, opts);
   }
 
   /**
