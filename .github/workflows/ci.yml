@@ -132,6 +132,10 @@ jobs:
           python tests/test_portability.py
           python tests/test_training.py
           python tests/test_example_server_limits.py
+          python tests/test_blank_lang_routing.py
+          python tests/test_export_onnx_safety.py
+          python tests/test_load_errors.py
+          python tests/test_revision_pinning.py
 
       - name: Email cleaning tests
         run: python tests/test_email.py
@@ -141,7 +145,7 @@ jobs:
       - name: Chinese short-command benchmark tests
         run: python -m unittest discover -s research/benchmarks/zh_short_commands/tests -v
 
-      # These four are pytest suites, and `python tests/<name>.py` does not run them: it defines
+      # These are pytest suites, and `python tests/<name>.py` does not run them: it defines
       # the test functions and exits 0, having asserted nothing. They were counted by the suite
       # list above without ever executing, which is how the HTTP surface came to have no coverage
       # in CI at all (#374).
@@ -153,6 +157,7 @@ jobs:
         run: |
           python -m pytest tests/test_serve.py \
                            tests/test_router_batch.py \
+                           tests/test_predict_batch.py \
                            tests/test_system_one_lang.py \
                            tests/test_audit_regressions.py \
                            tests/test_truncation_direction.py \
@@ -233,13 +238,19 @@ jobs:
       # pass -- a change to a container script, so it belongs in its own PR, not this one.
       - name: Routing and language-detection tests
         run: |
-          for t in test_router test_criteria test_download test_shortlist \
-                   test_decision_model test_packaging test_lang_guess \
-                   test_identifier_complexity \
-                   test_calibration_persistence test_context_manager \
+          for t in test_router test_criteria test_batch test_predict_long \
+                   test_structured test_structured_api test_onnx_lang_parity \
+                   test_download test_shortlist test_decision_model \
+                   test_head_checkpointing test_packaging test_doc_tables \
+                   test_tokenizer_cache test_tokenizer_concurrency test_lazy_import \
+                   test_runtime_fixes test_lang_guess test_identifier_complexity \
+                   test_lang_stats test_calibration_persistence test_context_manager \
                    test_criteria_normalization test_docker_entrypoint \
                    test_empty_questions test_router_memory test_shortlist_cosine \
-                   test_temperature_loading; do
+                   test_temperature_loading test_confidence test_cli test_mcp \
+                   test_langchain test_portability test_training \
+                   test_example_server_limits test_blank_lang_routing \
+                   test_export_onnx_safety test_load_errors test_revision_pinning; do
             if [ "$t" = "test_docker_entrypoint" ]; then
               echo "skipping $t: docker/entrypoint.py is Linux-container only"
               continue
@@ -254,13 +265,14 @@ jobs:
           python tests/test_hooks_api.py
         shell: bash
 
-      # Same five pytest suites as the Linux job. They are named explicitly rather than added to
+      # Same pytest suites as the Linux job. They are named explicitly rather than added to
       # the loop above, because the loop runs each file as a script and that is exactly what does
       # not execute a pytest suite (#374).
       - name: Pytest suites (serve, batch, system-one, audit regressions, truncation)
         run: |
           python -m pytest tests/test_serve.py \
                            tests/test_router_batch.py \
+                           tests/test_predict_batch.py \
                            tests/test_system_one_lang.py \
                            tests/test_audit_regressions.py \
                            tests/test_truncation_direction.py \

@@ -4,6 +4,7 @@ Text parsing, not tomllib: the floor is 3.10 and tomllib arrives in 3.11.
 """
 import os
 import re
+import shlex
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -92,6 +93,95 @@ missing_from_ci = [
     ".".join(str(p) for p in v) for v in classifier_versions if v not in ci_versions
 ]
 check("ci/tests every advertised Python version", missing_from_ci, [])
+
+# Every test in tests/ must be wired into CI workflows (ci.yml or docker.yml),
+# unless explicitly exempted with a documented rationale (#399).
+def _clean_command_line(line):
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return ""
+    try:
+        return " ".join(shlex.split(line, comments=True))
+    except ValueError:
+        return re.sub(r"(?:\s+|^)#.*$", "", line).strip()
+
+
+def _invoked_workflow_tests(yaml_text):
+    """Extract test files that are actually executed by python or pytest in run: steps."""
+    run_lines = []
+    in_run = False
+    run_indent = 0
+    for line in yaml_text.splitlines():
+        indent = len(line) - len(line.lstrip())
+        match = re.match(r"^(\s*)-\s+run:\s*(\|?>?)(.*)$", line) or re.match(r"^(\s*)run:\s*(\|?>?)(.*)$", line)
+        if match:
+            in_run = True
+            run_indent = indent
+            inline_cmd = match.group(3).strip()
+            cleaned = _clean_command_line(inline_cmd)
+            if cleaned:
+                run_lines.append(cleaned)
+            continue
+        if in_run:
+            if line.strip() and indent <= run_indent:
+                in_run = False
+            else:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    cleaned = _clean_command_line(stripped)
+                    if cleaned:
+                        if stripped.endswith("\\") and not cleaned.endswith("\\"):
+                            cleaned += " \\"
+                        run_lines.append(cleaned)
+
+    # Merge backslash continuation lines (e.g. multi-line pytest argument lists)
+    merged_lines = []
+    buf = []
+    for line in run_lines:
+        if line.endswith("\\"):
+            buf.append(line[:-1].strip())
+        else:
+            if buf:
+                buf.append(line)
+                merged_lines.append(" ".join(buf))
+                buf = []
+            else:
+                merged_lines.append(line)
+    if buf:
+        merged_lines.append(" ".join(buf))
+
+    # Match executable python or pytest invocations, ignoring mentions in echo/cat/test
+    invoked = set()
+    for cmd in merged_lines:
+        for part in re.split(r";|&&|\|\||\|", cmd):
+            part = part.strip()
+            if re.search(r"\b(?:pytest|python(?:\d+(?:\.\d+)?)?\s+-m\s+pytest)\b", part):
+                invoked.update(re.findall(r"\btests/(test_[a-zA-Z0-9_]+\.py)\b", part))
+            elif re.search(r"\bpython(?:\d+(?:\.\d+)?)?\s+.*?tests/(test_[a-zA-Z0-9_]+\.py)\b", part):
+                invoked.update(re.findall(r"\btests/(test_[a-zA-Z0-9_]+\.py)\b", part))
+    return invoked
+
+
+docker_workflow = read(os.path.join(".github", "workflows", "docker.yml"))
+registered_test_files = _invoked_workflow_tests(workflow) | _invoked_workflow_tests(docker_workflow)
+
+EXEMPT_TEST_SUITES = {
+    "test_local_e2e.py": "Requires local checkpoints under ~/laya_models (AGENTS.md)",
+    "test_mcp_local_e2e.py": "Requires local checkpoints under ~/laya_models (AGENTS.md)",
+    "test_onnx.py": "Requires onnx extra; skip-guarded on lane without it (AGENTS.md)",
+    "test_fast.py": "Requires CUDA and tilelang extra (AGENTS.md)",
+    "test_server_example.py": "Requires cached or downloaded weights for examples/server.py",
+}
+
+all_test_files = [
+    f for f in os.listdir(os.path.join(ROOT, "tests"))
+    if f.startswith("test_") and f.endswith(".py")
+]
+untested_suites = [
+    f for f in sorted(all_test_files)
+    if f not in EXEMPT_TEST_SUITES and f not in registered_test_files
+]
+check("ci/wires every non-exempt test suite", untested_suites, [])
 
 
 # --------------------------------------------------------------- markdown links
