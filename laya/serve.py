@@ -515,13 +515,24 @@ def create_app(router: Optional[Any] = None):
 
 
 def main() -> None:
+    import socket
+
     import uvicorn
+    from uvicorn.protocols.http.auto import AutoHTTPProtocol
+
+    class NoDelayHTTPProtocol(AutoHTTPProtocol):
+        # asyncio only sets TCP_NODELAY when the accepted socket reports IPPROTO_TCP, and
+        # on macOS and Windows it reports 0, so Nagle delays small responses (#620).
+        def connection_made(self, transport):
+            transport.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            super().connection_made(transport)
 
     uvicorn.run(
         create_app(),
         host=os.environ.get("LAYA_HOST", "0.0.0.0"),
         port=_resolve_port(),
         log_level=os.environ.get("LAYA_LOG_LEVEL", "info"),
+        http=NoDelayHTTPProtocol,
     )
 
 
