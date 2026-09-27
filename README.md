@@ -805,6 +805,7 @@ package:
 | `LAYA_PRELOAD` | `1` | Same as `laya.serve`: build the checkpoints at startup, not lazily |
 | `LAYA_MODELS` | `english,multilingual` | Comma list to preload (serve contract). MCP difference: an empty value preloads `english,multilingual` so `typed-decisions` stays lazy; in `laya.serve` empty means every checkpoint |
 | `LAYA_THREADS` | (torch default) | Same as `laya.serve`: cap torch intra-op threads for CPU inference; keep it at or below the physical core count |
+| `LAYA_AUTO_TASK` | `0` | Same as `laya.serve`: `1` lets a request whose question ids match a typed-decisions workflow route to that checkpoint, which is then loaded on demand; it never joins the preload list |
 
 The tools return structured JSON (answers with probabilities, routing metadata, device,
 `latency_ms`). `laya_shortlist` is the MCP form of [`predict_shortlist`](#honest-limits):

@@ -12,6 +12,9 @@ Environment (same meaning as laya.serve where it exists):
   LAYA_MODELS   comma list to preload; MCP default is "english,multilingual" so
                 typed-decisions stays lazy (in laya.serve an empty value preloads all)
   LAYA_THREADS  cap torch intra-op threads (CPU inference); keep <= physical cores
+  LAYA_AUTO_TASK  "1" lets a request auto-route to the typed-decisions checkpoint
+                  (same as laya.serve). It does not preload it: LAYA_MODELS still
+                  decides what is built at startup.
 """
 
 from __future__ import annotations
@@ -88,12 +91,13 @@ def _models_from_env() -> list[str]:
 def _ensure_router() -> Any:
     """Build the Router from the environment, following the laya.serve contract.
 
-    LAYA_DEVICE / LAYA_PRELOAD / LAYA_THREADS keep the same meaning as in
-    laya.serve (the helpers are reused, not duplicated). LAYA_MODELS follows the
-    serve comma-list but defaults to english+multilingual here, so
-    typed-decisions stays lazy. The global is only set once the router is fully
-    built, so a failed preload stays retriable on the next tool call, and
-    construction errors surface as ToolError payloads instead of being swallowed.
+    LAYA_DEVICE / LAYA_PRELOAD / LAYA_THREADS / LAYA_AUTO_TASK keep the same meaning as
+    in laya.serve (the helpers are reused, not duplicated). LAYA_MODELS follows the
+    serve comma-list but defaults to english+multilingual here, so typed-decisions stays
+    lazy: LAYA_AUTO_TASK=1 only lets a matching question schema route to it, and it is
+    then loaded on demand. The global is only set once the router is fully built, so a
+    failed preload stays retriable on the next tool call, and construction errors
+    surface as ToolError payloads instead of being swallowed.
     """
     global _ROUTER
     if _ROUTER is not None:
@@ -107,7 +111,8 @@ def _ensure_router() -> Any:
             raise ToolError("internal_error", f"cannot import laya: {exc}") from exc
         try:
             _apply_thread_limit()
-            router = Router(device=env_device())
+            router = Router(device=env_device(),
+                            auto_task_detection=_env_bool("LAYA_AUTO_TASK", False))
             if _env_bool("LAYA_PRELOAD", True):
                 router.preload(_models_from_env())
         except Exception as exc:
