@@ -790,8 +790,7 @@ vs 723 ms batched (**3.6×**); 16 mixed English/German states through a `Router`
 1903 ms (**1.6×**). On CPU the same workloads gave **1.6×** and **2.0×**. Projected values matched
 the one-by-one loop 8/8 and 16/16 on both devices, as expected wherever argmax is not at a
 threshold — verify against your own decision boundaries. `laya.decide_batch(runner, states, ...)`
-is the function form. `ONNXAgent` has no `predict_batch` yet, so it raises `TypeError` instead of
-silently looping.
+is the function form, and `ONNXAgent.decide_batch` runs the same thing on an ONNX export.
 
 ---
 

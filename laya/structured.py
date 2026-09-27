@@ -292,7 +292,8 @@ def decide(runner, state: Any, schema: Any = None, *, questions: Optional[Dict[s
 
 def decide_batch(runner, states: Sequence[Any], schema: Any = None, *,
                  questions: Optional[Dict[str, Any]] = None,
-                 return_details: bool = False, **predict_kwargs) -> List[Any]:
+                 return_details: bool = False, min_confidence: Optional[float] = None,
+                 **predict_kwargs) -> List[Any]:
     """Answer many states against one schema in one batched call, in input order.
 
     The throughput form of :meth:`decide`: the schema is planned once and its questions
@@ -302,14 +303,15 @@ def decide_batch(runner, states: Sequence[Any], schema: Any = None, *,
     ``decide`` does. Pass exactly one of ``schema`` or ``questions``; extra keyword
     arguments (``batch_size=``, ``model=``, ``hooks=``, ...) are forwarded to
     ``runner.predict_batch``. With ``return_details=True`` each item is a
-    ``DecisionResult``.
+    ``DecisionResult``. ``min_confidence`` works as in ``decide``: a field whose answer falls
+    below it comes back as ``None``, with the answer kept in the details.
 
     Both batch calling conventions are handled: an ``Agent``-like runner receives
     ``(states, questions)``, while a ``Router``-like runner (one exposing
     ``route_batch``) receives one ``{"state": ..., "questions": ...}`` request per
     state, so states may route to different checkpoints.
 
-    Not every runner batches: ``ONNXAgent`` has no ``predict_batch`` yet, so passing one
+    ``Agent``, ``ONNXAgent`` and ``Router`` all batch. A runner with no ``predict_batch``
     raises ``TypeError`` here rather than silently degrading to N sequential ``decide``
     calls -- loop ``decide`` yourself when the runner cannot batch.
     """
@@ -317,6 +319,8 @@ def decide_batch(runner, states: Sequence[Any], schema: Any = None, *,
         raise ValueError("pass exactly one of schema= or questions=")
     if isinstance(states, (str, bytes)) or not isinstance(states, SequenceABC):
         raise TypeError("states must be a sequence of states, not %s" % type(states).__name__)
+
+    mc = check_min_confidence(min_confidence) if min_confidence is not None else None
 
     fields: Optional[List[_Field]] = None
     if schema is not None:
@@ -337,6 +341,11 @@ def decide_batch(runner, states: Sequence[Any], schema: Any = None, *,
     else:
         # Agent convention: a list of states evaluated against one question set.
         results = predict_batch(list(states), questions, **predict_kwargs)
+
+    if mc is not None:
+        # Flagged here rather than passed down, so a runner whose predict_batch predates the
+        # keyword still gets the same projection.
+        flag_low_confidence([r for r in results if isinstance(r, dict)], mc)
 
     def _one(r: Dict[str, Any]) -> Any:
         answers = r.get("answers", {}) or {}

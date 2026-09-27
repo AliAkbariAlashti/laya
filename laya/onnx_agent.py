@@ -370,7 +370,10 @@ class ONNXAgent(HookRegistry):
     def predict_long(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]],
                      window: Optional[int] = None, stride: Optional[int] = None,
                      aggregate: str = "auto", batch_size: Optional[int] = None,
-                     lang: Optional[str] = None) -> Dict[str, Any]:
+                     lang: Optional[str] = None,
+                     hooks=None, on_predict_start=None, on_predict_end=None,
+                     hooks_raise: Optional[bool] = None,
+                     hooks_timeout: Optional[float] = None) -> Dict[str, Any]:
         """Evaluate questions over a state longer than the context window, scanning it in
         overlapping windows and aggregating per question.
 
@@ -402,10 +405,21 @@ class ONNXAgent(HookRegistry):
             aggregate: "auto" (the per-type rules above) is the only mode for now.
             batch_size: Cap on windows per session run, to bound peak memory on very long states.
             lang: Per-language temperature selection, as in `system_one`.
+            hooks, on_predict_start, on_predict_end, hooks_raise, hooks_timeout: per-call hooks,
+                    with the same contract as `Agent.predict_long`: they wrap the inference that
+                    answers the state, a start hook that answers with `ctx.skip(...)` gets
+                    `usage["windows"] == 0` and no window attribution, and a rewritten scan is
+                    aggregated without `answer["window"]`.
 
         Returns a single result dict, the same shape as `system_one`, with `usage["windows"]`
         added.
         """
+        from .agent import _start_evidence, _with_start_probe
+        from .hooks import aggregate_usage
+
+        hook_kwargs = {"hooks": hooks, "on_predict_start": on_predict_start,
+                       "on_predict_end": on_predict_end, "hooks_raise": hooks_raise,
+                       "hooks_timeout": hooks_timeout}
         if aggregate != "auto":
             raise ValueError("predict_long: only aggregate='auto' is supported")
         max_len = self.cfg.get("max_len", 512)
@@ -417,9 +431,14 @@ class ONNXAgent(HookRegistry):
             serialize_state(state).replace(self.tok.mask_token, " "),
             add_special_tokens=False,
         )["input_ids"]
-        # Fits in one window: identical to a plain call, no windowing overhead.
+        # Fits in one window: identical to a plain call, no windowing overhead. `windows` is still
+        # written, as on the torch Agent: 1 for a window the model read, 0 for a hook's answer.
         if len(state_ids) <= budget:
-            return self.system_one(state, questions, lang=lang)
+            probe, evidence = _start_evidence()
+            single = dict(self.system_one(state, questions, lang=lang,
+                                          **_with_start_probe(hook_kwargs, probe)))
+            single["usage"] = {**(single.get("usage") or {}), "windows": 0 if evidence["answered"] else 1}
+            return single
 
         step = stride if (stride and stride > 0) else max(1, budget // 2)
         windows, starts = [], []
@@ -433,7 +452,36 @@ class ONNXAgent(HookRegistry):
                 break
             i += step
 
-        results = self.predict_batch(windows, questions, batch_size=batch_size, lang=lang)
+        probe, evidence = _start_evidence()
+        # A copy, so a start hook that mutates `ctx.states` in place cannot shift `starts`.
+        results = self.predict_batch(list(windows), questions, batch_size=batch_size, lang=lang,
+                                     **_with_start_probe(hook_kwargs, probe))
+
+        if evidence["answered"]:
+            # A hook answered the document before any window was scored: pass that answer
+            # through unattributed, with no window counted (the torch Agent's rule).
+            if len(results) != 1:
+                raise ValueError(
+                    "predict_long: a start hook answered this state with %d results; ctx.skip()"
+                    " takes one result for the document, not one per window" % len(results))
+            warnings.warn("laya: predict_long: a hook answered the state before it was scanned, so "
+                          "no window decided the result and none is reported", RuntimeWarning,
+                          stacklevel=2)
+            document = dict(results[0])
+            document["usage"] = dict(document.get("usage") or {})
+            document["usage"]["windows"] = 0
+            return document
+
+        rewritten = evidence["states"] is not None and evidence["states"] != windows
+        if len(results) != len(windows) and not rewritten:
+            raise ValueError(
+                "predict_long: the state was split into %d windows and the call returned %d results"
+                % (len(windows), len(results)))
+        if not results:
+            warnings.warn("laya: predict_long: a start hook left no states to score, so the call"
+                          " aggregated nothing and returns no answers", RuntimeWarning, stacklevel=2)
+            return {"model": "laya-rl-agent-onnx", "answers": {},
+                    "usage": {**aggregate_usage(results), "windows": 0}}
 
         ids = list(questions.keys())
         internal = {qid: self._to_internal(questions[qid]) for qid in ids}
@@ -450,9 +498,10 @@ class ONNXAgent(HookRegistry):
                 best = max(range(len(per)), key=lambda j: float(per[j]["answer_confidence"]))
             ans = per[best]
             # Name the window that decided; the probability is that window's, not the document's.
-            ans["window"] = {"index": best, "token_start": starts[best],
-                             "token_end": min(starts[best] + budget, len(state_ids)),
-                             "count": len(windows)}
+            if not rewritten:
+                ans["window"] = {"index": best, "token_start": starts[best],
+                                 "token_end": min(starts[best] + budget, len(state_ids)),
+                                 "count": len(results)}
             answers[qid] = ans
         # Aggregate usage generically so fields predict_batch may grow later are propagated
         # rather than silently dropped, then record the window count.
@@ -461,7 +510,7 @@ class ONNXAgent(HookRegistry):
             for key, val in r["usage"].items():
                 usage[key] = (usage.get(key, 0) + val) if isinstance(val, (int, float)) else val
         usage["output_tokens"] = 0
-        usage["windows"] = len(windows)
+        usage["windows"] = len(results)
         return {"model": "laya-rl-agent-onnx", "answers": answers, "usage": usage}
 
     def _infer(self, state: Union[str, dict, list], questions: Dict[str, Dict[str, Any]],
@@ -653,5 +702,15 @@ class ONNXAgent(HookRegistry):
         from laya.structured import decide as _decide
         return _decide(self, state, schema, questions=questions,
                        return_details=return_details, min_confidence=min_confidence, **predict_kwargs)
+
+    def decide_batch(self, states: List[Union[str, dict, list]], schema: Any = None, *,
+                     questions: Optional[Dict[str, Dict[str, Any]]] = None,
+                     return_details: bool = False, min_confidence: Optional[float] = None,
+                     **predict_kwargs) -> List[Any]:
+        """Answer many states against one schema through `predict_batch`; see `laya.structured`."""
+        from laya.structured import decide_batch as _decide_batch
+        return _decide_batch(self, states, schema, questions=questions,
+                             return_details=return_details, min_confidence=min_confidence,
+                             **predict_kwargs)
 
     predict = system_one

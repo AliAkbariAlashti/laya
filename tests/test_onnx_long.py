@@ -124,11 +124,17 @@ short_result = short.predict_long("aa", QUESTIONS)
 check("short/one session run for the two questions", short.session.calls, [2])
 check_true("short/no window fields added",
            all("window" not in a for a in short_result["answers"].values()))
+# `usage["windows"]` is total on every path since #577 (1 for a state that fit one window), so the
+# comparison is system_one's payload with that one key added.
+def _with_one_window(result):
+    return dict(result, usage=dict(result["usage"], windows=1))
+
+
 check("short/delegates byte-for-byte to system_one",
-      short_result, _bare_onnx().system_one("aa", QUESTIONS))
+      short_result, _with_one_window(_bare_onnx().system_one("aa", QUESTIONS)))
 check("short/lang forwards to system_one",
       _bare_onnx().predict_long("aa", QUESTIONS, lang="de"),
-      _bare_onnx().system_one("aa", QUESTIONS, lang="de"))
+      _with_one_window(_bare_onnx().system_one("aa", QUESTIONS, lang="de")))
 
 
 # ---------------------------------------------------------------- long state windows and aggregates

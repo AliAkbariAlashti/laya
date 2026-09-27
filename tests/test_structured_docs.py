@@ -385,7 +385,7 @@ def main() -> int:
     check("decide/keyword-only arguments",
           [p.name for p in inspect.signature(S.decide).parameters.values()
            if p.kind is p.KEYWORD_ONLY],
-          ["questions", "return_details"])
+          ["questions", "return_details", "min_confidence"])
     check_true("decide/forwards predict kwargs",
                any(p.kind is p.VAR_KEYWORD for p in inspect.signature(S.decide).parameters.values()),
                "the page promises `**predict_kwargs`")

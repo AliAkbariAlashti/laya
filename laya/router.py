@@ -875,7 +875,8 @@ class Router(HookRegistry):
 
     def decide_batch(self, states: Sequence[Any], schema: Any = None, *,
                      questions: Optional[Dict[str, Any]] = None,
-                     return_details: bool = False, **predict_kwargs) -> List[Any]:
+                     return_details: bool = False, min_confidence: Optional[float] = None,
+                     **predict_kwargs) -> List[Any]:
         """Answer many states against one schema (JSON schema or pydantic model) in one batched call.
 
         The throughput form of :meth:`decide`: the schema is planned once and its questions
@@ -886,7 +887,8 @@ class Router(HookRegistry):
         """
         from .structured import decide_batch as _decide_batch
         return _decide_batch(self, states, schema, questions=questions,
-                             return_details=return_details, **predict_kwargs)
+                             return_details=return_details, min_confidence=min_confidence,
+                             **predict_kwargs)
 
     def __enter__(self):
         return self
