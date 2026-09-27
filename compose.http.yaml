@@ -37,6 +37,10 @@ services:
       LAYA_HOST: "${LAYA_HOST:-0.0.0.0}"
       LAYA_PORT: "${LAYA_PORT:-8000}"
       LAYA_DEVICE: "${LAYA_DEVICE:-cpu}"
+      # Autocast dtype the runtime reads when building the model; empty keeps the checkpoint's own
+      # `amp_dtype`. Set LAYA_CUDA_AMP=fp16 to serve fp16 on a GPU host.
+      LAYA_CUDA_AMP: "${LAYA_CUDA_AMP:-}"
+      LAYA_CPU_AMP: "${LAYA_CPU_AMP:-}"
       LAYA_PRELOAD: "${LAYA_PRELOAD:-0}"
       LAYA_MODELS: "${LAYA_MODELS:-}"
       LAYA_THREADS: "${LAYA_THREADS:-${OMP_NUM_THREADS:-4}}"
