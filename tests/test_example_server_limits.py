@@ -482,7 +482,8 @@ def main():
     errors = [r for r in poison["results"] if "error" in r]
     ok("one failing state yields one error entry, not an empty batch",
        len(poison["results"]) == 8 and [r["index"] for r in errors] == [3]
-       and "simulated failure" in errors[0]["error"],
+       # #625: the item names the failure without its exception text, which stays in the log
+       and errors[0]["error"] == "prediction failed",
        json.dumps(poison)[:240])
     ok("the failing batch retried per state, so its neighbours still answered",
        len(partial.batch_calls) == 1 and len(partial.predict_calls) == 8)

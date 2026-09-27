@@ -149,6 +149,9 @@ jobs:
           python tests/test_load_errors.py
           python tests/test_predict_batch.py
           python tests/test_revision_pinning.py
+          python tests/test_example_server_errors.py
+          python tests/test_crewai.py
+          python tests/test_llamaindex.py
 
       - name: LangChain integration runs on the real base class
         run: |

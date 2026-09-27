@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import re
 import time
@@ -65,6 +66,11 @@ MAX_STATE_CHARS = getattr(_laya_serve, "MAX_STATE_CHARS", 50_000)
 MAX_CHOICE_OPTIONS = getattr(_laya_serve, "MAX_CHOICE_OPTIONS", 100)
 MAX_SCORE_LEVELS = getattr(_laya_serve, "MAX_SCORE_LEVELS", 32)
 MAX_TOTAL_OPTIONS = getattr(_laya_serve, "MAX_TOTAL_OPTIONS", 512)
+
+# The demo answers failures the way laya.serve does: a fixed message to the caller, the
+# traceback to this logger. Without it a 500 arrived as a bare status line in the server
+# output and the cause had to be reproduced in-process to be found at all.
+_log = logging.getLogger("laya.example-server")
 
 # --------------------------------------------------------------------------- #
 # Request / response models
@@ -338,8 +344,11 @@ def predict(req: PredictRequest) -> Dict[str, Any]:
         raise
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:  # inference failure
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+    except Exception:  # inference failure -- the policy laya.serve follows: the caller
+        # gets a fixed message, never the exception text, which describes the deployment
+        # (paths, libraries, memory) rather than the request.
+        _log.exception("prediction failed")
+        raise HTTPException(status_code=500, detail="prediction failed")
 
 
 @app.post("/predict/batch")
@@ -365,8 +374,12 @@ def predict_batch(req: BatchRequest) -> Dict[str, Any]:
         for i, state in enumerate(req.states):
             try:
                 results.append(_predict(state, questions, **controls))
-            except Exception as item_exc:
-                results.append({"index": i, "error": f"{type(item_exc).__name__}: {item_exc}"})
+            except HTTPException as item_exc:  # a caller-facing status (413, 422, 503) is safe
+                results.append({"index": i, "error": "HTTPException: %d: %s"
+                                % (item_exc.status_code, item_exc.detail)})
+            except Exception:  # the index names the item; the cause stays in the log
+                _log.exception("prediction failed for batch item %d", i)
+                results.append({"index": i, "error": "prediction failed"})
     return {"count": len(results), "results": results}
 
 
@@ -3436,8 +3449,9 @@ async def gui_predict(request: Request) -> HTMLResponse:
             model=req.model, task=req.task, lang=req.lang,
         )
         res["_elapsed"] = time.perf_counter() - started
-    except Exception as exc:
-        return _gui_error("Prediction failed", [f"{type(exc).__name__}: {exc}"],
+    except Exception:
+        _log.exception("prediction failed (gui)")
+        return _gui_error("Prediction failed", ["The server could not complete this prediction."],
                           "Nothing was answered. The server log has the full trace.")
 
     answers = res.get("answers") or {}
