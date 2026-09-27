@@ -219,6 +219,311 @@ def test_evaluate_batches_same_questions():
     assert report.overall["choice_accuracy"] == 1.0
 
 
+class RequestsRunner(StubRunner):
+    """The `Router` shape: a list of per-request dicts, and no ``model=`` on the call."""
+
+    def __init__(self, by_state):
+        super().__init__(by_state)
+        self.batches = []
+        self.batch_sizes = []
+
+    def predict_batch(self, requests, batch_size=None):
+        self.batches.append(list(requests))
+        self.batch_sizes.append(batch_size)
+        return [{"model": r.get("model") or "m", "answers": self.by_state[r["state"]]}
+                for r in requests]
+
+
+def _labels(report):
+    """The decided labels with their correctness: parity at decision level, not as floats."""
+    return [(c["answer"]["choice"], c["correct"]) for c in report.cases]
+
+
+def test_evaluate_drives_a_requests_shaped_batch():
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}, model="english"),
+                       Example("s2", Q, {"intent": "a"}, model="english")])
+    runner = RequestsRunner({"s1": {"intent": choice_answer("a")},
+                             "s2": {"intent": choice_answer("a")}})
+    report = evaluate(runner, dataset, evaluators=[ChoiceAccuracy()], batch_size=8)
+    assert len(runner.batches) == 1, "a request-dict batch is a forward pass the harness can run"
+    expected = [{"state": "s1", "questions": Q, "model": "english"},
+                {"state": "s2", "questions": Q, "model": "english"}]
+    assert runner.batches[0] == expected, "each request carries its own state, questions, checkpoint"
+    assert runner.batch_sizes == [8], "the requested batch size reaches the runner"
+    assert report.overall["choice_accuracy"] == 1.0
+
+
+def test_requests_shaped_batch_agrees_with_single_predicts():
+    """`batch_size` changes how many forward passes a run makes, never what it scores."""
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"}),
+                       Example("s3", Q, {"intent": "b"})])
+    answers = {"s1": {"intent": choice_answer("a")}, "s2": {"intent": choice_answer("b")},
+               "s3": {"intent": choice_answer("b")}}
+    batched = evaluate(RequestsRunner(answers), dataset, evaluators=[ChoiceAccuracy()], batch_size=8)
+    single = evaluate(RequestsRunner(answers), dataset, evaluators=[ChoiceAccuracy()])
+    assert _labels(batched) == _labels(single) == [("a", True), ("b", False), ("b", True)]
+    assert len(batched.cases) == len(single.cases) == 3
+
+
+def test_evaluate_scores_a_batch_shape_it_cannot_call():
+    """A `predict_batch` in neither documented shape must not fail the run row by row."""
+    class UntypedBatch(StubRunner):
+        def predict_batch(self, states, questions):
+            raise AssertionError("the harness may not call this: no model=, no requests")
+
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"})])
+    runner = UntypedBatch({"s1": {"intent": choice_answer("a")}, "s2": {"intent": choice_answer("a")}})
+    report = evaluate(runner, dataset, evaluators=[ChoiceAccuracy()], batch_size=8, on_error="skip")
+    assert report.overall["choice_accuracy"] == 1.0, "scored one predict at a time"
+    assert not report.config.get("errored"), "a batch entry point in an unknown shape is not an error"
+
+
+def test_evaluate_scores_a_runner_with_no_batch_entry_point():
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"})])
+    runner = StubRunner({"s1": {"intent": choice_answer("a")}, "s2": {"intent": choice_answer("a")}})
+    report = evaluate(runner, dataset, evaluators=[ChoiceAccuracy()], batch_size=8)
+    assert report.overall["choice_accuracy"] == 1.0
+
+
+def test_evaluate_batches_a_pass_through_wrapper_positionally():
+    """A wrapper that forwards `*args, **kwargs` takes the positional call, whatever it names."""
+    class PassThrough(StubRunner):
+        def __init__(self, by_state):
+            super().__init__(by_state)
+            self.calls = []
+
+        def predict_batch(self, *args, **kwargs):
+            self.calls.append((args, kwargs))
+            return [{"model": "m", "answers": self.by_state[s]} for s in args[0]]
+
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"})])
+    runner = PassThrough({"s1": {"intent": choice_answer("a")}, "s2": {"intent": choice_answer("a")}})
+    report = evaluate(runner, dataset, evaluators=[ChoiceAccuracy()], batch_size=8)
+    assert len(runner.calls) == 1
+    assert runner.calls[0][0] == (["s1", "s2"], Q)
+    assert runner.calls[0][1] == {"model": None, "batch_size": 8}
+    assert report.overall["choice_accuracy"] == 1.0
+
+
+# --------------------------------------------------------------- timing (#585)
+FORWARD_MS = 100.0
+SHARED = 0.6                      # a batch of n costs SHARED * n * FORWARD_MS, as one call
+QWIDE = {"intent": {"type": "choice", "instructions": "?",
+                    "criteria": {"a": "x", "b": "y", "c": "z"}}}
+
+
+class Clock:
+    """A timer that advances only when the runner predicts, so every figure below is exact."""
+
+    def __init__(self):
+        self.now = 0.0
+
+    def perf_counter(self):
+        return self.now / 1000.0
+
+
+class TimedRunner(StubRunner):
+    """Answers from the state alone, so grouping can never change a decision -- only the clock."""
+
+    def __init__(self, by_state):
+        super().__init__(by_state)
+        self.clock = Clock()
+        self.chunks = []
+        self.singles = []
+
+    def predict(self, state, questions, model=None):
+        self.clock.now += FORWARD_MS
+        self.singles.append(state)
+        return StubRunner.predict(self, state, questions, model)
+
+    def predict_batch(self, states, questions, model=None, batch_size=None):
+        self.clock.now += len(states) * FORWARD_MS * SHARED
+        self.chunks.append(len(states))
+        return [StubRunner.predict(self, s, questions, model) for s in states]
+
+
+def _timed_pair(monkeypatch, batch_size):
+    """Score three shareable rows and one that cannot join them, on a fake clock.
+
+    Returns (report, runner): the runner's own `chunks` is the witness that the grouping the test
+    asserts is the grouping the harness really issued.
+    """
+    import laya.evals as evals_module
+
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"}),
+                       Example("s3", Q, {"intent": "a"}), Example("s4", QWIDE, {"intent": "a"})])
+    answers = {state: {"intent": choice_answer("a")} for state in ("s1", "s2", "s3", "s4")}
+    runner = TimedRunner(answers)
+    monkeypatch.setattr(evals_module, "time", runner.clock)
+    return evals_module.evaluate(runner, dataset, evaluators=[ChoiceAccuracy()],
+                                 batch_size=batch_size), runner
+
+
+def test_batched_latency_is_what_a_request_waited(monkeypatch):
+    solo, solo_runner = _timed_pair(monkeypatch, None)
+    batched, runner = _timed_pair(monkeypatch, 8)
+
+    assert _labels(batched) == _labels(solo), "identical decisions; only the timing moved"
+    assert (solo_runner.chunks, solo_runner.singles) == ([], ["s1", "s2", "s3", "s4"])
+    assert (runner.chunks, runner.singles) == ([3], ["s4"]), \
+        "one shared call of three, and the row whose questions match nothing left alone"
+
+    assert solo.overall["latency_p50_ms"] == pytest.approx(FORWARD_MS)
+    # The chunk of three returns all three requests together at +180 ms, so that is their latency.
+    assert batched.overall["latency_p50_ms"] == pytest.approx(3 * FORWARD_MS * SHARED)
+    assert batched.overall["latency_p50_ms"] > solo.overall["latency_p50_ms"], \
+        "batching trades request latency for throughput; the report has to say so"
+
+
+def test_the_throughput_share_keeps_its_own_metric(monkeypatch):
+    solo, _ = _timed_pair(monkeypatch, None)
+    batched, _ = _timed_pair(monkeypatch, 8)
+
+    # Unbatched, the two quantities are the same number, so every report without the flag is
+    # unchanged by this fix.
+    assert solo.overall["cost_per_decision_p50_ms"] == pytest.approx(solo.overall["latency_p50_ms"])
+    assert solo.overall["cost_per_decision_p95_ms"] == pytest.approx(solo.overall["latency_p95_ms"])
+    # Batched, the share is the figure the old `latency_p50_ms` published: 180 ms over three rows.
+    assert batched.overall["cost_per_decision_p50_ms"] == pytest.approx(FORWARD_MS * SHARED)
+    assert batched.overall["cost_per_decision_p95_ms"] == pytest.approx(FORWARD_MS)
+
+
+def test_a_latency_gate_cannot_pass_a_run_where_nothing_finished_in_time(monkeypatch):
+    from laya import evals_cli
+
+    solo, _ = _timed_pair(monkeypatch, None)
+    batched, _ = _timed_pair(monkeypatch, 8)
+    # 80 ms is below every wait in either run (100 ms alone, 180 ms shared). The old report passed
+    # the batched run at 60 ms, which was 1/3 of a call no request could see the end of.
+    for name, report in (("unbatched", solo), ("--batch-size 8", batched)):
+        assert evals_cli._check_thresholds(report.overall, {}, {"latency_p50_ms": 80.0}), \
+            "%s abstains: no request in it was served inside the limit" % name
+    for name, report in (("unbatched", solo), ("--batch-size 8", batched)):
+        assert not evals_cli._check_thresholds(report.overall, {}, {"latency_p50_ms": 200.0}), \
+            "%s passes a bound every request beat" % name
+    # The throughput win is still gateable, under the name that measures it.
+    assert not evals_cli._check_thresholds(batched.overall, {}, {"cost_per_decision_p50_ms": 80.0})
+    assert evals_cli._check_thresholds(solo.overall, {}, {"cost_per_decision_p50_ms": 80.0})
+
+
+def test_timing_facts_record_what_the_harness_did(monkeypatch):
+    solo, _ = _timed_pair(monkeypatch, None)
+    batched, _ = _timed_pair(monkeypatch, 8)
+
+    assert solo.config["timing"]["batch_size"] is None
+    assert solo.config["timing"]["batch_form"] is None
+    assert solo.config["timing"]["rows_grouped"] == 0
+    assert solo.config["timing"]["rows_alone"] == 4
+    assert solo.config["timing"]["max_chunk"] == 1
+    assert batched.config["timing"]["batch_size"] == 8
+    assert batched.config["timing"]["batch_form"] == "states"
+    assert batched.config["timing"]["chunks"] == 2
+    assert batched.config["timing"]["rows_grouped"] == 3
+    assert batched.config["timing"]["rows_alone"] == 1
+    assert batched.config["timing"]["max_chunk"] == 3
+    assert batched.config["timing"]["latency_metric"] != batched.config["timing"]["cost_metric"]
+
+    # `--json` is the artifact a reviewer reads, so the two runs must differ there, not only in
+    # the flag they were asked with.
+    assert json.dumps(batched.to_json()) != json.dumps(solo.to_json())
+
+
+def test_a_requested_batch_size_is_not_a_batched_run(monkeypatch):
+    """The report records the grouping it achieved, so a runner that cannot batch cannot hide it."""
+    import laya.evals as evals_module
+
+    class Untimed(StubRunner):
+        pass
+
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"})])
+    monkeypatch.setattr(evals_module, "time", Clock())
+    report = evals_module.evaluate(Untimed({"s1": {"intent": choice_answer("a")},
+                                            "s2": {"intent": choice_answer("a")}}),
+                                   dataset, evaluators=[ChoiceAccuracy()], batch_size=8)
+    assert report.config["timing"]["batch_form"] is None
+    assert report.config["timing"]["rows_grouped"] == 0, "asked to batch, and the report says it did not"
+    assert report.config["timing"]["rows_alone"] == 2
+
+
+def test_a_batched_call_that_raises_is_still_recorded_as_batched(monkeypatch):
+    """`config["timing"]` counts the calls the harness issued, not only the calls that returned.
+
+    A raised chunk used to contribute to none of the shape counters, which made a run that issued
+    one shared forward and lost it indistinguishable from a run that never shared a call at all --
+    the one mode where `docs/evals.md` says the block has to be right.
+    """
+    import laya.evals as evals_module
+
+    class RaisingBatch(TimedRunner):
+        def predict_batch(self, states, questions, model=None, batch_size=None):
+            self.chunks.append(len(states))
+            raise RuntimeError("the shared forward failed")
+
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"}),
+                       Example("s3", Q, {"intent": "a"}), Example("s4", QWIDE, {"intent": "a"})])
+    answers = {state: {"intent": choice_answer("a")} for state in ("s1", "s2", "s3", "s4")}
+    runner = RaisingBatch(answers)
+    monkeypatch.setattr(evals_module, "time", runner.clock)
+    report = evals_module.evaluate(runner, dataset, evaluators=[ChoiceAccuracy()],
+                                   batch_size=8, on_error="skip")
+
+    # Why the runner records it itself: the counters under test are the harness's own account, so
+    # an independent witness that a three-row forward really went out is what makes the assertion
+    # mean something.
+    assert runner.chunks == [3], "a shared forward was issued for the three matching rows"
+    timing = report.config["timing"]
+    assert (timing["chunks"], timing["rows_grouped"], timing["rows_alone"]) == (2, 3, 1)
+    assert timing["max_chunk"] == 3
+    assert len(report.config["errored"]) == 3
+
+    # Why the metric lists stay below the `continue`: a call that returned nothing has no request
+    # latency to publish, so counting the attempt must not invent one. Only s4's own `predict`
+    # reaches the percentiles here.
+    assert report.overall["latency_p50_ms"] == pytest.approx(FORWARD_MS)
+    assert [case["correct"] for case in report.cases] == [True]
+
+    # The ambiguity this closes: a runner with no `predict_batch` gave the identical three
+    # counters, so the artifact could not tell "nothing was batched" from "the batch raised".
+    plain = evaluate(StubRunner(answers), dataset, evaluators=[ChoiceAccuracy()], batch_size=8)
+    for key in ("chunks", "rows_grouped", "max_chunk"):
+        assert timing[key] != plain.config["timing"][key], key
+
+
+def test_compare_leaves_the_cost_metrics_alone():
+    report = EvalReport(overall={"choice_accuracy": 0.8, "latency_p50_ms": 12.0,
+                                 "cost_per_decision_p50_ms": 4.0})
+    baseline = {"overall": {"choice_accuracy": 0.8, "latency_p50_ms": 5.0,
+                            "cost_per_decision_p50_ms": 2.0}}
+    ok, deltas = report.compare(baseline)
+    assert ok and not {"latency_p50_ms", "cost_per_decision_p50_ms"} & set(deltas)
+    bad, deltas = report.compare(baseline, {"cost_per_decision_p50_ms": 0.5})
+    assert not bad, "a 2 ms drift is outside the 0.5 ms tolerance it named"
+    assert "latency_p50_ms" not in deltas, "the metric nobody named stays out of the comparison"
+    assert deltas["cost_per_decision_p50_ms"]["diff"] == pytest.approx(2.0)
+
+
+def test_docs_and_the_harness_name_the_same_timing_metrics(monkeypatch):
+    """`docs/evals.md` must list exactly the metrics `evaluate` publishes, with their quantities."""
+    import pathlib
+    import re
+
+    page = (pathlib.Path(__file__).resolve().parent.parent / "docs" / "evals.md").read_text()
+    batched, _ = _timed_pair(monkeypatch, 8)
+    published = {metric for metric in batched.overall if metric.endswith("_ms")}
+
+    rows = {}
+    for line in page.splitlines():
+        if line.startswith("| `"):
+            for metric in re.findall(r"`([a-z_0-9]+_ms)`", line):
+                rows[metric] = line
+    assert set(rows) == published, "no metric documented that is not emitted, and none missed"
+    assert "per request" in rows["latency_p50_ms"]
+    assert "waited" in rows["latency_p50_ms"], "the row has to say a request waits the whole call"
+    assert "divided by the rows it carried" in rows["cost_per_decision_p50_ms"]
+    assert "## Batching and timing" in page, "the trade-off the two numbers encode is written down"
+    assert "`config.timing`" in page, "the report's own run facts are documented"
+
+
 def test_evaluate_skips_errors_when_asked():
     class Boom(StubRunner):
         def predict(self, state, questions, model=None):

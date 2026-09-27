@@ -2,8 +2,10 @@
 
 Pure Python plus numpy, and free of torch at import time, so the metric math and the dataset
 parsing can be unit tested with no weights. `evaluate` only needs a runner with a
-``predict(state, questions, model=...)`` method (and optionally a ``predict_batch``), so a
-fixture runner stands in for a checkpoint in tests.
+``predict(state, questions, model=...)`` method, plus -- for ``batch_size`` above 1 -- a
+``predict_batch`` in either of the two shapes the repo ships: the positional one, or the
+per-request-dict one `Router.predict_batch` documents. A fixture runner stands in for a
+checkpoint in tests.
 
 The report is deterministic for a fixed runner: the same dataset produces the same numbers, and
 ``EvalReport.compare`` turns a baseline into a pass/fail with the per-metric deltas, which is what
@@ -11,6 +13,7 @@ the CI gate consumes.
 """
 from __future__ import annotations
 
+import inspect
 import json
 import statistics
 import time
@@ -284,6 +287,13 @@ def _group_cases(cases: Sequence[Dict[str, Any]], key: str) -> Dict[str, List[Di
     return groups
 
 
+def _percentiles(values: Sequence[float]) -> Tuple[float, float]:
+    """(median, 95th) using the nearest-rank rule the report has always used for latency."""
+    ordered = sorted(values)
+    return (float(statistics.median(ordered)),
+            float(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]))
+
+
 def _aggregate(cases: Sequence[Dict[str, Any]], evaluators: Sequence[Evaluator]) -> Dict[str, float]:
     out: Dict[str, float] = {}
     for evaluator in evaluators:
@@ -300,40 +310,113 @@ def _aggregate(cases: Sequence[Dict[str, Any]], evaluators: Sequence[Evaluator])
     return out
 
 
+# The two batch call shapes the repo ships. `RouterRunner.predict_batch(states, questions,
+# model=..., batch_size=...)` is the positional one; `Router.predict_batch(requests, ...)` takes
+# one dict per request, the form `route_batch` and the `laya-evals` CLI document.
+_BATCH_STATES = "states"
+_BATCH_REQUESTS = "requests"
+
+
+def _batch_form(runner: Any) -> Optional[str]:
+    """Return which batch call `runner` accepts, or ``None`` to score it one ``predict`` at a time.
+
+    Deliberately not ``hasattr(runner, "predict_batch")``: having a batch entry point and being
+    callable the way this harness calls it are different claims, and the attribute test returned
+    true for ``Router`` -- the one real runner whose ``predict(state, questions, model=...)``
+    matches the contract `evaluate` states. Every chunk of more than one example then raised
+    ``TypeError: ... unexpected keyword argument 'model'``, which under ``on_error="skip"`` became
+    a report with zero cases and an empty ``overall``.
+    """
+    fn = getattr(runner, "predict_batch", None)
+    if fn is None:
+        return None
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        # Not introspectable (a C-level or hand-rolled ``__call__``): keep the call this harness
+        # made before the shape was checked, rather than silently dropping to single predicts.
+        return _BATCH_STATES
+    if any(p.name == "model" or p.kind is p.VAR_KEYWORD for p in params):
+        return _BATCH_STATES
+    positional = [p for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD)]
+    # A bound method, so `positional[0]` is the batch argument itself.
+    if positional and positional[0].name == "requests":
+        return _BATCH_REQUESTS
+    return None
+
+
 def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evaluator]] = None,
              batch_size: Optional[int] = None, on_error: str = "fail",
              config: Optional[Dict[str, Any]] = None) -> EvalReport:
     """Run `runner` over `dataset`, aggregating per-answer metrics overall and per slice.
 
+    `runner` needs a ``predict(state, questions, model=...)`` method, and for `batch_size` above 1
+    a ``predict_batch`` in either shape the repo ships: the positional
+    ``predict_batch(states, questions, model=..., batch_size=...)``, or the per-request-dict form
+    `Router.predict_batch` takes -- ``predict_batch([{"state": ..., "questions": ...,
+    "model": ...}, ...], batch_size=...)``. A runner that offers neither is scored one ``predict``
+    at a time, which is slower but not wrong.
+
     `on_error` is ``"fail"`` (re-raise a runner error) or ``"skip"`` (record it and continue),
     the latter for evaluating a flaky fleet without aborting the whole run.
+
+    A batched run has two honest timing answers, so the report gives both. ``latency_p50_ms`` /
+    ``latency_p95_ms`` are per request: every row of a chunk returns from the same call, so each
+    one waited that whole call. ``cost_per_decision_p50_ms`` / ``cost_per_decision_p95_ms``
+    divide a call by its own chunk size, which is the throughput figure. ``--batch-size`` therefore
+    lowers the second and raises the first. What the harness really did -- the runner shape it
+    resolved to and how many rows shared a call -- lands in ``report.config["timing"]``, because the
+    requested flag alone does not say whether anything was batched.
     """
     if on_error not in ("fail", "skip"):
         raise EvalError("on_error must be 'fail' or 'skip', got %r" % on_error)
     evaluators = list(evaluators) if evaluators is not None else default_evaluators()
     cases: List[Dict[str, Any]] = []
-    latencies: List[float] = []
+    waits: List[float] = []          # what each request actually waited: its chunk's whole call
+    shares: List[float] = []         # that call split across its chunk: throughput per decision
+    chunks = rows_grouped = rows_alone = max_chunk = 0
     errors: List[Dict[str, Any]] = []
     examples = dataset.examples
-    can_batch = batch_size is not None and batch_size > 1 and hasattr(runner, "predict_batch")
+    # Only worth grouping if the runner can be handed the group in one call at all.
+    batch_form = _batch_form(runner) if batch_size is not None and batch_size > 1 else None
 
     index = 0
     while index < len(examples):
         # Batches only when the runner can share a forward pass: consecutive examples with the
         # same checkpoint and identical questions. Otherwise every example is one predict.
         chunk = [examples[index]]
-        if can_batch:
+        if batch_form:
             signature = (examples[index].model,
                          json.dumps(examples[index].questions, sort_keys=False, default=str))
             while (index + len(chunk) < len(examples) and len(chunk) < batch_size
                    and (examples[index + len(chunk)].model,
                         json.dumps(examples[index + len(chunk)].questions, sort_keys=False, default=str)) == signature):
                 chunk.append(examples[index + len(chunk)])
+        # Why these sit above the call and `waits`/`shares` below: the shape counters answer "what
+        # did the harness issue", which is settled the moment the chunk is grouped, while the
+        # metric lists answer "what did a request wait", which needs a call that returned. Counting
+        # only completed calls made a run that issued one shared forward and lost it to an error
+        # under `on_error="skip"` report the same `rows_grouped` and `max_chunk` as a runner with
+        # no batching at all (#592 review).
+        chunks += 1
+        if len(chunk) > 1:
+            rows_grouped += len(chunk)
+        else:
+            rows_alone += 1
+        if len(chunk) > max_chunk:
+            max_chunk = len(chunk)
         started = time.perf_counter()
         try:
             if len(chunk) > 1:
-                results = runner.predict_batch([e.state for e in chunk], chunk[0].questions,
-                                               model=chunk[0].model, batch_size=batch_size)
+                if batch_form == _BATCH_REQUESTS:
+                    # The chunk already shares one checkpoint and one question schema, so the
+                    # per-request dicts carry exactly what the positional call would pass.
+                    results = runner.predict_batch(
+                        [{"state": e.state, "questions": e.questions, "model": e.model}
+                         for e in chunk], batch_size=batch_size)
+                else:
+                    results = runner.predict_batch([e.state for e in chunk], chunk[0].questions,
+                                                   model=chunk[0].model, batch_size=batch_size)
             else:
                 results = [runner.predict(chunk[0].state, chunk[0].questions, model=chunk[0].model)]
         except Exception as exc:  # noqa: BLE001 -- honoured by on_error
@@ -344,7 +427,11 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
             index += len(chunk)
             continue
         elapsed = (time.perf_counter() - started) * 1000.0
-        latencies.extend([elapsed / len(chunk)] * len(chunk))
+        # A chunk is one call, so each of its rows waited all of `elapsed`; the split figure is a
+        # throughput share, not a latency, and putting the two in one list made a batched run
+        # publish a per-decision cost under the name of the per-request one (#585).
+        waits.extend([elapsed] * len(chunk))
+        shares.extend([elapsed / len(chunk)] * len(chunk))
         for offset, (example, result) in enumerate(zip(chunk, results)):
             answers = (result or {}).get("answers") or {}
             for qid, expected in example.expected.items():
@@ -370,10 +457,20 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
 
     report = EvalReport(config=dict(config or {}), cases=cases)
     report.overall = _aggregate(cases, evaluators)
-    if latencies:
-        ordered = sorted(latencies)
-        report.overall["latency_p50_ms"] = float(statistics.median(ordered))
-        report.overall["latency_p95_ms"] = float(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))])
+    if waits:
+        report.overall["latency_p50_ms"], report.overall["latency_p95_ms"] = _percentiles(waits)
+        (report.overall["cost_per_decision_p50_ms"],
+         report.overall["cost_per_decision_p95_ms"]) = _percentiles(shares)
+    report.config = dict(report.config, timing={
+        "latency_metric": "per request: the wall time of the call that returned it, unsplit",
+        "cost_metric": "per decision: that call divided by its own chunk size",
+        "batch_size": batch_size,
+        "batch_form": batch_form,
+        "chunks": chunks,
+        "rows_grouped": rows_grouped,
+        "rows_alone": rows_alone,
+        "max_chunk": max_chunk,
+    })
     for dimension in ("language", "model", "qid", "tag"):
         groups = _group_cases(cases, dimension)
         if groups:
