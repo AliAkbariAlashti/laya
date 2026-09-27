@@ -242,12 +242,15 @@ agent.predict(...)          # alias of system_one
 - On `predict_long` the hooks wrap the inference that answers the state, which for a document
   needing several windows is the single shared `predict_batch` over them: `on_predict_start` fires
   once, and `ctx.states` holds the decoded window texts in scan order rather than the caller's
-  state, which was tokenized to produce them. A start hook that answers with `ctx.skip(...)` is
-  answering the document, so its one result is returned as-is with no `window` key and
+  state, which was tokenized to produce them. A start hook may rewrite the text of those windows,
+  and what is scored is what it leaves behind, but it may not change how many there are or their
+  order -- the answer attributes itself to a span of the caller's document by index, so a call that
+  runs inference over any other number of states raises. A hook that means to answer the document
+  calls `ctx.skip(...)` instead: its one result is returned as-is with no `window` key and
   `usage["windows"]` at `0` -- no window scored it. `usage["windows"]` is total over the three
-  paths: `0` here, `1` for a state that fit a single window (a hook that answered it is answering
-  that one window, so the count is the same as the model's), and `N` for a document scanned in `N`
-  overlapping windows.
+  paths: `0` for a hook answer on either path, so a cached answer never reads as a window the model
+  read, `1` for a state that fit a single window and was scored, and `N` for a document scanned in
+  `N` overlapping windows.
 
 ### Router
 

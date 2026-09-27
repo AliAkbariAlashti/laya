@@ -578,12 +578,14 @@ result = agent.predict_long(state, questions, hooks=[AuditLog()])   # the scan, 
   document lets the neutral majority out-vote the one window that saw the deciding span.
 - A state that already fits one window is passed straight to `system_one` (identical output, plus
   `usage["windows"] = 1`). The key is total: `1` single window, `N` scanned windows, `0` a hook
-  answered a multi-window document before the model read any of it.
+  answered the document before the model read any of it.
 - Hooks wrap the inference that answers the state, so on a scanned document `on_predict_start`
   fires once with `ctx.states` holding the decoded windows, not the state you passed in (it was
-  tokenized to produce them). A start hook that answers with `ctx.skip(...)` is answering the
-  whole document: its result comes back with no `answer["window"]` and `usage["windows"]` at 0,
-  because no window scored it.
+  tokenized to produce them). A start hook may rewrite those window texts, and what is scored is
+  what it leaves behind, but it may not add, drop or reorder windows: the answer attributes itself
+  to a span of your document by index, so a call that runs inference over any other number of
+  states raises. A hook that means to answer the document calls `ctx.skip(...)` instead: its result
+  comes back with no `answer["window"]` and `usage["windows"]` at 0, because no window scored it.
 
 A smaller `window` isolates a short deciding span better (it becomes a larger fraction of its
 window); the default (`max_len - head_max_len`) favors context and throughput. Output shape matches

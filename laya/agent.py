@@ -29,8 +29,8 @@ from .common import (
     temp_bucket,
 )
 from .hooks import (
-    HookRegistry, PredictContext, aggregate_usage, compose_hooks, dispatch, normalise_hooks,
-    validate_timeout,
+    HookRegistry, PredictContext, _as_sequence, aggregate_usage, compose_hooks, dispatch,
+    normalise_hooks, validate_timeout,
 )
 from .revisions import resolve_revision, snapshot_revision, verify_digests
 
@@ -214,6 +214,34 @@ def _cuda_amp_dtype(checkpoint_default: Optional[str]) -> torch.dtype:
     if raw in ("bf16", "bfloat16"):
         return torch.bfloat16
     return amp_dtype(checkpoint_default)
+
+
+def _start_evidence():
+    """A recorder for `predict_long`: what the start-hook chain did, rather than what it cost.
+
+    Why a recorder at all: the result count cannot tell a hook that answered the document from a
+    hook that replaced the window list. Both return fewer results than there were windows, and the
+    two need opposite readings -- the first scored no window, the second scored the ones the hook
+    left behind, and booked tokens for them. `ctx.results` already distinguishes them, and only the
+    engine's own context sees it, so `predict_long` appends this probe to the call's start hooks.
+
+    Returns the probe and the dict it fills: `answered` is whether a hook replaced the call before
+    inference, `states` is the number of states that reached it.
+    """
+    evidence = {"answered": False, "states": None}
+
+    def probe(ctx):
+        evidence["answered"] = ctx.results is not None
+        evidence["states"] = len(ctx.states)
+
+    return probe, evidence
+
+
+def _with_start_probe(hook_kwargs, probe):
+    """`hook_kwargs` with `probe` appended after the caller's own start hooks."""
+    kwargs = dict(hook_kwargs)
+    kwargs["on_predict_start"] = list(_as_sequence(hook_kwargs.get("on_predict_start"))) + [probe]
+    return kwargs
 
 
 class Agent(HookRegistry):
@@ -986,9 +1014,11 @@ class Agent(HookRegistry):
         The hooks wrap the inference that answers the state, which for a document needing several
         windows is the one shared `predict_batch` over them: `on_predict_start` fires once, and
         `ctx.states` holds the decoded window texts in scan order -- not the caller's `state`, which
-        was tokenized to produce them. A start hook that rewrites `ctx.states` therefore rewrites
-        windows, and one that calls `ctx.skip(...)` is answering the document rather than a window,
-        so its payload is returned without window attribution.
+        was tokenized to produce them. A start hook may rewrite the text of those windows, and what
+        is scored is what it leaves behind. It may not change how many there are, or their order:
+        the per-window attribution names spans of the caller's document by index, so a different
+        count raises. A hook that means to answer the document itself calls `ctx.skip(...)`, whose
+        single payload is returned without window attribution.
 
         Args:
             window: state tokens per window. Defaults to the per-question state budget
@@ -1011,9 +1041,10 @@ class Agent(HookRegistry):
             hooks_timeout: Override the Agent's `hooks_timeout` for this call.
 
         Returns a single result dict, the same shape as `system_one`, with `usage["windows"]` added.
-        The key is always present and counts the windows the answer was read from: `1` for a state
-        that fit one window, `N` for a document scanned in `N` overlapping windows, and `0` when a
-        start hook answered a multi-window document before any window was scored.
+        The key is always present and counts the windows the model scored to produce the answer: `1`
+        for a state that fit one window, `N` for a document scanned in `N` overlapping windows, and
+        `0` when a start hook answered before any window was scored -- on either path, so a cached
+        answer never reads as a window the model read.
         """
         if aggregate != "auto":
             raise ValueError("predict_long: only aggregate='auto' is supported")
@@ -1032,8 +1063,13 @@ class Agent(HookRegistry):
         # shortest, most common inputs. The result is copied first: a start hook that answers with
         # `ctx.skip(...)` hands back its own payload dict, and it may be a cached object.
         if len(state_ids) <= budget:
-            single = dict(self.system_one(state, questions, lang=lang, **hook_kwargs))
-            single["usage"] = {**(single.get("usage") or {}), "windows": 1}
+            probe, evidence = _start_evidence()
+            single = dict(self.system_one(state, questions, lang=lang,
+                                          **_with_start_probe(hook_kwargs, probe)))
+            # Why 0 for a hook answer here: the state did fit one window, but no window was scored,
+            # which is the same fact the multi-window path reports as 0. Reading 1 would make a
+            # cached answer and a served answer agree on how much of the input the model saw.
+            single["usage"] = {**(single.get("usage") or {}), "windows": 0 if evidence["answered"] else 1}
             return single
 
         step = stride if (stride and stride > 0) else max(1, budget // 2)
@@ -1049,19 +1085,22 @@ class Agent(HookRegistry):
                 break
             i += step
 
-        results = self.predict_batch(windows, questions, batch_size=batch_size, lang=lang,
-                                     **hook_kwargs)
+        probe, evidence = _start_evidence()
+        # `list(windows)`, not `windows`: `ctx.states` is the list the hook receives, so a hook that
+        # mutates it in place (`append`, `sort`) would otherwise also grow the split this call
+        # attributes answers to, and the counts would agree while `starts` no longer lined up.
+        results = self.predict_batch(list(windows), questions, batch_size=batch_size, lang=lang,
+                                     **_with_start_probe(hook_kwargs, probe))
 
-        if len(results) != len(windows):
-            # Only a hook can change the count: `ctx.skip(...)` runs before the split, so a hook
-            # answering the whole document has no way to know how many windows it will produce and
-            # returns one result. Aggregating over that payload would pick between answers that were
-            # never scored and name a deciding window that decided nothing, so pass the document
-            # answer through unattributed and say which windows were scored: none of them.
+        if evidence["answered"]:
+            # The hook replaced the call before any window was scored. Aggregating over its payload
+            # would pick between answers that were never scored and name a deciding window that
+            # decided nothing, so pass the document answer through unattributed and report the
+            # count as what it is: none of them.
             if len(results) != 1:
                 raise ValueError(
-                    "predict_long: %d windows scored, %d results returned; a start hook that answers"
-                    " a long state returns one result for the document" % (len(windows), len(results)))
+                    "predict_long: a start hook answered this state with %d results; ctx.skip()"
+                    " takes one result for the document, not one per window" % len(results))
             warnings.warn("laya: predict_long: a hook answered the state before it was scanned, so "
                           "no window decided the result and none is reported", RuntimeWarning,
                           stacklevel=2)
@@ -1069,6 +1108,19 @@ class Agent(HookRegistry):
             document["usage"] = dict(document.get("usage") or {})
             document["usage"]["windows"] = 0
             return document
+
+        if len(results) != len(windows):
+            # A hook can also rewrite `ctx.states` and let inference run on what it left behind,
+            # which moves the count without answering anything. Those results cannot be attributed
+            # to windows of the caller's document -- the states that produced them are the hook's
+            # -- so refuse rather than name a span that was never read.
+            survived = ("" if evidence["states"] is None else
+                        " (%d states reached inference)" % evidence["states"])
+            raise ValueError(
+                "predict_long: the state was split into %d windows and the call returned %d"
+                " results%s; a start hook may rewrite the text of a window but not their number"
+                " or their order -- call ctx.skip([result]) to answer the document without scoring"
+                " it" % (len(windows), len(results), survived))
 
         ids = list(questions.keys())
         internal = {qid: self._to_internal(questions[qid]) for qid in ids}
