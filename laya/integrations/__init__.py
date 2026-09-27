@@ -1,4 +1,11 @@
 """Third-party agent and framework integrations for Laya."""
+from .crewai import (
+    CrewRouteDecision,
+    LayaCrewRouter,
+    LayaLowConfidenceError,
+    LayaTaskGuard,
+    LayaTaskGuardError,
+)
 from .langchain import (
     LayaDecision,
     LayaEvaluator,
@@ -24,5 +31,9 @@ __all__ = [
     "LayaSingleSelector",
     "LayaMultiSelector",
     "LayaQueryRouter",
+    "LayaCrewRouter",
+    "LayaTaskGuard",
+    "LayaTaskGuardError",
+    "CrewRouteDecision",
     "LayaLowConfidenceError",
 ]

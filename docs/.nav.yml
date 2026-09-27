@@ -7,6 +7,7 @@ nav:
       - hooks
       - langchain.md
       - llamaindex.md
+      - crewai.md
       - glob: "*"
         ignore_no_matches: true
   - Deployment:
