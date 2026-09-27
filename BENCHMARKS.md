@@ -394,7 +394,7 @@ Results (laya 0.3.20, CUDA; bootstrap CIs and raw predictions in the source repo
 
 Also measured: option-order flip rate 28% (CS) / 10.6% (voice); zh-CN to native zh-TW parallel-utterance flip rate 12.8%. Task framing differs from the sweep above (6-domain routing vs 20-way intent), so these complement rather than compare.
 
-Jev (jev-1.13, via Vercel AI Gateway) was also measured on the same zh voice-routing set: accuracy 0.944 / ECE 0.043 (n=179) — on par with Qwen3.5-2B and ahead of both Laya checkpoints; business-scenario questions were blocked by the gateway's free-tier model access, so the comparison there remains open.
+Jev (jev-latest, TypeSafe direct API) was measured on the full zh-decision-bench set (n=284): it wins or ties every question group — voice routing 0.941/ECE 0.045, CS routing 0.920/0.065, urgency 0.680, scam detection 0.933/ECE 0.084 — and is order-invariant (0-1.7% flips) and script-robust (zh-CN to native zh-TW flip 1.7%, no accuracy drop). A gateway-vs-direct channel check on the 179 shared voice items showed 100% decision agreement (TV 0.003).
 
 ### 3. Temperature refit for zh (official `temp_bucket` convention)
 
