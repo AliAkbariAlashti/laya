@@ -69,6 +69,10 @@ for label, fn in (("Agent.__init__", Agent.__init__), ("load", load),
 check_param("Router.__init__", Router.__init__, "lang_guess", None)
 check_param("Router.__init__", Router.__init__, "revisions", None)
 
+# load() forwards Agent's own construction options, so none of them is reachable only
+# through the class; tests/test_download.py asserts that against both signatures.
+check_param("load", load, "compile", False)
+
 # --------------------------------------------------------------- predict surfaces
 for label, fn in (("Agent.predict_batch", Agent.predict_batch),
                   ("Agent.system_one", Agent.system_one),

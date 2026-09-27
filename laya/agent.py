@@ -263,6 +263,12 @@ class Agent(HookRegistry):
         `fast=True` swaps the encoder/head forward for the TileLang fast path (CUDA only, needs
         `pip install laya[fast]`); see `Agent.accelerate`.
 
+        `compile=True` runs the model under `torch.compile` and turns ModernBERT's encoder
+        `reference_compile` on. `torch.compile` specializes per input shape and Laya sees a
+        new one on almost every request, so those graphs usually cost more than they return;
+        use it when the traffic is repetitive. `fast=True` takes precedence, because the
+        TileLang path replaces the forward that would be compiled.
+
         `subfolder` selects one checkpoint from a repo that bundles several, e.g.
         `Agent("convaiinnovations/laya", subfolder="multilingual")`. Only that subfolder is
         downloaded, so bundling does not cost every user the whole family.
@@ -1132,6 +1138,7 @@ RLAgent = Agent
 
 def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str] = None,
          token: Optional[str] = None, subfolder: Optional[str] = None, fast: bool = False,
+         compile: bool = False,
          revision: Optional[str] = None, expected_sha256: Optional[Dict[str, str]] = None,
          lang_temperatures: Optional[Dict[str, Dict[str, Any]]] = None,
          hooks=None, on_predict_start=None, on_predict_end=None,
@@ -1144,12 +1151,14 @@ def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str]
         laya.load("convaiinnovations/laya")                           # English (repo root)
         laya.load("convaiinnovations/laya", subfolder="multilingual")
         laya.load("convaiinnovations/laya", fast=True)                # TileLang GPU fast path
+        laya.load("convaiinnovations/laya", compile=True)              # torch.compile the model
 
     `revision`/`expected_sha256` pin and verify the downloaded artifacts; see `Agent`.
     `hooks` / `on_predict_start` / `on_predict_end` observe or shape every prediction; see
     `laya.hooks`.
     """
     return Agent(model_id_or_path, device=device, token=token, subfolder=subfolder, fast=fast,
+                 compile=compile,
                  revision=revision, expected_sha256=expected_sha256,
                  lang_temperatures=lang_temperatures,
                  hooks=hooks, on_predict_start=on_predict_start, on_predict_end=on_predict_end,
