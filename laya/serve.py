@@ -384,7 +384,11 @@ def create_app(router: Optional[Any] = None):
             # this the container logs show only the 500, so a deterministic failure such as a
             # missing C compiler for triton's JIT (#365) is invisible from the running server
             # and has to be reproduced in-process to be diagnosed at all.
-            _log.exception("inference failed for model=%s", model)
+            # `model` is caller-supplied text. `_resolve_model` has already reduced it to a
+            # shipped checkpoint name or None, and the line breaks are replaced so a crafted
+            # value cannot forge log entries (py/log-injection) if that ever stops holding.
+            _log.exception("inference failed for model=%s",
+                           str(model).replace("\n", "\\n").replace("\r", "\\r"))
             raise HTTPException(status_code=500, detail="inference failed")
 
     return app

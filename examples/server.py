@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import logging
 import os
 import re
 import time
@@ -59,6 +60,11 @@ import laya.serve as _laya_serve
 
 MAX_QUESTIONS = getattr(_laya_serve, "MAX_QUESTIONS", 64)
 MAX_STATE_CHARS = getattr(_laya_serve, "MAX_STATE_CHARS", 50_000)
+
+# The demo answers failures the way laya.serve does: a fixed message to the caller, the
+# traceback to this logger. Without it a 500 arrived as a bare status line in the server
+# output and the cause had to be reproduced in-process to be found at all.
+_log = logging.getLogger("laya.example-server")
 
 # --------------------------------------------------------------------------- #
 # Request / response models
@@ -275,8 +281,11 @@ def predict(req: PredictRequest) -> Dict[str, Any]:
         raise
     except (KeyError, ValueError) as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception as exc:  # inference failure
-        raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
+    except Exception:  # inference failure -- the policy laya.serve follows: the caller
+        # gets a fixed message, never the exception text, which describes the deployment
+        # (paths, libraries, memory) rather than the request.
+        _log.exception("prediction failed")
+        raise HTTPException(status_code=500, detail="prediction failed")
 
 
 @app.post("/predict/batch")
@@ -290,8 +299,9 @@ def predict_batch(req: BatchRequest) -> Dict[str, Any]:
             results.append(
                 _predict(state, questions, model=req.model, task=req.task, lang=req.lang)
             )
-        except Exception as exc:
-            results.append({"index": i, "error": f"{type(exc).__name__}: {exc}"})
+        except Exception:  # the index names the item; the cause stays in the log
+            _log.exception("prediction failed for batch item %d", i)
+            results.append({"index": i, "error": "prediction failed"})
     return {"count": len(results), "results": results}
 
 
@@ -3358,8 +3368,9 @@ async def gui_predict(request: Request) -> HTMLResponse:
             model=req.model, task=req.task, lang=req.lang,
         )
         res["_elapsed"] = time.perf_counter() - started
-    except Exception as exc:
-        return _gui_error("Prediction failed", [f"{type(exc).__name__}: {exc}"],
+    except Exception:
+        _log.exception("prediction failed (gui)")
+        return _gui_error("Prediction failed", ["The server could not complete this prediction."],
                           "Nothing was answered. The server log has the full trace.")
 
     answers = res.get("answers") or {}

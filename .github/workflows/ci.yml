@@ -132,6 +132,7 @@ jobs:
           python tests/test_portability.py
           python tests/test_training.py
           python tests/test_example_server_limits.py
+          python tests/test_example_server_errors.py
 
       - name: Email cleaning tests
         run: python tests/test_email.py
