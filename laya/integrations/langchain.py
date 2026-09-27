@@ -505,6 +505,13 @@ class LayaGuardrail(_BatchedRunnable, RunnableSerializable):
     Screens for prompt injections, jailbreaks, sensitive data, or custom harm
     criteria before passing inputs downstream. A list of inputs is screened in one
     shared forward pass through `batch`.
+
+    `threshold` is a violation probability in [0, 1] for every `noul` and `score`
+    question: for a `noul` question it applies to `noul`, and for a `score`
+    question to the probability that the level is at or above the middle of the
+    scale (`serious` or `severe` for the default `harm_severity`; the middle level
+    counts on an odd scale). Levels of a `score` question must run from harmless
+    to worst.
     """
 
     questions: Optional[Dict[str, Any]] = None
@@ -548,6 +555,8 @@ class LayaGuardrail(_BatchedRunnable, RunnableSerializable):
         hooks_timeout: Optional[float] = None,
         **kwargs: Any,
     ):
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be a probability in [0, 1]; got %r" % (threshold,))
         if _RUNNABLE_AVAILABLE:
             super().__init__(
                 questions=questions,
@@ -605,11 +614,24 @@ class LayaGuardrail(_BatchedRunnable, RunnableSerializable):
                     "probability": ans["noul"],
                     "confidence": ans.get("confidence", 0.0),
                 }
-            elif t == "score" and ans.get("score", 0.0) >= self.threshold:
-                violations[qid] = {
-                    "score": ans["score"],
-                    "confidence": ans.get("confidence", 0.0),
-                }
+            elif t == "score":
+                # `score` is the expected level (0..k-1), not a probability: gate on the
+                # probability that the level is at or above the middle of the scale. Without
+                # a distribution, the normalised expected level stands in for it.
+                probs = ans.get("probabilities") or {}
+                k = len(probs) or len(self._questions().get(qid, {}).get("criteria") or [])
+                if k < 2:
+                    p_violation = 0.0
+                elif probs:
+                    p_violation = sum(float(probs.get(str(i), 0.0)) for i in range(k // 2, k))
+                else:
+                    p_violation = ans.get("score", 0.0) / (k - 1)
+                if p_violation >= self.threshold:
+                    violations[qid] = {
+                        "score": ans.get("score", 0.0),
+                        "probability": round(p_violation, 4),
+                        "confidence": ans.get("confidence", 0.0),
+                    }
 
         is_safe = len(violations) == 0
 
