@@ -134,6 +134,8 @@ annotated = annotate_guard.invoke({"input": "Hello world"})
 print(annotated["guardrails"]["passed"])  # True
 ```
 
+`threshold` is a violation probability in [0, 1], and a value outside that range raises `ValueError`. For a `score` question such as `harm_severity`, it applies to the probability that the level is at or above the middle of the scale (`serious` or `severe`), not to the expected level in `score`, so a mostly `minor` answer does not block on its own.
+
 ---
 
 ## 3. Support Ticket Triage Node

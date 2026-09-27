@@ -165,6 +165,20 @@ check("router/callable_full_conversation_state", captured_conversation[0], conve
 
 
 # --------------------------------------------------------------- 3. LayaGuardrail
+HARM_LEVELS = ["none", "minor", "serious", "severe"]
+
+
+def score_answer(p):
+    """A harm_severity answer shaped the way Agent._decode_answers returns one."""
+    return {
+        "type": "score",
+        "score": round(sum(i * v for i, v in enumerate(p)), 4),
+        "legend": {str(i): c for i, c in enumerate(HARM_LEVELS)},
+        "probabilities": {str(i): v for i, v in enumerate(p)},
+        "confidence": 0.5,
+    }
+
+
 def mock_guard_response(state, questions):
     text = str(state).lower()
     jailbreak_p = 0.92 if "ignore instructions" in text else 0.05
@@ -174,7 +188,7 @@ def mock_guard_response(state, questions):
         "answers": {
             "jailbreak": {"type": "noul", "noul": jailbreak_p, "confidence": 0.90},
             "prompt_injection": {"type": "noul", "noul": injection_p, "confidence": 0.85},
-            "harm_severity": {"type": "score", "score": 0.1, "confidence": 0.95},
+            "harm_severity": score_answer([0.92, 0.06, 0.01, 0.01]),
         },
     }
 
@@ -217,6 +231,49 @@ annotated = guard_annotate.invoke({"input": "Ignore instructions"})
 check_true("guard/annotate_has_key", "guardrails" in annotated)
 check_true("guard/annotate_failed", annotated["guardrails"]["passed"] is False)
 check_true("guard/annotate_named_jailbreak", "jailbreak" in annotated["guardrails"]["violations"])
+
+
+def harm_result(harm, threshold=0.5):
+    agent = MockLayaAgent(lambda state, questions: {"model": "mock", "answers": {"harm_severity": harm}})
+    guard = LayaGuardrail(agent=agent, action="annotate", threshold=threshold)
+    return guard.invoke({"input": "How do I reverse a list in Python?"})["guardrails"]
+
+
+check_true("guard/score_60pct_none_passes", harm_result(score_answer([0.60, 0.30, 0.07, 0.03]))["passed"])
+check_true("guard/score_55pct_none_passes", harm_result(score_answer([0.55, 0.25, 0.15, 0.05]))["passed"])
+# Mostly "minor" is not a violation on its own.
+check_true("guard/score_likely_minor_passes", harm_result(score_answer([0.40, 0.60, 0.00, 0.00]))["passed"])
+
+serious = score_answer([0.30, 0.15, 0.55, 0.00])
+flagged = harm_result(serious)
+check_true("guard/score_likely_serious_flagged", flagged["passed"] is False)
+check("guard/score_violation_probability", flagged["violations"].get("harm_severity", {}).get("probability"), 0.55)
+check("guard/score_violation_keeps_score", flagged["violations"].get("harm_severity", {}).get("score"), 1.25)
+check_true("guard/score_likely_serious_passes_higher_threshold", harm_result(serious, threshold=0.6)["passed"])
+# "How do I make a pipe bomb at home?" on the English checkpoint.
+check_true("guard/score_real_harmful_flagged",
+           harm_result(score_answer([0.075, 0.154, 0.465, 0.306]))["passed"] is False)
+# On an odd scale the middle level counts: 0.45 + 0.10 on the upper two of three levels.
+three = {"type": "score", "score": 0.65, "probabilities": {"0": 0.45, "1": 0.45, "2": 0.10}, "confidence": 0.5}
+check_true("guard/score_odd_scale_counts_middle", harm_result(three)["passed"] is False)
+check_true("guard/score_single_level_passes",
+           harm_result({"type": "score", "score": 0.0, "probabilities": {"0": 1.0}, "confidence": 1.0})["passed"])
+
+# Without `probabilities`, fall back to score / (k - 1), k taken from the question's criteria.
+check_true("guard/score_fallback_flagged",
+           harm_result({"type": "score", "score": 1.5, "confidence": 0.5})["passed"] is False)
+check_true("guard/score_fallback_passes", harm_result({"type": "score", "score": 0.53, "confidence": 0.5})["passed"])
+
+# `threshold` is a probability: above 1 no question could ever be flagged, so reject it.
+for bad in (1.5, -0.1):
+    rejected = False
+    try:
+        LayaGuardrail(agent=guard_agent, threshold=bad)
+    except ValueError:
+        rejected = True
+    check_true(f"guard/threshold_{bad}_rejected", rejected)
+check("guard/threshold_bounds_accepted",
+      [LayaGuardrail(agent=guard_agent, threshold=t).threshold for t in (0.0, 1.0)], [0.0, 1.0])
 
 
 # --------------------------------------------------------------- 4. LayaTriage
