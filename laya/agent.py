@@ -25,6 +25,8 @@ from .common import (
     answer_confidence,
     confidence_from_probs,
     _resolve_noul_labels,
+    _reuse_question_tokens,
+    _disable_question_token_reuse,
     encode_text,
     render_options,
     serialize_state,
@@ -916,6 +918,7 @@ class Agent(HookRegistry):
         return answers
 
     @torch.no_grad()
+    @_reuse_question_tokens
     def predict_batch(self, states: List[Union[str, dict, list]], questions: Dict[str, Dict[str, Any]],
                       batch_size: Optional[int] = None, lang: Optional[str] = None,
                       hooks=None,
@@ -986,6 +989,8 @@ class Agent(HookRegistry):
                     raise TypeError(
                         "state must not be None; pass a string, dict, or list"
                     )
+                if len(states) == 1:
+                    _disable_question_token_reuse()
                 if not states:
                     ctx.results = []
                 else:

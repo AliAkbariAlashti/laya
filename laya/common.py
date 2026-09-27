@@ -4,6 +4,8 @@ import math
 import os
 import threading
 from contextlib import nullcontext
+from contextvars import ContextVar
+from functools import wraps
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -23,12 +25,50 @@ _DEFAULT_NOUL_LABELS = {"false": "false", "true": "true"}
 # `RuntimeError: Already borrowed`. Serialise encoding instead: it is a small fraction of a call
 # next to the forward pass, and this keeps the cache's single parse.
 _TOKENIZE_LOCK = threading.RLock()
+_QUESTION_TOKEN_CACHE = ContextVar("laya_question_token_cache", default=None)
 
 
 def encode_text(tok, text, **kwargs):
     """Tokenize `text` while holding the lock a shared fast tokenizer needs."""
     with _TOKENIZE_LOCK:
         return tok(text, **kwargs)
+
+
+def _reuse_question_tokens(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        # One cache per prediction call: nested calls get their own scope, and exceptions
+        # restore the outer scope. Nothing is retained on an Agent or shared across threads.
+        scope = {"thread": threading.get_ident(), "tokens": {}}
+        token = _QUESTION_TOKEN_CACHE.set(scope)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # A timed hook can copy this context to a worker that outlives the call.
+            scope["tokens"] = None
+            _QUESTION_TOKEN_CACHE.reset(token)
+    return wrapped
+
+
+def _disable_question_token_reuse():
+    scope = _QUESTION_TOKEN_CACHE.get()
+    if scope is not None:
+        scope["tokens"] = None
+
+
+def _encode_question_text(tok, text, **kwargs):
+    scope = _QUESTION_TOKEN_CACHE.get()
+    cache = scope["tokens"] if scope is not None and scope["thread"] == threading.get_ident() else None
+    if cache is None:
+        return encode_text(tok, text, **kwargs)["input_ids"]
+    # Key the rendered, mask-sanitized text and encoding settings, not a JSON question:
+    # option order, structured criteria and custom noul labels must keep their meaning.
+    key = (id(tok), text, tuple(kwargs.items()))
+    if key not in cache:
+        # Keep the tokenizer alive so its identity cannot be reused within this scope.
+        cache[key] = (tok, tuple(encode_text(tok, text, **kwargs)["input_ids"]))
+    # Sequence assembly must not mutate token lists retained for later states.
+    return list(cache[key][1])
 
 
 def serialize_state(state: Union[str, dict, list]) -> str:
@@ -116,19 +156,19 @@ def build_sequence(
     opts = render_options(q)
     order = option_order if option_order is not None else list(range(len(opts)))
     ins = str(q["ins"]).replace(mask_tok, " ")
-    head_ids = encode_text(tok, "%s question: %s" % (q["t"], ins), add_special_tokens=False)["input_ids"]
+    head_ids = _encode_question_text(tok, "%s question: %s" % (q["t"], ins), add_special_tokens=False)
     opt_ids = []
     for i in order:
         # Cap at the tokenizer, not after the fact: `[:48]` still makes the tokenizer process the
         # whole (possibly long) description. truncation=True, max_length=48 keeps the first 48
         # tokens, which is exactly what the previous slice produced.
-        opt_tokens = encode_text(
+        opt_tokens = _encode_question_text(
             tok,
             " " + opts[i].replace(mask_tok, " "),
             add_special_tokens=False,
             truncation=True,
             max_length=48,
-        )["input_ids"]
+        )
         opt_ids.append([tok.mask_token_id] + opt_tokens)
     opt_budget = head_max_len - sum(len(o) for o in opt_ids)
     per_option = None
