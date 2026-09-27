@@ -394,6 +394,8 @@ Results (laya 0.3.20, CUDA; bootstrap CIs and raw predictions in the source repo
 
 Also measured: option-order flip rate 28% (CS) / 10.6% (voice); zh-CN to native zh-TW parallel-utterance flip rate 12.8%. Task framing differs from the sweep above (6-domain routing vs 20-way intent), so these complement rather than compare.
 
+Jev (jev-1.13, via Vercel AI Gateway) was also measured on the same zh voice-routing set: accuracy 0.944 / ECE 0.043 (n=179) — on par with Qwen3.5-2B and ahead of both Laya checkpoints; business-scenario questions were blocked by the gateway's free-tier model access, so the comparison there remains open.
+
 ### 3. Temperature refit for zh (official `temp_bucket` convention)
 
 Refit on zh-decision-bench (multilingual checkpoint; 50/50 fit/test split by item hash), clamped to `[0.5, 5]`:
