@@ -719,9 +719,10 @@ class Router(HookRegistry):
         gets its own ``PredictContext``, so ``on_predict_start`` can replace that request's
         state, questions or token budget, or ``ctx.skip(...)`` it, and ``on_predict_end``
         sees and may replace its result. Requests are grouped for the forward pass after
-        their start hooks have run. If the batch fails, every request whose start hook ran
-        and that has no result gets ``on_error``, then every started request gets
-        ``on_predict_end``, before the exception propagates.
+        their start hooks have run, and a checkpoint group's requests end in reverse of the
+        order they started. If a checkpoint group fails, every request of it whose start hook
+        ran fails with the exception, a cache hit included: each gets ``on_error`` and then
+        ``on_predict_end`` before the exception propagates.
 
         Args:
             requests: Sequence of request dictionaries. Every item requires ``state`` and
@@ -743,10 +744,14 @@ class Router(HookRegistry):
         groups: Dict[str, List[int]] = {}
         for i, decision in enumerate(decisions):
             # Indexed, not `.model`: an on_route hook may replace the decision with a plain dict,
-            # which `predict` accepts too.
-            groups.setdefault(decision["model"], []).append(i)
+            # which `predict` accepts too. Normalised, because such a hook may name the checkpoint
+            # by an alias ("ml"), and that request must share its checkpoint's forward pass.
+            groups.setdefault(normalise_name(decision["model"]), []).append(i)
 
-        results: List[Optional[Dict[str, Any]]] = [None] * len(requests)
+        # Counted rather than marked with None: an end hook may leave a None result, which
+        # `predict` returns as it is.
+        results: List[Any] = [None] * len(requests)
+        answered = 0
         # `compose_hooks`, not `list(self.hooks)`: this is the composition `predict` uses at its
         # own dispatch site, and it is what merges in `set_default_hooks`. Reading the instance
         # list alone silently dropped every process-wide default from the batched path while
@@ -855,61 +860,69 @@ class Router(HookRegistry):
                     for (i, ctx), result in zip(items, batch_results):
                         result["routing"] = dict(decisions[i])
                         ctx.results = [result]
+
+                # Usage is summed here, not while ending, so a malformed usage block (a cached
+                # payload's, say) fails the group like any other error instead of escaping from
+                # the end loop before a single end hook has run.
+                usages = [aggregate_usage(ctx.results) for ctx in started]
+                for ctx, usage in zip(started, usages):
+                    ctx.usage = usage
             except BaseException as exc:
-                # Every started request is ended, so a hook that opens something in start (a
-                # span, an in-flight count) always sees the matching end. A request that already
-                # has its result keeps it; the rest failed with the batch.
-                for ctx in started:
-                    if ctx.results is None:
-                        ctx.error = exc
-                        try:
-                            dispatch(active, "on_error", ctx, raise_errors=raise_errors,
-                                     lock=self._hooks_lock, timeout=timeout)
-                        except BaseException as hook_exc:
-                            exc.__context__ = hook_exc
-                try:
-                    self._end_contexts(active, started, raise_errors, timeout)
-                except BaseException as hook_exc:
-                    exc.__context__ = hook_exc
+                # The caller gets this exception and no result, so every started request of the
+                # group failed with it, including a cache hit or a request whose question group
+                # had already run. Each is still ended, so a hook that opens something in start
+                # (a span, an in-flight count) always sees the matching end.
+                self._end_contexts(active, started, raise_errors, timeout, error=exc)
                 raise
 
             self._end_contexts(active, started, raise_errors, timeout)
             for i, ctx in zip(indices, started):
                 results[i] = ctx.results[0]
+            answered += len(indices)
+            # Drop this group's references before the next load() can evict its checkpoint:
+            # eviction's gc.collect() and empty_cache() only free an Agent nothing still holds,
+            # and every context of the group holds it as `ctx.agent`.
+            agent = ctx = started = question_groups = group = items = None
 
         # Every input index is assigned exactly once by construction. Keep this assertion local
         # so a future refactor cannot silently return a partially-filled batch.
-        if any(result is None for result in results):
+        if answered != len(requests):
             raise RuntimeError("internal error: batch execution did not produce every result")
 
-        return [result for result in results if result is not None]
+        return results
 
     predict_many = predict_batch
 
     def _end_contexts(self, active: List[Any], contexts: List[PredictContext], raise_errors: bool,
-                      timeout: Optional[float] = None) -> None:
-        """Finish each request of a batch the way `predict`'s `finally` finishes one.
+                      timeout: Optional[float] = None, error: Optional[BaseException] = None) -> None:
+        """Finish each request of a batch the way `predict` finishes one.
 
-        Every context gets its `on_predict_end` even if an earlier one's end hook raises; the
-        first such failure is raised afterwards. On a context that already failed, a raising
-        end hook is chained onto its error instead, as in `predict`. Timing and usage are set on
-        all of them first, so one request's `elapsed_ms` never includes another's end hooks.
+        `error` is the exception that failed the batch, if one did: every context then fails
+        with it and gets `on_error` before its `on_predict_end`, as in `predict`. Contexts end
+        in reverse of the order they started, because all of them started before any ends: a
+        hook that sets something in start and resets it in end (a contextvar, a tracing
+        context) must unwind the last one first. Every context gets its `on_predict_end` even if
+        another's hooks raise; the first such failure is raised afterwards. On a failed context,
+        a raising hook is chained onto its error instead, as in `predict`. `elapsed_ms` is set
+        on all of them first, so one request's never includes another's error or end hooks.
         """
         now = time.perf_counter()
         for ctx in contexts:
             ctx.elapsed_ms = (now - ctx.started_at) * 1000.0
-            if ctx.results is not None:
-                ctx.usage = aggregate_usage(ctx.results)
+            if error is not None:
+                ctx.error = error
         first_error: Optional[BaseException] = None
-        for ctx in contexts:
-            try:
-                dispatch(active, "on_predict_end", ctx, raise_errors=raise_errors,
-                         lock=self._hooks_lock, timeout=timeout)
-            except BaseException as hook_exc:
-                if ctx.error is not None:
-                    ctx.error.__context__ = hook_exc
-                elif first_error is None:
-                    first_error = hook_exc
+        for ctx in reversed(contexts):
+            events = ("on_error", "on_predict_end") if ctx.error is not None else ("on_predict_end",)
+            for event in events:
+                try:
+                    dispatch(active, event, ctx, raise_errors=raise_errors,
+                             lock=self._hooks_lock, timeout=timeout)
+                except BaseException as hook_exc:
+                    if ctx.error is not None:
+                        ctx.error.__context__ = hook_exc
+                    elif first_error is None:
+                        first_error = hook_exc
         if first_error is not None:
             raise first_error
 

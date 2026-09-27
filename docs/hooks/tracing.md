@@ -14,7 +14,8 @@ start, end and error events (and any spans it opens) without keeping its own boo
 ## run_id
 
 - A `uuid4().hex` string, created once per public call (`predict_batch`, `system_one`,
-  `Router.predict`, `ONNXAgent.system_one`).
+  `Router.predict`, `ONNXAgent.system_one`). `Router.predict_batch` creates one per request
+  instead, the `run_id` a `Router.predict` call for that request would have had.
 - Shared by every hook of that call, including `on_error` and `on_predict_end`.
 - Not global and not persisted: it identifies a call within the process. Put it in your logs and
   outbound payloads to correlate across systems.

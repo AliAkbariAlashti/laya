@@ -263,7 +263,9 @@ router.predict(
 
 ## Batch
 
-Hooks fire once per `predict_batch` call, with `ctx.states` holding every state.
+Hooks fire once per `Agent.predict_batch` call, with `ctx.states` holding every state.
+`Router.predict_batch` runs its Router-level hooks once per request instead, each with one state
+and its own `run_id`, so the same hook there writes one record per call of the hook.
 
 ```python
 def audit_batch(ctx):

@@ -111,6 +111,37 @@ def test_inference_exception_propagates_and_cache_remains_consistent(fake_agent)
     assert router.predict("after failure", Q, lang="ar")["answers"]["seen"] == "after failure"
 
 
+def test_evicted_checkpoint_is_unreferenced_when_it_is_evicted(monkeypatch):
+    # With max_loaded=1, loading the second group's checkpoint evicts the first. Eviction's
+    # gc.collect() / empty_cache() only give its memory back if predict_batch no longer holds
+    # it at that moment -- directly, or through the previous group's contexts.
+    import gc
+    import weakref
+
+    import laya.agent
+
+    refs = {}
+    evicted_alive = []
+
+    class Agent:
+        def __init__(self, repo, *, device, token, subfolder):
+            self.checkpoint = subfolder or "english"
+            refs[self.checkpoint] = weakref.ref(self)
+
+        def predict_batch(self, states, questions, batch_size=None):
+            return [{"answers": {"seen": state}, "usage": {}} for state in states]
+
+    class CheckFreed:
+        def on_evict(self, ctx):
+            gc.collect()
+            evicted_alive.append((ctx.model, refs[ctx.model]() is not None))
+
+    monkeypatch.setattr(laya.agent, "Agent", Agent)
+    router = Router(max_loaded=1, hooks=[CheckFreed()])
+    router.predict_batch([request("english text"), request("مرحبا")])
+    assert evicted_alive == [("english", False)]
+
+
 def test_warm_cache_and_repeated_batches(fake_agent):
     built, _ = fake_agent
     router = Router(max_loaded=2)
