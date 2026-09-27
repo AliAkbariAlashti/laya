@@ -227,19 +227,10 @@ DOC = {"model": "laya-rl-agent",
                    "flag": {"type": "noul", "noul": 0.2, "answer_confidence": 0.8}},
        "usage": {"input_tokens": 3, "output_tokens": 0}}
 
-# The control first: how many windows this state really splits into, measured from the forward
-# passes it costs rather than from the key under test. Two questions, one row each per window.
-scan = make_real_agent()
-base = scan.predict_long(LONG, Q)
-nwin = sum(scan._forward_calls) // 2
-check("scan/more than one window", nwin > 1, True)
-check("scan/the scan reports the windows it read", base["usage"]["windows"], nwin)
-check("scan/the deciding window is the last",
-      base["answers"]["dept"]["window"]["index"], nwin - 1)
-
-# The instrument for sections 8-8c: a hook that answers must return, and a hook that replaces the
-# window list must raise. Letting either unexpected case propagate would abort the suite and hide
-# every check after it, so each call is captured and its type asserted by a named check.
+# The instrument for sections 8-8e: a predict_long call is captured rather than let propagate, so
+# a case that ends in the wrong shape -- an answer that should have come back raising, or a
+# rejection that should not have happened at all -- fails a named check instead of aborting the run
+# and hiding every check after it.
 def _attempt(fn):
     """Call `fn`, returning (value, exception)."""
     try:
@@ -250,6 +241,19 @@ def _attempt(fn):
 
 def _kind(exc):
     return exc.__class__.__name__ if exc else None
+
+
+# The control first: how many windows this state really splits into, measured from the forward
+# passes it costs rather than from the key under test. Two questions, one row each per window.
+scan = make_real_agent()
+base, base_exc = _attempt(lambda: scan.predict_long(LONG, Q))
+check("scan/an unhooked scan returns", _kind(base_exc), None)
+nwin = sum(scan._forward_calls) // 2
+check("scan/more than one window", nwin > 1, True)
+check("scan/the scan reports the windows it read",
+      ((base or {}).get("usage") or {}).get("windows", "<absent>"), nwin)
+check("scan/the deciding window is the last",
+      ((base or {}).get("answers") or {}).get("dept", {}).get("window", {}).get("index"), nwin - 1)
 
 
 def _narrow(keep):
@@ -274,53 +278,70 @@ check("skip/no deciding window is claimed",
       sorted(k for v in answers.values() for k in v if k == "window"), [])
 check("skip/the caller is told", [w.category.__name__ for w in caught], ["RuntimeWarning"])
 
-# 8b. a start hook that replaces the window list is the other reading of the same count, and it is
-# not a hook answer: inference ran on the states the hook left behind.
+# 8b. a start hook that replaces the scan is the middle row: inference ran on the hook's states, so
+# the answers aggregate, the count is theirs, and no span of the caller's document is named -- the
+# offsets computed above describe windows that were not scored.
 a = make_real_agent()
 with warnings.catch_warnings(record=True) as caught:
     warnings.simplefilter("always")
-    _, narrow_exc = _attempt(lambda: a.predict_long(LONG, Q, on_predict_start=_narrow(1)))
-narrow_err = str(narrow_exc) if narrow_exc else "<no error>"
-check("narrow/rejects a list shortened to one state", _kind(narrow_exc), "ValueError")
-# Why this check sits next to the rejection: the forward is the proof that this was a rewrite and
-# not an answer, and it is what made the two cases indistinguishable before.
-check("narrow/a forward did run, so nothing was answered before inference",
-      a._forward_calls, [2])
-check("narrow/the rewrite is not called a hook answer",
+    narrow, narrow_exc = _attempt(lambda: a.predict_long(LONG, Q, on_predict_start=_narrow(1)))
+check("narrow/one state left behind is a scan, not a rejected count", _kind(narrow_exc), None)
+# Why the forward sits next to the count: it is the proof that tokens were spent, which is exactly
+# what made this case read as a hook answer before.
+check("narrow/inference ran on the state that was left", a._forward_calls, [2])
+check("narrow/the count is the state scored, not the split made",
+      ((narrow or {}).get("usage") or {}).get("windows", "<absent>"), 1)
+check("narrow/the tokens that forward booked are kept",
+      ((narrow or {}).get("usage") or {}).get("input_tokens", 0) > 0, True)
+check("narrow/no span of the caller's document is named",
+      sorted(k for v in (narrow or {}).get("answers", {}).values() for k in v if k == "window"), [])
+check("narrow/the answer is still aggregated",
+      (narrow or {}).get("answers", {}).get("dept", {}).get("type"), "choice")
+check("narrow/a rewrite is not warned about as a hook answer",
       [w.category.__name__ for w in caught], [])
-check_true("narrow/the error names the split it could not attribute",
-           ("split into %d windows" % nwin) in narrow_err, narrow_err)
-check_true("narrow/the error offers ctx.skip as the way to answer",
-           "ctx.skip" in narrow_err, narrow_err)
 a = make_real_agent()
-check_raises("narrow/rejects a list shortened to two states", ValueError,
-             lambda: a.predict_long(LONG, Q, on_predict_start=_narrow(2)))
-# the other direction, so the rule is the count rather than a hook that dropped something. The
-# error must name the caller's split: `predict_long` hands the hook a copy, so an in-place
-# `append` grows the hook's list and leaves the attributed windows alone.
+two, exc = _attempt(lambda: a.predict_long(LONG, Q, on_predict_start=_narrow(2)))
+check("narrow/two states left behind are counted as two",
+      ((two or {}).get("usage") or {}).get("windows", "<absent>"), 2)
+check("narrow/and two states is what the forward saw", a._forward_calls, [4])
+# the other direction, and in place: `predict_long` hands the hook a copy of its split, so the
+# state the hook invented is scored and counted without moving the windows computed above.
 a = make_real_agent()
-_, added_exc = _attempt(
+grown, exc = _attempt(
     lambda: a.predict_long(LONG, Q, on_predict_start=lambda ctx: ctx.states.append("invented")))
-added_err = str(added_exc) if added_exc else "<no error>"
-check("grow/rejects a list with a state added", _kind(added_exc), "ValueError")
-check_true("grow/the count is the caller's split, not the hook's list",
-           ("split into %d windows" % nwin) in added_err, added_err)
+check("grow/the hook's added state is scored",
+      ((grown or {}).get("usage") or {}).get("windows", "<absent>"), nwin + 1)
+check("grow/the caller's split is the one that was extended", a._forward_calls, [2 * (nwin + 1)])
+check("grow/and no span is named",
+      sorted(k for v in (grown or {}).get("answers", {}).values() for k in v if k == "window"), [])
 
-# 8c. rewriting the windows themselves stays supported: the count holds, so the attribution does
+# 8c. an unchanged scan keeps the attribution; any rewrite drops it, even one of the same length
 a = make_real_agent()
-res, exc = _attempt(
+noop, exc = _attempt(
     lambda: a.predict_long(LONG, Q, on_predict_start=lambda ctx: ctx.states.extend(())))
-check("rewrite/a no-op on the list scans as usual", _kind(exc), None)
-check("rewrite/a no-op on the list keeps the count",
-      ((res or {}).get("usage") or {}).get("windows", "<absent>"), nwin)
+check("rewrite/a no-op on the list changes nothing", _kind(exc), None)
+check("rewrite/a no-op keeps the count", ((noop or {}).get("usage") or {}).get("windows", "<absent>"), nwin)
+check("rewrite/a no-op keeps the deciding window",
+      ((noop or {}).get("answers") or {}).get("dept", {}).get("window", {}).get("index"), nwin - 1)
 a = make_real_agent()
-res, exc = _attempt(lambda: a.predict_long(
+upper, exc = _attempt(lambda: a.predict_long(
     LONG, Q, on_predict_start=lambda ctx: setattr(ctx, "states", [s.upper() for s in ctx.states])))
 check("rewrite/the hook's text is what was scored", (a._encoded or [""])[0].isupper(), True)
-check("rewrite/the same count is the same scan", _kind(exc), None)
-check("rewrite/the count is unchanged", ((res or {}).get("usage") or {}).get("windows", "<absent>"), nwin)
-check("rewrite/the deciding window is still named",
-      ((res or {}).get("answers") or {}).get("dept", {}).get("window", {}).get("index"), nwin - 1)
+check("rewrite/the same length is still the same count",
+      ((upper or {}).get("usage") or {}).get("windows", "<absent>"), nwin)
+check("rewrite/a text rewrite names no span",
+      sorted(k for v in (upper or {}).get("answers", {}).values() for k in v if k == "window"), [])
+
+# 8e. a hook that leaves nothing scores nothing: 0 windows and no answers, not a max() over []
+a = make_real_agent()
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    empty, exc = _attempt(
+        lambda: a.predict_long(LONG, Q, on_predict_start=lambda ctx: setattr(ctx, "states", [])))
+check("empty/nothing scored returns instead of raising", _kind(exc), None)
+check("empty/no answer is invented", (empty or {"answers": "?"}).get("answers", "?"), {})
+check("empty/the count says so", ((empty or {}).get("usage") or {}).get("windows", "<absent>"), 0)
+check("empty/the caller is told", [w.category.__name__ for w in caught], ["RuntimeWarning"])
 
 # 8d. the fits-in-one-window path answers to a hook too, so 0 keeps meaning "no window scored this"
 a = make_real_agent()
@@ -367,17 +388,17 @@ check("docs/README states the key is total", "The key is total" in bullet, True)
 check("docs/README documents all three counts", sorted(set(re.findall(r"`([0-9N])`", bullet))),
       ["0", "1", "N"])
 # The two rules this branch added, pinned where they are taught rather than in the code comment
-hooks_bullet = README[README.index("Hooks wrap the inference that answers the state"):][:800]
-check("docs/README says a hook may not change the window count or order",
-      "reorder windows" in hooks_bullet, True)
+hooks_bullet = README[README.index("Hooks wrap the inference that answers the state"):][:900]
+check("docs/README says attribution survives only an unchanged scan",
+      "reported when the scan reached inference unchanged" in hooks_bullet, True)
 check("docs/README names ctx.skip as the way to answer", "ctx.skip(...)" in hooks_bullet, True)
 API = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         "docs", "hooks", "api.md"), encoding="utf-8").read()
-api_para = API[API.index("On `predict_long` the hooks wrap"):][:1200]
-check("docs/api.md matches: count and order are fixed",
-      "or their" in api_para and "number of states raises" in api_para, True)
-check("docs/api.md matches: the hook answer reads as zero windows",
-      'usage["windows"]` at `0' in api_para, True)
+api_para = API[API.index("On `predict_long` the hooks wrap"):][:1600]
+check("docs/api.md tabulates the rewritten scan as its own case",
+      "| replaced the scan, in any way |" in api_para, True)
+check("docs/api.md tabulates a hook answer as zero windows",
+      "| answered with `ctx.skip([result])` | `0` |" in api_para, True)
 check("docs/predict_long's docstring says the key is total",
       "always present" in (Agent.predict_long.__doc__ or ""), True)
 
