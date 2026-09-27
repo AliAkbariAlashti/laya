@@ -12,7 +12,7 @@ from .presets import (
     triage_questions,
 )
 from .router import DEFAULT_MODELS, RouteDecision, Router
-from .structured import DecisionResult, decide
+from .structured import DecisionResult, decide, decide_batch
 
 __version__ = "0.3.20"
 
@@ -103,6 +103,7 @@ __all__ = [
     "BaseHook",
     "AsyncHook",
     "decide",
+    "decide_batch",
     "DecisionResult",
     "__version__",
 ]
