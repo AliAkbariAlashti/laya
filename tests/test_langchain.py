@@ -4,6 +4,7 @@ Tests verify routing logic, confidence threshold fallback gating, guardrail filt
 state extraction, schema-driven decisions, and LangGraph callable conventions without requiring
 model downloads or GPU.
 """
+import json
 import os
 import sys
 
@@ -815,13 +816,14 @@ for name, build in BUDGET_NODES:
           {"model": "laya-multilingual", "head_max_len": 256})
 
 
-# `laya-serve` has no budget field, so a remote node must refuse rather than drop the override.
+# `laya-serve` accepts `max_len` / `head_max_len` (#566), so a remote node forwards the override
+# in the request body instead of dropping it.
 budget_remote_calls = []
 _budget_real_call_remote = langchain_module._call_remote
 
 
-def budget_spy_call_remote(base_url, state, questions, api_key=None, model=None):
-    budget_remote_calls.append({"model": model})
+def budget_spy_call_remote(base_url, state, questions, api_key=None, model=None, **budget):
+    budget_remote_calls.append(dict({"model": model}, **budget))
     return {"answers": {"route": {"type": "choice", "choice": "billing", "confidence": 0.9}}}
 
 
@@ -833,17 +835,44 @@ try:
     check("budget/remote still sends model", budget_remote_calls[-1], {"model": None})
 
     for field in ("max_len", "head_max_len"):
-        raised, message = False, ""
-        try:
-            LayaRouter(BUDGET_CRITERIA, base_url="http://laya:8000", **{field: 512}).invoke("x")
-        except ValueError as e:
-            raised, message = True, str(e)
-        check_true("budget/remote refuses %s" % field, raised)
-        check_true("budget/remote %s names the endpoint" % field, "laya-serve" in message)
-
-    check("budget/remote made no extra call", len(budget_remote_calls), 1)
+        LayaRouter(BUDGET_CRITERIA, base_url="http://laya:8000", **{field: 512}).invoke("x")
+        check("budget/remote forwards %s" % field, budget_remote_calls[-1],
+              {"model": None, field: 512})
 finally:
     langchain_module._call_remote = _budget_real_call_remote
+
+# ...and the real `_call_remote` puts them in the JSON body.
+_sent = {}
+
+
+class _FakeResponse:
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self):
+        return b'{"answers": {}}'
+
+
+class _FakeOpener:
+    def open(self, req, timeout=None):
+        _sent["body"] = json.loads(req.data.decode("utf-8"))
+        return _FakeResponse()
+
+
+_real_build_opener = langchain_module.urllib.request.build_opener
+langchain_module.urllib.request.build_opener = lambda *a, **k: _FakeOpener()
+try:
+    langchain_module._call_remote("http://laya:8000", "x", {}, max_len=1024, head_max_len=384)
+    check("budget/_call_remote sends max_len", _sent["body"].get("max_len"), 1024)
+    check("budget/_call_remote sends head_max_len", _sent["body"].get("head_max_len"), 384)
+    langchain_module._call_remote("http://laya:8000", "x", {})
+    check_true("budget/_call_remote omits an unset budget",
+               "max_len" not in _sent["body"] and "head_max_len" not in _sent["body"])
+finally:
+    langchain_module.urllib.request.build_opener = _real_build_opener
 
 
 # --------------------------------------------------------------- 7. Prediction hooks

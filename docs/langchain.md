@@ -1,53 +1,3 @@
-
----
-
-## 5. Widening the Token Budget for Many Options
-
-Every runnable takes `max_len` and `head_max_len`, the two per-request knobs the core API accepts.
-A choice question's options share the checkpoint's *option* budget -- `head_max_len`, 192 tokens on
-`laya` and 256 on `laya-multilingual` -- and each option carries its own description, so past
-roughly 20 options every label is trimmed to fit and similar labels start reaching the model as the
-same text. See the README's [Honest limits](https://github.com/NandhaKishorM/laya#honest-limits)
-for the same effect measured on Banking77.
-
-Two situations call for it. A routing node with many branches overflows the *option* budget, and
-a long document overflows the *state* budget -- the README's own long-document guidance is literally
-`router.predict(long_document, questions, model="multilingual", max_len=8192)`, which until now was
-unspeakable from a chain step. Both go through the same two arguments:
-
-```python
-router = LayaRouter(
-    criteria=queue_criteria,          # 48 queues, each with a description
-    instructions="Which support queue owns this ticket?",
-    max_len=1024,                     # total window
-    head_max_len=512,                 # tokens shared by the option prompt
-)
-```
-
-Measured on `laya` (Apple silicon, one forward pass per state, scored on the chosen label) with
-queue labels a state names explicitly, so ground truth is exact. Each cell is the count over the
-full set, and all three repeats of every row gave the identical count:
-
-| Options | Default budget | `max_len=1024, head_max_len=512` |
-|---|---|---|
-| 24 | 24/24 | 20/24 |
-| 48 | 1/48 | 43/48 |
-| 72 | 1/72 | 63/72 |
-
-Both directions of that table matter. Past about 40 options the default budget collapses the
-decision, and widening it recovers most of it. Below that, widening it costs a few: at 24 options
-the labels already fit the default budget and four answers move. The docs do not claim to know why
-the wider collation changes those four -- it is enough that it can. That is why the two arguments
-are opt-in per node: set the knob to fix a question that does not fit, not to sharpen one that does.
-
-The same override applies to `LayaGuardrail`, `LayaTriage` and `LayaEvaluator`.
-It is per node, so a chain can give its wide routing step room while every other node keeps the
-checkpoint's defaults, which is the point of not raising `agent.cfg["head_max_len"]` process-wide.
-
-**Remote mode rejects it.** A budget override is applied by the local runner, and `laya-serve`
-neither accepts nor needs the field, so `max_len` or `head_max_len` on a node with a `base_url`
-raises `ValueError` instead of quietly doing nothing. Raise the budget on the server that runs
-inference.
 # LangChain & LangGraph Integration
 
 Laya provides fast, non-autoregressive decision components for **LangChain** and **LangGraph** (single-question latency measured at **32.8 ms** with `laya-multilingual` and **39.5 ms** with `laya` on a Tesla T4 GPU; 193–464 ms on CPU):
@@ -59,64 +9,6 @@ Laya provides fast, non-autoregressive decision components for **LangChain** and
 * **`LayaDecision`**: Schema-driven decisions -- a JSON schema or pydantic model in, schema-shaped values out.
 
 Every node also takes core's five per-call prediction-hook arguments (`hooks`, `on_predict_start`, `on_predict_end`, `hooks_raise`, `hooks_timeout`).
-
----
-
-## 5. Prediction Hooks on a Single Node
-
-Every runnable takes the five per-call hook arguments the core API takes -- `hooks`,
-`on_predict_start`, `on_predict_end`, `hooks_raise`, `hooks_timeout` -- so the caching, audit and
-gating patterns from [Prediction hooks](hooks/index.md) can be attached to one node in a graph
-instead of to the whole agent. See [Patterns and anti-patterns](hooks/patterns.md) for the cache
-pair this is built around.
-
-```python
-from laya.integrations.langchain import LayaRouter
-
-class Memo:
-    def __init__(self):
-        self.cache = {}
-
-    def on_predict_start(self, ctx):
-        hit = self.cache.get(str(ctx.states[0]))
-        if hit is not None:
-            ctx.skip([hit])          # the forward pass is skipped; end hooks still run
-
-    def on_predict_end(self, ctx):
-        if ctx.results:
-            self.cache[str(ctx.states[0])] = ctx.results[0]
-
-
-router = LayaRouter(
-    criteria={"billing": "invoices, charges, refunds", "technical": "bugs, errors, outage"},
-    hooks=[Memo()],
-    hooks_timeout=0.25,
-)
-```
-
-Leave an argument out and it is not sent at all, so the node keeps whatever the runner was built
-with. `hooks=[]` and `hooks_raise=False` are decisions rather than absences and are forwarded as
-given: the first means "no hooks for this call" even on an agent that has some, the second means
-"keep deciding after a hook fails". Both belong to [the error contract in hooks/errors.md](hooks/errors.md).
-
-**What it buys.** On `laya` (Apple silicon) a 24-state pass over 4 distinct tickets, median of 3
-runs, scored on the returned route label:
-
-| Node | Forward passes | Wall clock |
-|---|---|---|
-| no hooks | 24 | 2109 ms |
-| `hooks=[Memo(), Counter()]`, cold cache | 4 | 330 ms |
-| `hooks=[Memo(), Counter()]`, warm cache | 0 | 0.3 ms |
-
-All 24 routes were identical to the hook-free node's. The cold run is 4 forwards rather than 24
-because the distinct tickets are the only ones that can miss; a warm cache answers the whole pass
-from memory, which is the point of the pattern and not a speedup of the model. The same pair wired
-through `on_predict_start=`/`on_predict_end=` instead of `hooks=` measured 359 ms cold.
-
-**Remote mode refuses them.** A hook is a Python callable that runs inside `predict`, and
-`laya-serve` has no way to receive or run one, so a node with a `base_url` and any of the five set
-raises `ValueError` naming the arguments rather than reporting success for a cache that never ran.
-Install hooks on the process that runs inference.
 
 Supports both **local in-process inference** (`Agent` or `Router`) and **remote HTTP inference** against your own `laya-serve` without requiring PyTorch on edge clients.
 
@@ -409,3 +301,110 @@ guard `LayaGuardrail`: 4173 ms vs **2329 ms** (**1.8x**). Route labels and guard
 identical to the one-by-one loop in every run (0/16 and 0/24 changes). On CPU the same workloads are
 2.2x to 2.4x over the one-by-one loop, but only 1.1x to 1.5x over the thread pool, which already
 overlaps cores -- the MPS case is where `batch()` was not just slower but unusable.
+
+---
+
+## 7. Widening the Token Budget for Many Options
+
+Every runnable takes `max_len` and `head_max_len`, the two per-request knobs the core API accepts.
+A choice question's options share the checkpoint's *option* budget -- `head_max_len`, 192 tokens on
+`laya` and 256 on `laya-multilingual` -- and each option carries its own description, so past
+roughly 20 options every label is trimmed to fit and similar labels start reaching the model as the
+same text. See the README's [Honest limits](https://github.com/NandhaKishorM/laya#honest-limits)
+for the same effect measured on Banking77.
+
+Two situations call for it. A routing node with many branches overflows the *option* budget, and
+a long document overflows the *state* budget -- the README's own long-document guidance is literally
+`router.predict(long_document, questions, model="multilingual", max_len=8192)`, which until now was
+unspeakable from a chain step. Both go through the same two arguments:
+
+```python
+router = LayaRouter(
+    criteria=queue_criteria,          # 48 queues, each with a description
+    instructions="Which support queue owns this ticket?",
+    max_len=1024,                     # total window
+    head_max_len=512,                 # tokens shared by the option prompt
+)
+```
+
+Measured on `laya` (Apple silicon, one forward pass per state, scored on the chosen label) with
+queue labels a state names explicitly, so ground truth is exact. Each cell is the count over the
+full set, and all three repeats of every row gave the identical count:
+
+| Options | Default budget | `max_len=1024, head_max_len=512` |
+|---|---|---|
+| 24 | 24/24 | 20/24 |
+| 48 | 1/48 | 43/48 |
+| 72 | 1/72 | 63/72 |
+
+Both directions of that table matter. Past about 40 options the default budget collapses the
+decision, and widening it recovers most of it. Below that, widening it costs a few: at 24 options
+the labels already fit the default budget and four answers move. The docs do not claim to know why
+the wider collation changes those four -- it is enough that it can. That is why the two arguments
+are opt-in per node: set the knob to fix a question that does not fit, not to sharpen one that does.
+
+The same override applies to `LayaGuardrail`, `LayaTriage` and `LayaEvaluator`.
+It is per node, so a chain can give its wide routing step room while every other node keeps the
+checkpoint's defaults, which is the point of not raising `agent.cfg["head_max_len"]` process-wide.
+
+**Remote mode forwards it.** A node with a `base_url` sends `max_len` / `head_max_len` in the
+request body, and `laya-serve` applies them up to its `LAYA_MAX_TOKEN_BUDGET` ceiling (8192 by
+default); a larger value comes back as a 422.
+
+---
+
+## 8. Prediction Hooks on a Single Node
+
+Every runnable takes the five per-call hook arguments the core API takes -- `hooks`,
+`on_predict_start`, `on_predict_end`, `hooks_raise`, `hooks_timeout` -- so the caching, audit and
+gating patterns from [Prediction hooks](hooks/index.md) can be attached to one node in a graph
+instead of to the whole agent. See [Patterns and anti-patterns](hooks/patterns.md) for the cache
+pair this is built around.
+
+```python
+from laya.integrations.langchain import LayaRouter
+
+class Memo:
+    def __init__(self):
+        self.cache = {}
+
+    def on_predict_start(self, ctx):
+        hit = self.cache.get(str(ctx.states[0]))
+        if hit is not None:
+            ctx.skip([hit])          # the forward pass is skipped; end hooks still run
+
+    def on_predict_end(self, ctx):
+        if ctx.results:
+            self.cache[str(ctx.states[0])] = ctx.results[0]
+
+
+router = LayaRouter(
+    criteria={"billing": "invoices, charges, refunds", "technical": "bugs, errors, outage"},
+    hooks=[Memo()],
+    hooks_timeout=0.25,
+)
+```
+
+Leave an argument out and it is not sent at all, so the node keeps whatever the runner was built
+with. `hooks=[]` and `hooks_raise=False` are decisions rather than absences and are forwarded as
+given: the first means "no hooks for this call" even on an agent that has some, the second means
+"keep deciding after a hook fails". Both belong to [the error contract in hooks/errors.md](hooks/errors.md).
+
+**What it buys.** On `laya` (Apple silicon) a 24-state pass over 4 distinct tickets, median of 3
+runs, scored on the returned route label:
+
+| Node | Forward passes | Wall clock |
+|---|---|---|
+| no hooks | 24 | 2109 ms |
+| `hooks=[Memo(), Counter()]`, cold cache | 4 | 330 ms |
+| `hooks=[Memo(), Counter()]`, warm cache | 0 | 0.3 ms |
+
+All 24 routes were identical to the hook-free node's. The cold run is 4 forwards rather than 24
+because the distinct tickets are the only ones that can miss; a warm cache answers the whole pass
+from memory, which is the point of the pattern and not a speedup of the model. The same pair wired
+through `on_predict_start=`/`on_predict_end=` instead of `hooks=` measured 359 ms cold.
+
+**Remote mode refuses them.** A hook is a Python callable that runs inside `predict`, and
+`laya-serve` has no way to receive or run one, so a node with a `base_url` and any of the five set
+raises `ValueError` naming the arguments rather than reporting success for a cache that never ran.
+Install hooks on the process that runs inference.

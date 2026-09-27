@@ -105,8 +105,14 @@ def _call_remote(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     timeout: float = 10.0,
+    max_len: Optional[int] = None,
+    head_max_len: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Send decision request to a remote laya-serve HTTP instance using standard library urllib."""
+    """Send decision request to a remote laya-serve HTTP instance using standard library urllib.
+
+    `max_len` / `head_max_len` travel in the body; laya-serve applies them up to its
+    `LAYA_MAX_TOKEN_BUDGET` ceiling and answers a larger value with 422.
+    """
     url = base_url.rstrip("/")
     if not url.endswith("/v1/systemone"):
         url = f"{url}/v1/systemone"
@@ -114,6 +120,10 @@ def _call_remote(
     payload: Dict[str, Any] = {"state": state, "questions": questions}
     if model:
         payload["model"] = model
+    if max_len is not None:
+        payload["max_len"] = max_len
+    if head_max_len is not None:
+        payload["head_max_len"] = head_max_len
 
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -144,22 +154,6 @@ def _get_default_router():
                 from ..router import Router
                 _DEFAULT_ROUTER = Router()
     return _DEFAULT_ROUTER
-
-
-def _reject_remote_budget(max_len: Optional[int], head_max_len: Optional[int],
-                          base_url: Optional[str]) -> None:
-    """Refuse a budget override on a remote node rather than dropping it silently.
-
-    `laya-serve` has no budget field of its own -- it answers within the checkpoint's defaults and
-    rejects an oversized question with 413. The budget decides how many tokens each option gets, so
-    ignoring it can change the label the model returns; a caller must not be told it applied when
-    it could not.
-    """
-    if base_url and (max_len is not None or head_max_len is not None):
-        raise ValueError(
-            "max_len/head_max_len are applied by the local runner and cannot be sent to a "
-            "laya-serve endpoint; raise the budget where serve runs, or drop the override"
-        )
 
 
 def _predict_kwargs(model: Optional[str] = None, max_len: Optional[int] = None,
@@ -221,9 +215,11 @@ def _execute_decision(
 ) -> Dict[str, Any]:
     hook_kwargs = _hook_kwargs(hooks, on_predict_start, on_predict_end, hooks_raise, hooks_timeout)
     if base_url:
-        _reject_remote_budget(max_len, head_max_len, base_url)
         _reject_remote_hooks(hook_kwargs, base_url)
-        return _call_remote(base_url, state, questions, api_key=api_key, model=model)
+        # Only what was set, so a stand-in `_call_remote` without the budget keywords still works.
+        budget = {k: v for k, v in (("max_len", max_len), ("head_max_len", head_max_len))
+                  if v is not None}
+        return _call_remote(base_url, state, questions, api_key=api_key, model=model, **budget)
     runner = agent if agent is not None else _get_default_router()
     kwargs = _predict_kwargs(model, max_len, head_max_len)
     kwargs.update(hook_kwargs)
