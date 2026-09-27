@@ -136,6 +136,20 @@ jobs:
           python tests/test_training.py
           python tests/test_example_server_limits.py
 
+      - name: LangChain integration runs on the real base class
+        run: |
+          # The install above is what makes tests/test_langchain.py run on real Runnables, and
+          # nothing proves it took: with langchain-core missing, the eight checks inside that
+          # file's `if _RUNNABLE_AVAILABLE:` block vanish instead of failing, and it still
+          # prints FAIL: 0 -- measured here: PASS: 87 with the extra, PASS: 80 without, exit 0
+          # both ways. This step asserts the install took, then checks what only a real install
+          # can check.
+          python -c "from laya.integrations.langchain import RunnableSerializable; \
+            assert RunnableSerializable is not object, \
+            'langchain-core is missing: laya.integrations.langchain fell back to a plain object, ' \
+            'so the LangChain suites in this job test a shape no install produces'"
+          python tests/test_langchain_real_mode.py
+
       - name: Email cleaning tests
         run: python tests/test_email.py
       # Full dependency tree here, so the stub pipeline and the metric pins that need numpy
