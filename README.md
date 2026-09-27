@@ -722,7 +722,8 @@ agent.decide("I was charged twice, refund me.", schema=schema)
 ```
 
 `decide` also works on a `Router`, accepts a pydantic model (install `laya[structured]`), and can
-return per-field confidence with `return_details=True`. See [`docs/structured.md`](docs/structured.md).
+return per-field confidence with `return_details=True`. In an LCEL chain or LangGraph node the
+same call is `LayaDecision`. See [`docs/structured.md`](docs/structured.md).
 
 For throughput, `decide_batch` answers a list of states against the *same* schema through
 `predict_batch` (see [Batch Mode](#batch-mode-score-many-states-in-one-forward-pass)), so the schema
@@ -774,7 +775,7 @@ triage = agent.predict({"message": "My payment failed twice"}, laya.triage_quest
 Fast System 1 routing and guardrails directly inside LangGraph workflows and LCEL chains:
 
 ```python
-from laya.integrations.langchain import LayaRouter, LayaGuardrail
+from laya.integrations.langchain import LayaDecision, LayaGuardrail, LayaRouter
 
 # 1. Sub-35ms LangGraph conditional edge routing with confidence fallback
 router = LayaRouter(
@@ -787,7 +788,18 @@ workflow.add_conditional_edges("triage", router)
 # 2. Inline prompt guardrails
 guard = LayaGuardrail(action="raise")  # raises LayaGuardrailError on jailbreak/injection
 
-# 3. Score a backlog in one batched call, not one forward pass per input
+# 3. Schema-driven decisions: a JSON schema in, schema-shaped values out
+decide = LayaDecision({
+    "type": "object",
+    "properties": {
+        "department": {"type": "string", "enum": ["billing", "technical", "other"]},
+        "needs_human": {"type": "boolean"},
+    },
+})
+decide.invoke("I was charged twice and the API still 500s for us.")
+# {'department': 'billing', 'needs_human': False}
+
+# 4. Score a backlog in one batched call, not one forward pass per input
 routes = router.batch(["refund my invoice", "the app crashes", "change my password"])
 ```
 
