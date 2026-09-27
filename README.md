@@ -27,12 +27,11 @@
 python -m pip install laya
 ```
 
-For TypeScript / Node.js / browser:
-```bash
-npm install laya-ts
-```
+With [uv](https://docs.astral.sh/uv/), run `uv add laya` in a uv project or `uv pip install laya` in a virtual environment.
 
-Python 3.10 or newer. Optional extras: `laya[serve]` (HTTP server), `laya[mcp]` (MCP server), `laya[langchain]` (LangChain and LangGraph), `laya[onnx]` (ONNX Runtime), `laya[fast]` (TileLang GPU fast path). See [`laya-ts/`](laya-ts/) for the TypeScript runtime guide. Step-by-step setup for each platform, CPU-only or GPU PyTorch builds, and troubleshooting are in [Installation details](#installation-details).
+Python 3.10 or newer. Optional extras: `laya[serve]` (HTTP server), `laya[mcp]` (MCP server), `laya[langchain]` (LangChain and LangGraph), `laya[llamaindex]` (LlamaIndex selectors), `laya[crewai]` (CrewAI routing), `laya[onnx]` (ONNX Runtime), `laya[fast]` (TileLang GPU fast path). Step-by-step setup for each platform, CPU-only or GPU PyTorch builds, and troubleshooting are in [Installation details](#installation-details).
+
+For TypeScript / Node.js / browser, see [`laya-ts/`](laya-ts/). npm releases (`npm install laya-ts`) are published from this repository's `laya-ts-v*` release tags.
 
 **Long documents.** `laya-multilingual` reads up to 8,192 tokens with `max_len=8192`. Measured accuracy and time by document length, reproducible with [`research/scripts/bench_long_context.py`](https://github.com/NandhaKishorM/laya/blob/main/research/scripts/bench_long_context.py):
 
@@ -185,6 +184,26 @@ To use the development version instead of the PyPI release, create the virtual e
 ```
 
 Run the same version check afterward. The GitHub version follows the repository's default branch and may differ from the published release.
+
+**Install with uv**
+
+[uv](https://docs.astral.sh/uv/) creates the virtual environment, downloads a matching Python if none is installed, and installs into it. The commands are the same on macOS, Linux and Windows PowerShell:
+
+```bash
+uv venv --python 3.12
+uv pip install laya
+```
+
+`uv pip install` targets the `.venv` in the current directory without activating it, so run the version check for your platform above afterward. Extras and the GitHub version install the same way: `uv pip install "laya[serve]"`, `uv pip install "git+https://github.com/NandhaKishorM/laya.git"`. For a CPU-only or GPU-specific PyTorch build, add `--torch-backend=auto` to pick the build that matches the machine's GPU driver, or name one such as `--torch-backend=cpu`; [uv's PyTorch guide](https://docs.astral.sh/uv/guides/integration/pytorch/) has the list.
+
+If your application is a uv project, add Laya as a dependency instead:
+
+```bash
+uv add laya
+uv run python -I -c "import laya; print(laya.__version__)"
+```
+
+`--torch-backend` applies to `uv pip` only; in a uv project, uv's PyTorch guide shows how to set the PyTorch index in `pyproject.toml`.
 
 **Model setup and troubleshooting**
 
