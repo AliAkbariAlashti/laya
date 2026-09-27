@@ -90,6 +90,38 @@ in
       '';
     };
 
+    logLevel = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "warning";
+      description = ''
+        uvicorn's log level (sets `LAYA_LOG_LEVEL`), one of `critical`, `error`,
+        `warning`, `info`, `debug`, `trace`. `info`, which the server uses when
+        this is unset, logs a line per request, so on a busy decision endpoint it
+        is most of the unit's journal traffic; `warning` keeps startup and errors.
+        Not an `enum` over those names: uvicorn checks the value, and a copy here
+        could only fall behind it. null leaves the server's own default.
+      '';
+    };
+
+    maxConcurrent = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      example = 4;
+      description = ''
+        Cap on requests admitted at once (sets `LAYA_MAX_CONCURRENT`). A request
+        that arrives with every slot taken is refused with HTTP 503 right away
+        rather than queued, which is what keeps the bodies held in memory
+        bounded. Lower it on a host where a queue of forwards is worse
+        than a refusal — measured on the `english` checkpoint, CPU, 16
+        simultaneous requests: the median accepted request answered in 64 ms at a
+        cap of 1 and 542 ms at 16, and 15 of 16 were refused in under 0.1 ms at
+        that cap against none at 16. So the knob trades the latency of the
+        requests that get through against the number turned away, and a host
+        needs to be able to pick. null leaves the server's own default.
+      '';
+    };
+
     autoTaskDetection = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -137,6 +169,10 @@ in
       } // lib.optionalAttrs (cfg.threads != null) {
         LAYA_THREADS = toString cfg.threads;
         OMP_NUM_THREADS = toString cfg.threads;
+      } // lib.optionalAttrs (cfg.logLevel != null) {
+        LAYA_LOG_LEVEL = cfg.logLevel;
+      } // lib.optionalAttrs (cfg.maxConcurrent != null) {
+        LAYA_MAX_CONCURRENT = toString cfg.maxConcurrent;
       } // {
         HF_HOME = "/var/lib/${cfg.stateDirectory}/huggingface";
         # torch-bin bundles its own CUDA runtime but still needs the host

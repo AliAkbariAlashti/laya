@@ -284,6 +284,61 @@ check_true("nix/module still joins models into LAYA_MODELS",
            re.search(r'LAYA_MODELS = lib\.concatStringsSep "," cfg\.models;', nix_module) is not None,
            "the models option no longer feeds LAYA_MODELS; these checks need retargeting")
 
+# ---- every knob the server reads from the environment has to be reachable from the module
+# `laya.serve` has no config file and no CLI flag for any of it: it configures itself from LAYA_*
+# and nothing else. On a NixOS host the unit's environment is the only thing that can hand those
+# variables over, so a name the module never assigns is a control that host cannot ask for. Two
+# were missing: `LAYA_LOG_LEVEL`, and `LAYA_MAX_CONCURRENT` -- the admission bound, which is what
+# keeps the bodies buffered in memory bounded and refuses the excess with 503.
+serve_src = read(os.path.join("laya", "serve.py"))
+served = sorted(
+    set(re.findall(r'environ\.get\("(LAYA_[A-Z_]+)"', serve_src))
+    | set(re.findall(r'_env_bool\("(LAYA_[A-Z_]+)"', serve_src))
+)
+# Non-vacuity again: if the derivation found nothing, both directions below pass for free.
+check_true("nix/serve.py's environment reads were found", len(served) >= 5,
+           "got %r -- retarget this if laya/serve.py changes shape" % (served,))
+
+# An assignment only. The `models` description names `LAYA_MODELS` in prose, and prose that
+# mentions a variable sets nothing.
+assigned = sorted(set(re.findall(r'\b(LAYA_[A-Z_]+)\s*=', nix_module))
+                  | set(re.findall(r'export (LAYA_[A-Z_]+)=', nix_module)))
+check("nix/module reaches every env var laya.serve reads",
+      [n for n in served if n not in assigned], [])
+# The other direction is the silent failure: a misspelled name is a perfectly good string,
+# systemd exports it, no Python ever looks at it, and the operator's setting does nothing.
+check("nix/module assigns no env var laya.serve never reads",
+      [n for n in assigned if n not in served], [])
+
+# An option that nothing reads is a promise the unit does not keep, and the mirror case -- a
+# setting the unit applies with no option to turn it -- is a host that cannot change it.
+declared = re.findall(r"^    ([a-zA-Z]+) = lib\.mkOption \{", nix_module, re.M)
+check_true("nix/module's options were found", len(declared) >= 5,
+           "got %r -- retarget this if the option block changes shape" % (declared,))
+check("nix/every declared option is used by the unit",
+      [n for n in declared if "cfg.%s" % n not in nix_module], [])
+
+# Both new options are opt-in: unset means the unit exports nothing and the server's own default
+# applies, so a host that ignores them gets today's behaviour byte for byte.
+for opt in ("logLevel", "maxConcurrent"):
+    _b = re.search(r"^    %s = lib\.mkOption \{(.*?)\n    \};" % opt, nix_module, re.S | re.M)
+    check_true("nix/module declares %s" % opt, _b is not None, "option not found")
+    _t = _b.group(1) if _b else ""
+    check_true("nix/%s is opt-in (nullOr, default null)" % opt,
+               _t.count("nullOr") == 1 and re.search(r"^\s*default = null;", _t, re.M) is not None,
+               _t.strip()[:120])
+    check_true("nix/%s is guarded by a != null optionalAttrs" % opt,
+               re.search(r"lib\.optionalAttrs \(cfg\.%s != null\)" % opt, nix_module) is not None,
+               "the unit would export the variable even when the host left it unset")
+
+# The same lesson as `models`, stated for the whole module: no option may carry a closed list of
+# names that somebody else validates. uvicorn checks the log level, laya checks the checkpoint
+# name, and a copy here can only fall behind them -- which is how the module came to refuse ten
+# spellings of a value the server accepts.
+check_true("nix/module declares no closed enum over names it does not own",
+           "types.enum" not in nix_module, "an enum in this module is a copy of someone "
+           "else's list; defer to the thing that validates the value")
+
 # --------------------------------------------------------------- declared extras
 # The runtime error in laya/structured.py tells users to install `laya[structured]`, and the
 # docs and README repeat it. A reference to an extra pyproject.toml does not declare is a dead
