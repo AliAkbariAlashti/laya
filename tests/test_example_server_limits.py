@@ -17,10 +17,22 @@ Driven over HTTP through TestClient. No weights are loaded; the router stays unb
 a request that passes validation answers 503, which is the assertion for "accepted". The
 one arm that needs a Router enters the lifespan, which is also the arm that checks the cap.
 
-On `main` this file is 19 checks, all of them about request size. It is now 37: the other
-eighteen follow the cap from the environment to the constructor, to the running Router, to
+On `main` this file is 19 checks, all of them about request size. It is now 38: the other
+nineteen follow the cap from the environment to the constructor, to the running Router, to
 `/health` in both JSON and HTML, and back out through the `--reload` push. The first
 nineteen are untouched.
+
+FAILS_ON_MAIN -- this file, against `main`'s `examples/server.py` at 4066d5d:
+
+    PASS the page and health endpoints are unaffected
+    FAIL an unset LAYA_MAX_LOADED means 'not asked for', not a number of this file's own  1
+    AttributeError: module 'server' has no attribute '_router_kwargs'
+
+One check names the number, then the run aborts because the helper it drives does not exist
+there. That is the shape of the gap: on `main` the cap is a literal at
+`examples/server.py:158`, handed to the constructor at `:169`, reported back from that same
+`_CFG` by `/health` at `:212`, and guessed once more by the page at `:3255`. Nothing in the
+file ever asked the running Router what it was holding.
 
 Run: python tests/test_example_server_limits.py
 """
@@ -172,13 +184,24 @@ def main():
         cap = demo.ROUTER.max_loaded
         ok("the running Router holds laya's own default",
            cap == Router().max_loaded, "demo %r vs laya %r" % (cap, Router().max_loaded))
-        ok("which is the two #180 settled on, not the one before it",
+        ok("and laya's own default is more than one checkpoint",
            cap > 1, repr(cap))
         ok("/health reports the cap the Router really holds",
            client.get("/health").json()["config"]["max_loaded"] == cap, repr(cap))
         ok("and the HTML page prints that same number",
            ("up to %d kept in memory" % cap)
            in client.get("/health", headers={"accept": "text/html"}).text, repr(cap))
+        # The number cannot come from the requested config, because the config and the
+        # Router are allowed to disagree: `Router(preload=True)` raises its own cap to fit
+        # what it preloads (laya/router.py:275 -> :372), so the demo's default mode has run
+        # with three resident while its env said one. Move the Router and the page must move.
+        demo.ROUTER.max_loaded = cap + 1
+        moved = client.get("/health")
+        ok("and both follow the Router when the Router raises its own cap",
+           moved.json()["config"]["max_loaded"] == cap + 1
+           and ("up to %d kept in memory" % (cap + 1))
+           in client.get("/health", headers={"accept": "text/html"}).text,
+           repr(moved.json()["config"]))
 
     def with_cap(value):
         """Re-import the demo the way uvicorn starts it, with LAYA_MAX_LOADED set to `value`."""
