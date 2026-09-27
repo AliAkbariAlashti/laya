@@ -51,6 +51,76 @@ in
       description = "torch device for every checkpoint (cuda, cpu, cuda:0, ...).";
     };
 
+    cudaAmp = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "[a-zA-Z0-9_-]+");
+      default = null;
+      example = "fp16";
+      description = ''
+        Autocast dtype on CUDA, overriding the checkpoint's own `amp_dtype`
+        (sets `LAYA_CUDA_AMP`). Which tokens mean something is decided by
+        `laya.agent`, not here: `tests/test_packaging.py` reads them out of the
+        runtime and fails if this text drifts from it, which is why there is no
+        `enum` on this option. The recognised spellings are `fp16`, `float16`,
+        `bf16` and `bfloat16` — the first two name one dtype and the last two
+        another. Anything else is ignored rather than an error, and the
+        checkpoint's own choice stays in force.
+
+        The type allows any single token but refuses whitespace, which is not
+        style: the runtime lower-cases the value and then compares it without
+        trimming, so a trailing space keeps full precision and says nothing.
+        null leaves every CUDA checkpoint on its own `amp_dtype`.
+      '';
+    };
+
+    cpuAmp = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "[a-zA-Z0-9_-]+");
+      default = null;
+      example = "bf16";
+      description = ''
+        Run CPU inference under autocast (sets `LAYA_CPU_AMP`). CPU is the one
+        device where the runtime does not do this by default: reduced precision
+        on CPU only pays where the hardware has a native BF16 path. The
+        accepted spellings are `bf16` and `bfloat16`, and nothing else —
+        deliberately narrower than `cudaAmp`, which additionally takes a
+        half-precision spelling that means nothing on CPU. A value the runtime
+        does not recognise leaves CPU in fp32 rather than raising, and
+        `tests/test_packaging.py` derives both device sets from `laya.agent`,
+        so this sentence is checked in both directions rather than trusted.
+
+        On a host without a native BF16 path this costs several times the fp32
+        latency for the same decision: measured at 137 ms -> 744 ms on one
+        single-row request, answer unchanged. Set it only where the hardware is
+        known to want it. null keeps CPU at full precision.
+      '';
+    };
+
+    mpsAmpMinRows = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      example = 1;
+      description = ''
+        Smallest batch that runs under fp16 autocast on MPS (sets
+        `LAYA_MPS_AMP_MIN_ROWS`). MPS autocast is decided per call rather than
+        once at load: casting costs more than the matmul saves on a single
+        small row, and starts to win once a batch has several, so the runtime
+        holds short requests in fp32 and long ones in fp16. This option moves
+        that crossover for the whole service.
+
+        There is no value that is simply better, which is why the default is
+        null and not a number. Measured on an Apple-silicon host with the
+        `english` checkpoint: forcing the threshold to 1 made a one-row request
+        42% slower (31.8 ms -> 45.1 ms), while pushing it past the largest
+        batch the service sees made an eight-row batch 71% slower
+        (83.5 ms -> 142.7 ms) — the two settings trade the same two cases
+        against each other. The reported answer was unchanged either way.
+
+        `ints.positive` rather than `ints.unsigned`: the runtime clamps a value
+        below 1 up to 1, so this refuses at evaluation time the one input the
+        service would otherwise reinterpret. null leaves the runtime's own
+        threshold in place.
+      '';
+    };
+
     models = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ "english" "multilingual" "typed-decisions" ];
@@ -173,6 +243,12 @@ in
         LAYA_LOG_LEVEL = cfg.logLevel;
       } // lib.optionalAttrs (cfg.maxConcurrent != null) {
         LAYA_MAX_CONCURRENT = toString cfg.maxConcurrent;
+      } // lib.optionalAttrs (cfg.cudaAmp != null) {
+        LAYA_CUDA_AMP = cfg.cudaAmp;
+      } // lib.optionalAttrs (cfg.cpuAmp != null) {
+        LAYA_CPU_AMP = cfg.cpuAmp;
+      } // lib.optionalAttrs (cfg.mpsAmpMinRows != null) {
+        LAYA_MPS_AMP_MIN_ROWS = toString cfg.mpsAmpMinRows;
       } // {
         HF_HOME = "/var/lib/${cfg.stateDirectory}/huggingface";
         # torch-bin bundles its own CUDA runtime but still needs the host

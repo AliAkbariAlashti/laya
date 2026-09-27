@@ -284,31 +284,66 @@ check_true("nix/module still joins models into LAYA_MODELS",
            re.search(r'LAYA_MODELS = lib\.concatStringsSep "," cfg\.models;', nix_module) is not None,
            "the models option no longer feeds LAYA_MODELS; these checks need retargeting")
 
-# ---- every knob the server reads from the environment has to be reachable from the module
-# `laya.serve` has no config file and no CLI flag for any of it: it configures itself from LAYA_*
-# and nothing else. On a NixOS host the unit's environment is the only thing that can hand those
-# variables over, so a name the module never assigns is a control that host cannot ask for. Two
-# were missing: `LAYA_LOG_LEVEL`, and `LAYA_MAX_CONCURRENT` -- the admission bound, which is what
-# keeps the bodies buffered in memory bounded and refuses the excess with 503.
-serve_src = read(os.path.join("laya", "serve.py"))
-served = sorted(
-    set(re.findall(r'environ\.get\("(LAYA_[A-Z_]+)"', serve_src))
-    | set(re.findall(r'_env_bool\("(LAYA_[A-Z_]+)"', serve_src))
-)
-# Non-vacuity again: if the derivation found nothing, both directions below pass for free.
-check_true("nix/serve.py's environment reads were found", len(served) >= 5,
-           "got %r -- retarget this if laya/serve.py changes shape" % (served,))
+# ---- every knob laya reads from the environment has to be reachable from the module
+# `laya.serve` has no config file and no CLI flag for any of it: the process configures itself
+# from LAYA_* and nothing else. On a NixOS host the unit's environment is the only thing that can
+# hand those variables over, so a name the module never assigns is a control that host cannot ask
+# for.
+#
+# This set is derived from the whole package, not from `laya/serve.py`. Reading serve.py alone is
+# a scope error that passed: the three runtime knobs below were invisible to it. A deployment unit
+# configures a *process*, and the process is `laya`.
+#
+# Both regexes carry `[A-Z0-9_]` for the same reason: `LAYA_SHA256_DIGESTS`. `[A-Z_]+` matches a
+# prefix of that name, so a narrower pattern reports no gap rather than the one it cannot see.
+_READ_PATTERNS = (r'environ\.get\("(LAYA_[A-Z0-9_]+)"', r'_env_bool\("(LAYA_[A-Z0-9_]+)"',
+                  r'environ\["(LAYA_[A-Z0-9_]+)"\]')
 
+
+def env_reads():
+    """Every `LAYA_*` name the package looks up, by walking laya/ rather than listing files."""
+    found = set()
+    for root, dirs, files in os.walk(os.path.join(ROOT, "laya")):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            rel = os.path.relpath(os.path.join(root, name), ROOT)
+            src = read(rel)
+            for pat in _READ_PATTERNS:
+                found.update(re.findall(pat, src))
+    return found
+
+
+read_names = env_reads()
 # An assignment only. The `models` description names `LAYA_MODELS` in prose, and prose that
 # mentions a variable sets nothing.
-assigned = sorted(set(re.findall(r'\b(LAYA_[A-Z_]+)\s*=', nix_module))
-                  | set(re.findall(r'export (LAYA_[A-Z_]+)=', nix_module)))
-check("nix/module reaches every env var laya.serve reads",
-      [n for n in served if n not in assigned], [])
+assigned = sorted(set(re.findall(r'\b(LAYA_[A-Z0-9_]+)\s*=', nix_module))
+                  | set(re.findall(r'export (LAYA_[A-Z0-9_]+)=', nix_module)))
+
+# Non-vacuity, twice over: an empty derivation passes both directions below for free, and a
+# digit-blind pattern reproduces the original miss while still looking like ten names found.
+check_true("nix/package's environment reads were found", len(read_names) >= 10,
+           "got %d -- retarget this if the lookup shape changes" % len(read_names))
+check_true("nix/the derivation reaches a digit-bearing env var",
+           any(any(c.isdigit() for c in n) for n in read_names),
+           "sorted: %s" % sorted(read_names))
+
+# One name is knowingly left unwired, and it is named rather than hidden by a narrower
+# derivation: `LAYA_SHA256_DIGESTS` carries a JSON object, and this module has no way to prove a
+# shell-quoting claim holds -- nothing in CI evaluates a NixOS module, so every check here is
+# textual. Listing the exception keeps the gap asserted at exactly one name.
+UNWIRED = {"LAYA_SHA256_DIGESTS"}
+check("nix/module reaches every env var laya reads",
+      sorted(read_names - set(assigned) - UNWIRED), [])
 # The other direction is the silent failure: a misspelled name is a perfectly good string,
 # systemd exports it, no Python ever looks at it, and the operator's setting does nothing.
-check("nix/module assigns no env var laya.serve never reads",
-      [n for n in assigned if n not in served], [])
+check("nix/module assigns no env var laya never reads",
+      [n for n in assigned if n not in read_names], [])
+# And the exception list has to stay the size of the real gap: an entry that got wired up, or a
+# name core stopped reading, is a stale excuse that would hide the next one.
+check("nix/unwired exceptions are all still unwired and still real",
+      sorted(n for n in UNWIRED if n not in read_names or n in assigned), [])
 
 # An option that nothing reads is a promise the unit does not keep, and the mirror case -- a
 # setting the unit applies with no option to turn it -- is a host that cannot change it.
@@ -318,12 +353,29 @@ check_true("nix/module's options were found", len(declared) >= 5,
 check("nix/every declared option is used by the unit",
       [n for n in declared if "cfg.%s" % n not in nix_module], [])
 
-# Both new options are opt-in: unset means the unit exports nothing and the server's own default
-# applies, so a host that ignores them gets today's behaviour byte for byte.
-for opt in ("logLevel", "maxConcurrent"):
+
+def option_text(opt):
     _b = re.search(r"^    %s = lib\.mkOption \{(.*?)\n    \};" % opt, nix_module, re.S | re.M)
-    check_true("nix/module declares %s" % opt, _b is not None, "option not found")
-    _t = _b.group(1) if _b else ""
+    return _b.group(1) if _b else ""
+
+
+def option_type(opt):
+    """The declared `type = ...;` line, and nothing else from the block.
+
+    Read it off the type, not off the option: `mpsAmpMinRows`'s description spells out
+    `ints.positive` to explain why it is `ints.positive`, and a check that searched the whole
+    block was satisfied by that sentence while the type line said `ints.unsigned`. Prose naming a
+    constraint is not the constraint.
+    """
+    _t = re.search(r"^\s*type = (.+);$", option_text(opt), re.M)
+    return _t.group(1) if _t else ""
+
+
+# Every new knob is opt-in: unset means the unit exports nothing and the runtime's own default
+# applies, so a host that ignores them gets today's behaviour byte for byte.
+for opt in ("logLevel", "maxConcurrent", "cudaAmp", "cpuAmp", "mpsAmpMinRows"):
+    _t = option_text(opt)
+    check_true("nix/module declares %s" % opt, _t != "", "option not found")
     check_true("nix/%s is opt-in (nullOr, default null)" % opt,
                _t.count("nullOr") == 1 and re.search(r"^\s*default = null;", _t, re.M) is not None,
                _t.strip()[:120])
@@ -338,6 +390,65 @@ for opt in ("logLevel", "maxConcurrent"):
 check_true("nix/module declares no closed enum over names it does not own",
            "types.enum" not in nix_module, "an enum in this module is a copy of someone "
            "else's list; defer to the thing that validates the value")
+
+# So the AMP vocabularies are read out of `laya.agent` instead, from the comparisons that follow
+# each lookup rather than from a list written down here: a spelling core starts accepting shows up
+# in the set on its own, and this module's prose has to name it. The sets differ by device -- CPU
+# takes bf16 only, CUDA takes fp16 too -- and that asymmetry is the whole content of the two
+# options, so the check runs in both directions like the env-var one above. A `fp16` added to the
+# `cpuAmp` description is a promise the runtime does not keep.
+agent_src = read(os.path.join("laya", "agent.py"))
+
+
+def amp_tokens(var):
+    anchor = re.search(r'environ\.get\("%s"' % var, agent_src)
+    if anchor is None:
+        return None                      # reported by the non-vacuity guard below
+    window = agent_src[anchor.end():anchor.end() + 300]
+    return sorted({t for group in re.findall(r'\bin \(([^)]*)\)', window)
+                   for t in re.findall(r'"([^"]+)"', group)})
+
+
+AMP_MEANING = {"cudaAmp": "LAYA_CUDA_AMP", "cpuAmp": "LAYA_CPU_AMP"}
+for _opt, _var in sorted(AMP_MEANING.items()):
+    accepted = amp_tokens(_var)
+    check_true("nix/%s's dtype list came from laya/agent.py" % _opt, bool(accepted),
+               "no `in (...)` comparison follows `environ.get(\"%s\")`; retarget this" % _var)
+    _d = re.search(r"description = ''(.*?)''", option_text(_opt), re.S)
+    described = _d.group(1) if _d else ""
+    check_true("nix/%s names every dtype core accepts for %s" % (_opt, _var),
+               all("`%s`" % t in described for t in accepted),
+               "core compares %s against %s; the option text says: %s"
+               % (_var, accepted, described.strip()[:160]))
+    offered = [t for t in ("fp16", "float16", "bf16", "bfloat16")
+               if "`%s`" % t in described and t not in accepted]
+    check_true("nix/%s offers no dtype core ignores for it" % _opt, not offered,
+               "%s is not in the set laya.agent compares %s against" % (offered, _var))
+
+# `mpsAmpMinRows` has no vocabulary, but its type is a claim: laya clamps a value below 1 up to 1,
+# so `ints.positive` is what keeps the module from accepting an input the service reinterprets.
+check_true("nix/mpsAmpMinRows's type refuses what the runtime would clamp",
+           "positive" in option_type("mpsAmpMinRows"),
+           "type = %s -- ints.unsigned or ints.atLeast 0 would let 0 through to be rewritten"
+           % option_type("mpsAmpMinRows"))
+
+# Both AMP options tell the operator that the transport refuses whitespace, and that is a claim
+# about the type, not the prose: the runtime lower-cases but does not trim, so `"bf16 "` is a
+# silently inert setting. Checked where the claim is made.
+for _opt in ("cudaAmp", "cpuAmp"):
+    _t = option_type(_opt)
+    check_true("nix/%s's type carries its own no-whitespace claim" % _opt,
+               "strMatching" in _t and "nullOr" in _t,
+               "type = %s -- the description promises a single token" % _t)
+
+# The device split is the entire content of those two options: CUDA takes a half-precision
+# spelling, CPU does not. Asserted from core rather than from the prose, so the day that stops
+# being true the gate says so instead of the option text quietly overpromising.
+_cuda, _cpu = amp_tokens("LAYA_CUDA_AMP"), amp_tokens("LAYA_CPU_AMP")
+check_true("nix/CUDA and CPU accept different dtype spellings", _cuda != _cpu,
+           "cuda=%r cpu=%r -- if laya honours the same set on both devices now, the `cpuAmp` "
+           "description's cross-reference needs retargeting" % (_cuda, _cpu))
+
 
 # --------------------------------------------------------------- declared extras
 # The runtime error in laya/structured.py tells users to install `laya[structured]`, and the
