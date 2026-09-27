@@ -132,6 +132,62 @@ export function answerConfidence(p: number[]): number {
   if (p.length < 1) return 1.0;
   return Math.min(1, Math.max(0, Math.max(...p)));
 }
+
+function pyRepr(v: unknown): string {
+  if (typeof v === "boolean") return v ? "True" : "False";
+  if (v === null || v === undefined) return "None";
+  if (typeof v === "number") {
+    if (Number.isNaN(v)) return "nan";
+    if (v === Infinity) return "inf";
+    if (v === -Infinity) return "-inf";
+    return String(v);
+  }
+  if (typeof v === "string") return JSON.stringify(v);
+  if (Array.isArray(v)) return `[${v.map(pyRepr).join(", ")}]`;
+  return String(v);
+}
+
+/**
+ * Validate opt-in abstention threshold `min_confidence` (#361).
+ *
+ * Must be a real number in [0.0, 1.0]. Booleans are rejected.
+ */
+export function checkMinConfidence(v: unknown): number {
+  if (typeof v === "boolean" || typeof v !== "number" || !Number.isFinite(v) || v < 0.0 || v > 1.0) {
+    throw new Error(`min_confidence must be a float in [0.0, 1.0], got ${pyRepr(v)}`);
+  }
+  return v;
+}
+
+/**
+ * Opt-in abstention marker (#361): flag answers whose confidence falls below `min_confidence`.
+ *
+ * Reads `answer_confidence` (the calibrated max(p) confidence, invariant to label count k),
+ * falling back to `confidence` if `answer_confidence` is absent.
+ * The raw answer and confidence stay intact; `low_confidence: true` is added.
+ */
+export function flagLowConfidence(
+  results: Array<Record<string, unknown>> | Record<string, unknown>,
+  minConfidence: number,
+): void {
+  if (minConfidence === 0.0) return;
+  const list = Array.isArray(results) ? results : [results];
+  for (const res of list) {
+    const answers = res && typeof res === "object" ? (res as Record<string, unknown>).answers : null;
+    if (!answers || typeof answers !== "object") continue;
+    for (const a of Object.values(answers as Record<string, unknown>)) {
+      if (!a || typeof a !== "object") continue;
+      const ansObj = a as Record<string, unknown>;
+      let conf = ansObj.answer_confidence;
+      if (conf === undefined || conf === null) {
+        conf = ansObj.confidence;
+      }
+      if (typeof conf === "number" && !Number.isNaN(conf) && conf < minConfidence) {
+        ansObj.low_confidence = true;
+      }
+    }
+  }
+}
 export const TEMP_MIN = 0.5, TEMP_MAX = 5.0;
 export function clampTemperature(t: unknown): number {
   if (t === null || t === undefined || t === "" || typeof t === "boolean") return 1.0;

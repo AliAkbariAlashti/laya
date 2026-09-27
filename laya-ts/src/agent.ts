@@ -6,6 +6,8 @@ import {
   collateItems,
   confidenceFromProbs,
   answerConfidence,
+  checkMinConfidence,
+  flagLowConfidence,
   renderCriterion,
   renderOptions,
   sequenceWithState,
@@ -48,6 +50,7 @@ export interface ChoiceAnswer {
   confidence: number;
   answer_confidence: number;
   action: ActionInfo;
+  low_confidence?: boolean;
 }
 
 export interface ScoreAnswer {
@@ -58,6 +61,7 @@ export interface ScoreAnswer {
   confidence: number;
   answer_confidence: number;
   action: ActionInfo;
+  low_confidence?: boolean;
 }
 
 export interface NoulAnswer {
@@ -66,6 +70,7 @@ export interface NoulAnswer {
   confidence: number;
   answer_confidence: number;
   action: ActionInfo;
+  low_confidence?: boolean;
 }
 
 export type SystemAnswer = ChoiceAnswer | ScoreAnswer | NoulAnswer;
@@ -128,6 +133,10 @@ export interface PredictOptions {
   onPredictStart?: PredictHook;
   onPredictEnd?: PredictHook;
   hooksRaise?: boolean;
+  /** Minimum confidence threshold in [0.0, 1.0]. Low confidence answers get `low_confidence: true`. */
+  minConfidence?: number | null;
+  /** Python parity alias for minConfidence. */
+  min_confidence?: number | null;
 }
 
 function qidStr(qid: string): string {
@@ -372,6 +381,8 @@ export class Agent extends HookRegistry {
     questions: Record<string, QuestionDef>,
     opts: PredictOptions,
   ): Promise<SystemOneResult[]> {
+    const mcOpt = opts.minConfidence ?? opts.min_confidence;
+    const mc = mcOpt !== undefined && mcOpt !== null ? checkMinConfidence(mcOpt) : null;
     const active = defaultsAlreadyRan(opts)
       ? [...this.hooks, ...normaliseHooks(opts.hooks, opts.onPredictStart, opts.onPredictEnd)]
       : composeHooks(this.hooks, opts.hooks, opts.onPredictStart, opts.onPredictEnd);
@@ -407,7 +418,12 @@ export class Agent extends HookRegistry {
       throw err;
     } finally {
       ctx.markElapsed();
-      if (ctx.results !== null) ctx.usage = aggregateUsage(ctx.results);
+      if (ctx.results !== null) {
+        ctx.usage = aggregateUsage(ctx.results);
+        if (mc !== null) {
+          flagLowConfidence(ctx.results as unknown as Record<string, unknown>[], mc);
+        }
+      }
       try {
         await dispatchAsync(active, "onPredictEnd", ctx, { raiseErrors });
       } catch (hookErr) {
