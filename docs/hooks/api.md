@@ -18,8 +18,10 @@ from laya.hooks import HOOK_EVENTS, normalise_hooks, dispatch, aggregate_usage
 
 ## PredictContext
 
-A `PredictContext` is created once per public call and passed to every hook of that call. It is
-**mutable**: hooks may rewrite `states`, `questions` and `results`, and `on_route` may rewrite
+A `PredictContext` is created once per public call and passed to every hook of that call.
+`Router.predict_batch` is the one exception: it creates one per request, as a `Router.predict`
+call for that request would, so its Router-level hooks fire once per request with one state
+each. It is **mutable**: hooks may rewrite `states`, `questions` and `results`, and `on_route` may rewrite
 `decision`. It uses identity equality (`eq=False`), so a context is hashable and two contexts are
 never equal.
 
@@ -44,7 +46,7 @@ class PredictContext:
 
 | field | type | set when | mutable | meaning |
 |---|---|---|---|---|
-| `states` | `list` | always | yes (start) | the states for this call. `system_one`/`Router.predict` pass one; `predict_batch` passes many. A start hook may replace the list. |
+| `states` | `list` | always | yes (start) | the states for this call. `system_one`/`Router.predict` pass one; `Agent.predict_batch` passes many; `Router.predict_batch` passes one per request. A start hook may replace the list. |
 | `questions` | `dict` | always | yes (start) | the questions. A start hook may replace the dict. |
 | `run_id` | `str` | always | no | a unique id shared by every hook of this call. Use it to correlate events and spans. |
 | `results` | `list \| None` | end (and on a skip) | yes (end) | per-state result dicts, each shaped like `system_one`'s return. `None` until inference finishes. |

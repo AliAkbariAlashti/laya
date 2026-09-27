@@ -6,6 +6,7 @@ with `_encode_state` / `_forward` / `_decode_answers` stubbed). The Router path 
 
 Run: python tests/test_hooks.py
 """
+import contextvars
 import os
 import sys
 import threading
@@ -724,9 +725,9 @@ class BatchTrace:
 
 r, en, ml = batch_router(hooks=[BatchTrace()])
 out = r.predict_batch([req("one"), req("two", "multilingual"), req("three")])
-check("router_batch/one start and one end per request, per checkpoint group",
+check("router_batch/one start and one end per request, per checkpoint group, ends in reverse",
       [(e[0], e[1]) for e in batch_events],
-      [("start", "one"), ("start", "three"), ("end", "one"), ("end", "three"),
+      [("start", "one"), ("start", "three"), ("end", "three"), ("end", "one"),
        ("start", "two"), ("end", "two")])
 starts = {e[1]: e[2] for e in batch_events if e[0] == "start"}
 ends = {e[1]: e[2] for e in batch_events if e[0] == "end"}
@@ -849,7 +850,7 @@ check_raises("router_batch/inference failure propagates", RuntimeError,
 check("router_batch/failure pairs every started request with on_error then on_predict_end",
       [(e[0], e[1]) for e in batch_events],
       [("start", "ok"), ("end", "ok"), ("start", "boom"), ("start", "also"),
-       ("error", "boom"), ("error", "also"), ("end", "boom"), ("end", "also")])
+       ("error", "also"), ("end", "also"), ("error", "boom"), ("end", "boom")])
 ends = {e[1]: e[2] for e in batch_events if e[0] == "end"}
 check_true("router_batch/end of a failed request sees the error",
            all(isinstance(getattr(ends.get(s), "error", None), RuntimeError) for s in ("boom", "also")))
@@ -862,10 +863,33 @@ r, en, ml = batch_router(hooks=[BatchTrace()],
 check_raises("router_batch/inference failure with a cache hit in the group propagates", RuntimeError,
              lambda: r.predict_batch([req("cached"), req("boom")]))
 ends = {e[1]: e[2] for e in batch_events if e[0] == "end"}
-check("router_batch/only requests without a result get on_error",
-      [e[1] for e in batch_events if e[0] == "error"], ["boom"])
-check_true("router_batch/a cache hit in a failed group keeps its result and no error",
-           "cached" in ends and ends["cached"].error is None and ends["cached"].results is not None)
+# The caller gets the exception and no result at all, so a cache hit of the failed group was not
+# delivered either: reporting it as a success would record a decision nobody received.
+check("router_batch/every request of a failed group gets on_error, a cache hit included",
+      sorted(e[1] for e in batch_events if e[0] == "error"), ["boom", "cached"])
+check_true("router_batch/a cache hit in a failed group ends with the batch's error",
+           "cached" in ends and isinstance(ends["cached"].error, RuntimeError))
+
+batch_events = []
+r, en, ml = batch_router(hooks=[BatchTrace()],
+                         on_predict_start=lambda c: setattr(c, "questions", Q_OTHER) if c.states == ["boom"] else None)
+check_raises("router_batch/a later question group's failure propagates", RuntimeError,
+             lambda: r.predict_batch([req("inferred"), req("boom")]))
+check("router_batch/the earlier question group did run", [c[0] for c in en.calls], [["inferred"], ["boom"]])
+ends = {e[1]: e[2] for e in batch_events if e[0] == "end"}
+check_true("router_batch/a request inferred before its group failed ends with the batch's error",
+           "inferred" in ends and isinstance(ends["inferred"].error, RuntimeError))
+
+batch_events = []
+bad_usage = {"model": "cached", "answers": {}, "usage": {"input_tokens": "n/a", "output_tokens": 0}}
+r, en, ml = batch_router(hooks=[BatchTrace()],
+                         on_predict_start=lambda c: c.skip([dict(bad_usage)]) if c.states == ["bad"] else None)
+check_raises("router_batch/a malformed usage block fails the batch", ValueError,
+             lambda: r.predict_batch([req("a"), req("bad"), req("c")]))
+check("router_batch/a malformed usage block still ends every started request",
+      sorted(e[1] for e in batch_events if e[0] == "end"), ["a", "bad", "c"])
+check("router_batch/a malformed usage block fails every request of its group",
+      sorted(e[1] for e in batch_events if e[0] == "error"), ["a", "bad", "c"])
 
 batch_events = []
 
@@ -879,7 +903,7 @@ r, en, ml = batch_router(on_predict_end=fail_end_on_a, hooks=[BatchTrace()])
 check_raises("router_batch/end hook failure propagates", ValueError,
              lambda: r.predict_batch([req("a"), req("b")]))
 check("router_batch/end hook failure still ends the other requests",
-      [(e[0], e[1]) for e in batch_events if e[0] == "end"], [("end", "a"), ("end", "b")])
+      [(e[0], e[1]) for e in batch_events if e[0] == "end"], [("end", "b"), ("end", "a")])
 
 batch_events = []
 r, en, ml = batch_router(hooks=[BatchTrace()])
@@ -901,8 +925,78 @@ check_raises("router_batch/start hook failure propagates", ValueError,
              lambda: r.predict_batch([req("a"), req("b"), req("c")]))
 check("router_batch/start hook failure still ends every started request",
       [(e[0], e[1]) for e in batch_events],
-      [("start", "a"), ("start", "b"), ("error", "a"), ("error", "b"), ("end", "a"), ("end", "b")])
+      [("start", "a"), ("start", "b"), ("error", "b"), ("end", "b"), ("error", "a"), ("end", "a")])
 check("router_batch/start hook failure runs no inference", en.calls, [])
+
+# A hook that sets something in start and resets it in end (a contextvar, an OpenTelemetry
+# context attach/detach, a logging MDC) is only correct if the requests unwind in reverse: all
+# of a group's starts run before any of its ends, so ending in input order resets the wrong layer.
+_batch_cv = contextvars.ContextVar("batch_cv", default=None)
+_cv_tokens = {}
+
+
+class CvStack:
+    def on_predict_start(self, ctx):
+        _cv_tokens[ctx] = _batch_cv.set(ctx.states[0])
+
+    def on_predict_end(self, ctx):
+        _batch_cv.reset(_cv_tokens.pop(ctx))
+
+
+r, en, ml = batch_router(hooks=[CvStack()])
+r.predict_batch([req("a"), req("b"), req("c")])
+check("router_batch/set-in-start, reset-in-end hooks unwind to the caller's value", _batch_cv.get(), None)
+_cv_tokens.clear()
+r, en, ml = batch_router(hooks=[CvStack()])
+check_raises("router_batch/unwinding a failed batch propagates", RuntimeError,
+             lambda: r.predict_batch([req("a"), req("boom"), req("c")]))
+check("router_batch/a failed batch also unwinds to the caller's value", _batch_cv.get(), None)
+_cv_tokens.clear()
+
+failed_ctxs = []
+elapsed_when_first_error_ran = []
+
+
+def remember_failed_start(ctx):
+    failed_ctxs.append(ctx)
+
+
+class FirstError:
+    def on_error(self, ctx):
+        if not elapsed_when_first_error_ran:
+            elapsed_when_first_error_ran.append([c.elapsed_ms is not None for c in failed_ctxs])
+
+
+r, en, ml = batch_router(hooks=[FirstError()], on_predict_start=remember_failed_start)
+check_raises("router_batch/a failed group propagates", RuntimeError,
+             lambda: r.predict_batch([req("boom"), req("b"), req("c")]))
+check("router_batch/elapsed_ms is set for a failed group before any on_error runs",
+      elapsed_when_first_error_ran, [[True, True, True]])
+
+r, en, ml = batch_router(on_predict_end=lambda c: setattr(c, "results", [None]) if c.states == ["x"] else None)
+try:
+    got = r.predict_batch([req("x"), req("y")])
+    got = (got[0], got[1]["answers"]["seen"])
+except Exception as e:  # noqa: BLE001
+    got = repr(e)
+check("router_batch/a None result an end hook leaves is returned, as predict returns it", got, (None, "y"))
+
+
+class AliasPin:
+    """An on_route hook pinning a request with an alias, as a plain dict."""
+
+    def on_route(self, ctx):
+        if ctx.states == ["alias"]:
+            ctx.decision = {**ctx.decision, "model": "ml"}
+
+
+alias_models = []
+r, en, ml = batch_router(hooks=[AliasPin()], on_predict_start=lambda c: alias_models.append(c.model))
+r.predict_batch([req("alias"), req("full", "multilingual")])
+check("router_batch/an aliased pin shares its checkpoint's forward pass", [c[0] for c in ml.calls],
+      [["alias", "full"]])
+check("router_batch/an aliased pin reports the resolved checkpoint", alias_models,
+      ["multilingual", "multilingual"])
 
 r, en, ml = batch_router(on_predict_start=fail_on_b, hooks_raise=False)
 with warnings.catch_warnings(record=True) as caught:
