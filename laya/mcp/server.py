@@ -42,6 +42,7 @@ from laya.serve import _apply_thread_limit, _env_bool
 from .device import env_device
 from .tools import (
     ToolError,
+    batch_item_key_doc,
     laya_decide,
     get_available_presets,
     laya_predict,
@@ -268,10 +269,13 @@ def laya_predict_tool(
     name="laya_predict_batch",
     description=(
         "Answer many typed-question requests in one call: requests is a non-empty array of "
-        "{state, questions, model?, task?, lang?, lang_guess?} objects, each with the same "
+        + batch_item_key_doc() + ", each with the same "
         "questions schema as laya_predict. Requests are routed first, grouped by checkpoint, "
         "and share forward passes when their question schemas match, so scoring many "
-        "requests costs one round trip instead of N. Returns answers in input order with "
+        "requests costs one round trip instead of N. max_len / head_max_len are per request "
+        "here, not per call: a wide question can raise its own budget without shrinking the "
+        "batch's other requests to it, and requests that ask for different budgets are split "
+        "into separate forward passes. Returns answers in input order with "
         "per-request routing and device, plus model_counts and batch latency. "
         + _GUARDRAILS
     ),
@@ -294,7 +298,7 @@ def laya_predict_batch_tool(requests: list, batch_size: int = 0) -> str:
     description=(
         "Decide which Laya checkpoint would answer each request, without running any "
         "forward pass or loading a checkpoint: requests is a non-empty array of "
-        "{state, questions, model?, task?, lang?, lang_guess?} objects. Use this to "
+        + batch_item_key_doc(omit=("max_len", "head_max_len")) + ". Use this to "
         "inspect or aggregate the routing of a workload before paying model-load cost. "
         "Returns one {model, repo, reason} decision per request in input order, plus "
         "model_counts. "

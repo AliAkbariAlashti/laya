@@ -28,10 +28,12 @@ except ImportError:
 from laya.mcp.device import agent_device, device_report, env_device, resolve_device, router_agent  # noqa: E402
 from laya.mcp.server import _models_from_env, server as mcp_server  # noqa: E402
 from laya.mcp.tools import (  # noqa: E402
+    BATCH_ITEM_OVERRIDES,
     PRESETS,
     PRESET_ALIASES,
     ToolError,
     _overrides,
+    batch_item_key_doc,
     get_available_presets,
     laya_decide,
     laya_predict,
@@ -891,6 +893,37 @@ def test_batch_validation():
     # Keys the Router would never expect are dropped, not forwarded.
     out = validate_batch_requests([{"state": STATE, "questions": QUESTIONS, "temperature": 0}])
     ok("batch/validation_unknown_key_dropped", set(out[0]) == {"state", "questions"}, repr(out[0]))
+    # The two token budgets are per-request overrides Router.predict_batch reads off the item,
+    # so they survive validation rather than being dropped with the unknown keys above.
+    out = validate_batch_requests([{"state": STATE, "questions": QUESTIONS,
+                                   "max_len": 1024, "head_max_len": 512}])
+    ok("batch/validation_keeps_budgets", out[0].get("max_len") == 1024
+       and out[0].get("head_max_len") == 512, repr(out[0]))
+    # An explicit null means "keep the checkpoint's default", the same as leaving it out.
+    out = validate_batch_requests([{"state": STATE, "questions": QUESTIONS, "max_len": None}])
+    ok("batch/validation_null_budget_dropped", "max_len" not in out[0], repr(out[0]))
+    for key, bad in (("max_len", 0), ("max_len", "1024"), ("max_len", 2.5), ("max_len", True),
+                     ("head_max_len", 0), ("head_max_len", -1), ("head_max_len", "512")):
+        expect_tool_error("batch/item_bad_%s_%r" % (key, bad),
+                          lambda k=key, v=bad: validate_batch_requests(
+                              [{"state": STATE, "questions": QUESTIONS, k: v}]),
+                          "invalid_%s" % key)
+    # The message that lists the accepted keys must list the ones the validator keeps --
+    # a client reads that list as the schema. Both directions, derived from the validator.
+    probe = {"state": STATE, "questions": QUESTIONS, "model": "english", "task": "massive",
+             "lang": "en", "lang_guess": False, "max_len": 5, "head_max_len": 5}
+    kept = set(validate_batch_requests([probe])[0])
+    ok("batch/validation_covers_every_override",
+       kept == {"state", "questions"} | set(BATCH_ITEM_OVERRIDES), repr(sorted(kept)))
+    message = ""
+    try:
+        validate_batch_requests([])
+    except ToolError as exc:
+        message = str(exc)
+    listed = {part.strip().rstrip("?") for part in
+              message[message.index("{") + 1:message.index("}")].split(",")}
+    ok("batch/error_message_matches_validator", listed == kept,
+       "listed=%r kept=%r" % (sorted(listed), sorted(kept)))
 
 
 def test_batch_predict():
@@ -920,6 +953,21 @@ def test_batch_predict():
     ok("batch/predict_size_forwarded", size == 8, repr(size))
     ok("batch/predict_items_forwarded", [item["state"] for item in forwarded]
        == [request["state"] for request in BATCH_REQUESTS])
+    # A request's own token budget must reach the forward pass: `Router.predict_batch` reads
+    # max_len/head_max_len off each item and splits items that ask for different budgets into
+    # separate calls, so an item that loses them is answered at the checkpoint's default window.
+    router = BatchRouter()
+    laya_predict_batch([{"state": STATE, "questions": QUESTIONS,
+                         "max_len": 1024, "head_max_len": 512},
+                        {"state": {"body": "no budget asked for"}, "questions": QUESTIONS}],
+                       router=router)
+    forwarded = router.predict_batch_calls[0][0]
+    ok("batch/predict_budget_forwarded",
+       forwarded[0].get("max_len") == 1024 and forwarded[0].get("head_max_len") == 512,
+       repr({k: v for k, v in forwarded[0].items() if k not in ("state", "questions")}))
+    ok("batch/predict_budget_absent_when_unset",
+       "max_len" not in forwarded[1] and "head_max_len" not in forwarded[1],
+       repr(sorted(forwarded[1])))
 
     ok("batch/predict_keys", set(out) == {"requests", "model_counts",
                                           "total_latency_ms", "per_request_latency_ms"}, repr(sorted(out)))
@@ -1751,6 +1799,34 @@ def test_timeout_removed():
 
 # --- server registration (schema only, no model load) ------------------------
 
+def test_batch_item_shape_as_documented():
+    """Every place the batch item shape is written out says what the validator keeps.
+
+    Three strings enumerate the keys a batch item may carry: `validate_batch_requests`' error
+    message (checked against the validator in test_batch_validation), each batch tool's registered
+    description, and the README's MCP section. A client reads them as the schema, so all three are
+    compared to `BATCH_ITEM_OVERRIDES` -- the tuple `_validate_batch_item` branches on.
+    `laya_route_batch` leaves the two token budgets out, because routing runs no forward pass and
+    a budget there would be ignored.
+    """
+    by_name = {t.name: t for t in asyncio.run(mcp_server.list_tools())}
+    for tool, omit in (("laya_predict_batch", ()),
+                       ("laya_route_batch", ("max_len", "head_max_len"))):
+        want = batch_item_key_doc(omit=omit)
+        ok("schema/%s_item_shape" % tool, want in (by_name[tool].description or ""),
+           "documents %r" % want)
+
+    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    marker = "one tool call takes an array of `{"
+    ok("docs/readme_names_the_batch_shape", marker in readme, "sentence not found")
+    if marker in readme:
+        start = readme.index(marker) + len(marker)
+        inner = readme[start:readme.index("}", start)]
+        named = {part.strip().rstrip("?") for part in inner.split(",")}
+        ok("docs/readme_batch_item_keys",
+           named == {"state", "questions"} | set(BATCH_ITEM_OVERRIDES), repr(sorted(named)))
+
+
 def test_models_from_env():
     old = os.environ.get("LAYA_MODELS")
     try:
@@ -1884,6 +1960,7 @@ test_question_validation_matches_the_agent()
 test_a_bad_question_is_a_caller_error_not_a_server_fault()
 test_timeout_removed()
 test_models_from_env()
+test_batch_item_shape_as_documented()
 test_auto_task_env()
 test_server_registration()
 

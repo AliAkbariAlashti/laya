@@ -792,6 +792,20 @@ def _validate_batch_str(value: Any, where: str, allow_empty: bool = False) -> st
     return value
 
 
+def _validate_batch_budget(value: Any, name: str, where: str) -> int | None:
+    """One of the two per-request token budgets, with the batch item named in the message.
+
+    Same guard and same error code as the single-request tools take, so `invalid_max_len` means
+    one thing whichever tool a client called.
+    """
+    if value is None:
+        return None
+    try:
+        return validate_budget(value, name)
+    except ToolError as error:
+        raise ToolError("invalid_%s" % name, "%s[%r]: %s" % (where, name, error)) from None
+
+
 def _validate_batch_item(request: Any, i: int) -> dict:
     where = "requests[%d]" % i
     if not isinstance(request, dict):
@@ -809,20 +823,44 @@ def _validate_batch_item(request: Any, i: int) -> dict:
             item[key] = _validate_batch_str(request[key], "%s[%r]" % (where, key))
     if "lang_guess" in request:
         item["lang_guess"] = request["lang_guess"]
+    # `Router.predict_batch` reads both off the request dict and splits requests that ask for
+    # different budgets into separate forward passes, so an item that names one must keep it.
+    for key in ("max_len", "head_max_len"):
+        if key in request:
+            budget = _validate_batch_budget(request[key], key, where)
+            if budget is not None:
+                item[key] = budget
     return item
+
+
+# The per-request overrides a batch item may carry. Written out from here rather than retyped,
+# because the key list a client sees is the key list `_validate_batch_item` keeps: an enumeration
+# that drops one advertises a control that would be ignored, and an enumeration that gains one
+# rejects a request the tool would have answered.
+BATCH_ITEM_OVERRIDES = ("model", "task", "lang", "lang_guess", "max_len", "head_max_len")
+
+
+def batch_item_key_doc(omit: tuple = ()) -> str:
+    """The batch item shape as one phrase: ``{state, questions, model?, task?, ...}``.
+
+    `omit` drops the overrides a given tool has no use for -- the token budgets are kept by the
+    shared validator but mean nothing to `route_batch`, which never runs a forward pass.
+    """
+    keys = [key for key in BATCH_ITEM_OVERRIDES if key not in omit]
+    return "{state, questions, %s} objects" % ", ".join("%s?" % key for key in keys)
 
 
 def validate_batch_requests(requests: Any) -> list[dict]:
     """Validate a tool payload of many requests, preserving order.
 
     Same per-item validation as ``laya_predict``/``laya_route`` (state, questions,
-    optional model/task/lang/lang_guess overrides), run before any model loads so
-    one malformed item fails the whole call instead of a partial batch.
+    optional model/task/lang/lang_guess/max_len/head_max_len overrides), run before any model
+    loads so one malformed item fails the whole call instead of a partial batch.
     """
     if not isinstance(requests, list) or not requests:
         raise ToolError(
             "invalid_request",
-            "requests must be a non-empty array of {state, questions, model?, task?, lang?, lang_guess?} objects",
+            "requests must be a non-empty array of %s" % batch_item_key_doc(),
         )
     return [_validate_batch_item(request, i) for i, request in enumerate(requests)]
 

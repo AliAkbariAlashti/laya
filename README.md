@@ -935,9 +935,11 @@ package:
 The tools return structured JSON (answers with probabilities, routing metadata, device,
 `latency_ms`). `laya_predict_batch` and `laya_route_batch` are the MCP form of
 [`Router.predict_batch` / `route_batch`](#batch-mode-score-many-states-in-one-forward-pass):
-one tool call takes an array of `{state, questions, model?, lang?}` requests, routes them
+one tool call takes an array of `{state, questions, model?, task?, lang?, lang_guess?, max_len?, head_max_len?}` requests, routes them
 first, groups them by checkpoint, and shares forward passes between requests with the same
-question schema, returning the answers in input order. On 16 mixed-language tickets through
+question schema, returning the answers in input order. `max_len` / `head_max_len` are per request
+there, exactly as `Router.predict_batch` reads them, so one wide question can raise its own budget
+without shrinking the rest of the batch to it. On 16 mixed-language tickets through
 the tool functions themselves, one batch call beat 16 `laya_predict` calls by **2.1-2.3x on
 MPS** (983-1082 ms -> 467-477 ms) and **~1.25x on CPU** (1861-2471 ms -> 1470-1911 ms), with
 **0/16 decision flips** (choice label, rounded score, noul sign) against the loop. Prefer it
