@@ -36,6 +36,14 @@
 
 ::: laya.shortlist.embed_fn_from_agent
 
+::: laya.shortlist.cached_embed_fn
+
+## Abstention
+
+::: laya.confidence.check_min_confidence
+
+::: laya.confidence.flag_low_confidence
+
 ## Calibration and training
 
 ::: laya.common.confidence_from_probs
