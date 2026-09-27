@@ -130,6 +130,51 @@ jobs:
             -H 'content-type: application/json' -d '{}' "$@"; }
           test "$(code)" = 401
           test "$(code -H 'authorization: Bearer wrong')" = 401
+          # 400 is the body error, which the handler reaches only once auth has passed: this is
+          # the half that says the configured key is accepted, not merely that others are not.
+          test "$(code -H "authorization: Bearer $LAYA_API_KEY")" = 400
+      # docs/docker.md tells operators to keep the bearer key in a mounted file instead of in the
+      # environment: the entrypoint reads LAYA_API_KEY_FILE, moves the value into LAYA_API_KEY and
+      # drops the _FILE name before it execs the server. This job only ever set the inline
+      # variable, so the second arm of docker/entrypoint.py's SECRET_NAMES -- the one the
+      # documented deployment uses -- was exercised by nothing. Deleting that arm leaves the API
+      # unauthenticated (`/v1/systemone` with no header answers 400) and every line above still
+      # passed; tests/test_docker_entrypoint.py explains the same gap at the script level.
+      - name: Check the file-backed bearer key
+        run: |
+          mkdir -p "$RUNNER_TEMP/secrets"
+          # Both keys are shell variables, and the file is written from the one that is supposed
+          # to authenticate this service. A literal token after `Bearer ` is what the secret scan
+          # in security.yml looks for, and these two strings are test values, not credentials.
+          FILE_KEY=from-a-mounted-file
+          printf '%s\n' "$FILE_KEY" > "$RUNNER_TEMP/secrets/laya_api_key"
+          # LAYA_API_KEY= keeps the job's inline key away from this service, so the mounted file
+          # is the only thing that can authenticate it. LAYA_PORT moves both the published and the
+          # bound port off the one the service above is holding, from the one variable the docs
+          # say controls both.
+          LAYA_API_KEY= LAYA_PORT=8100 docker compose run -d --name laya-file-key \
+            --volume "$RUNNER_TEMP/secrets/laya_api_key:/run/secrets/laya_api_key:ro" \
+            -e LAYA_API_KEY_FILE=/run/secrets/laya_api_key \
+            --service-ports laya-serve >/dev/null
+          for _ in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' localhost:8100/health)" = 200 ]; then
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS localhost:8100/health
+          code() { curl -s -o /dev/null -w '%{http_code}' -X POST localhost:8100/v1/systemone \
+            -H 'content-type: application/json' -d '{}' "$@"; }
+          test "$(code)" = 401
+          test "$(code -H 'authorization: Bearer wrong')" = 401
+          # The key the job exports must not be the one the file-backed service accepts, and the
+          # value in the mounted file must be. 400 is the body error, which the handler reaches
+          # only once auth has passed.
+          test "$(code -H "authorization: Bearer $LAYA_API_KEY")" = 401
+          test "$(code -H "authorization: Bearer $FILE_KEY")" = 400
+      - name: Stop the file-backed service
+        if: always()
+        run: docker rm -f laya-file-key || true
       - name: Stop
         if: always()
         run: |
