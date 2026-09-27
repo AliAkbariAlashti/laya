@@ -189,7 +189,11 @@ def _strip_disclaimer(paragraph: str) -> str:
 
 
 def clean_email_body(body: str, max_chars: int = 3000) -> str:
-    """Remove quoted email history, signatures and disclaimers to keep input focused."""
+    """Remove quoted email history, signatures and disclaimers to keep input focused.
+
+    `max_chars` is the length the result is cut to, 3000 characters unless raised -- see
+    `email_state`, which takes the same budget and passes it through.
+    """
     text = (body or "").replace("\r\n", "\n").replace("\r", "\n").replace("\\n", "\n")
     # Bound regex work before the expensive patterns below: _DISCLAIMER uses
     # [^.]{0,60/80/100} alternations whose cost grows with input length, and only
@@ -225,11 +229,22 @@ def clean_email_body(body: str, max_chars: int = 3000) -> str:
     return text[:max_chars]
 
 
-def email_state(subject: str, body: str, sender: Optional[str] = None, clean: bool = True, **extra) -> Dict:
-    """Construct a clean state dictionary for email classification."""
+def email_state(subject: str, body: str, sender: Optional[str] = None, clean: bool = True,
+                max_chars: int = 3000, **extra) -> Dict:
+    """Construct a clean state dictionary for email classification.
+
+    `max_chars` is the budget `clean_email_body` cuts the body to, and it is worth raising for a
+    long message: at the default the body stops after 3000 characters, so a request that arrives in
+    the last paragraphs never reaches the model -- including through `predict_long`, which scans a
+    state in windows precisely so it can read past one window's worth. Ignored when `clean=False`,
+    which passes the body through whole.
+
+    Any other keyword becomes a field of the state, so it is read by the model; a typo here is an
+    input mutation, not an error.
+    """
     state = {
         "subject": (subject or "").strip(),
-        "body": clean_email_body(body) if clean else (body or ""),
+        "body": clean_email_body(body, max_chars=max_chars) if clean else (body or ""),
     }
     if sender:
         state["from"] = sender

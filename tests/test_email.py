@@ -22,7 +22,13 @@ The last block guards a different kind of silence. `email_questions` was defined
 in `laya/presets.py`, and `laya/__init__.py` re-exports the `presets` one. Editing the copy in
 `laya/email.py` moved `laya.email.email_questions` and left `laya.email_questions` where it was,
 with no test and no lint failing.
+
+The block at the end is the same shape again: `clean_email_body` takes a `max_chars` budget and
+`email_state` cut every body to its default, so a request in the last paragraphs of a long email was
+deleted before the model saw it -- while the keyword a caller would use to stop that,
+`email_state(..., max_chars=8000)`, fell into `**extra` and became a field of the state instead.
 """
+import inspect
 import os
 import sys
 
@@ -520,6 +526,78 @@ check(
     "email_questions/a caller override reaches both paths",
     email_module.email_questions({"legal": "contracts"})["category"]["criteria"],
     laya.email_questions({"legal": "contracts"})["category"]["criteria"],
+)
+
+
+# --------------------------------- email_state owns the body budget (a `clean_email_body` control)
+# `clean_email_body(body, max_chars=...)` takes a budget and `email_state` called it with none, so
+# the state was always cut at 3000 characters with no lever. The one call a reader reaches for,
+# `email_state(subject, body, max_chars=8000)`, went to `**extra` instead, which merges the keyword
+# into the state that `serialize_state` renders into the model's input: the budget stayed at 3000
+# and a `"max_chars": 8000` field was added to what the checkpoint reads.
+LONG = ("The account review covers the last twelve statements and the support thread that goes with "
+        "them, including the charges that were disputed and the credits that were applied. ") * 40
+REQUEST = "Please refund the duplicate monthly charge of 49 dollars from the account ending 4417."
+LONG_BODY = LONG + "\n\n" + REQUEST
+
+check(
+    "budget/default still cuts at 3000",
+    len(email_state("Billing", LONG_BODY)["body"]),
+    3000,
+)
+check_true(
+    "budget/the default cuts away a late request",
+    REQUEST not in email_state("Billing", LONG_BODY)["body"],
+    "a 3000-character cap should not reach the closing line of a 7000-character body",
+)
+check_true(
+    "budget/raising max_chars keeps the late request",
+    REQUEST in email_state("Billing", LONG_BODY, max_chars=8000)["body"],
+    "the whole point of the lever",
+)
+check(
+    "budget/max_chars reaches clean_email_body unchanged",
+    email_state("Billing", LONG_BODY, max_chars=8000)["body"],
+    clean_email_body(LONG_BODY, max_chars=8000),
+)
+check_true(
+    "budget/max_chars is not a field of the state",
+    "max_chars" not in email_state("Billing", LONG_BODY, max_chars=8000),
+    "it belongs to the cleaning, not to what the model reads",
+)
+check(
+    "budget/clean=False passes the body whole",
+    email_state("Billing", LONG_BODY, clean=False, max_chars=100)["body"],
+    LONG_BODY,
+)
+# `max_chars` is added last, so a call that already passed four positional arguments still means
+# subject, body, sender, clean. Reading the order off the signature is what fails if it moves.
+check(
+    "budget/positional order is unchanged",
+    [p.name for p in inspect.signature(email_state).parameters.values()][:5],
+    ["subject", "body", "sender", "clean", "max_chars"],
+)
+check(
+    "budget/sender still lands under from",
+    email_state("Billing", "Short body", sender="me@example.com").get("from"),
+    "me@example.com",
+)
+# The two defaults are literals on purpose -- a signature is documentation, and `max_chars: int =
+# 3000` reads better than a constant's name -- so this is what keeps the pair from drifting.
+def budget_default(fn):
+    param = inspect.signature(fn).parameters.get("max_chars")
+    return None if param is None else param.default
+
+
+check(
+    "budget/the two defaults are the same value",
+    budget_default(email_state),
+    budget_default(clean_email_body),
+)
+check(
+    "budget/email_state cuts where clean_email_body promises",
+    email_state("Billing", LONG_BODY)["body"],
+    clean_email_body(LONG_BODY),
 )
 
 
