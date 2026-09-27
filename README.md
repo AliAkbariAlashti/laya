@@ -466,7 +466,10 @@ curl -s localhost:8000/v1/systemone -H 'content-type: application/json' -d '{
 Configuration is by environment variable: `LAYA_HOST`, `LAYA_PORT`,
 `LAYA_DEVICE`, `LAYA_PRELOAD`, `LAYA_MODELS` (comma list to preload),
 `LAYA_THREADS` (cap torch intra-op threads for CPU inference — keep at or below
-physical cores), `LAYA_AUTO_TASK`, and `LAYA_API_KEY` (when set, clients must
+physical cores), `LAYA_AUTO_TASK`, `LAYA_MAX_LOADED` (checkpoints resident at
+once, 2 by default; raise it to 3 when `LAYA_AUTO_TASK` makes a third one
+reachable on demand, or the server rebuilds one every time routing switches),
+and `LAYA_API_KEY` (when set, clients must
 send `Authorization: Bearer <key>`). A client's `model` field is honoured when it
 names a Laya checkpoint (`english`/`multilingual`/`typed-decisions`), otherwise
 the router auto-selects by script/language.

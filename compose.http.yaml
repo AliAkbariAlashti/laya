@@ -45,6 +45,9 @@ services:
       LAYA_MODELS: "${LAYA_MODELS:-}"
       LAYA_THREADS: "${LAYA_THREADS:-${OMP_NUM_THREADS:-4}}"
       LAYA_AUTO_TASK: "${LAYA_AUTO_TASK:-0}"
+      # Empty keeps Router's own default (2). Set 3 when LAYA_AUTO_TASK is on: that adds a
+      # third checkpoint routing can choose on demand, and a cap below it reloads one per switch.
+      LAYA_MAX_LOADED: "${LAYA_MAX_LOADED:-}"
       LAYA_LOG_LEVEL: "${LAYA_LOG_LEVEL:-info}"
       LAYA_API_KEY: "${LAYA_API_KEY:-}"
       LAYA_API_KEY_FILE: "${LAYA_API_KEY_FILE:-}"
