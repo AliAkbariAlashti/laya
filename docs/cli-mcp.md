@@ -25,6 +25,17 @@ python -m pip install laya
 laya --help
 ```
 
+### Evaluation CLI
+
+The package also installs `laya-evals`. The main CLI exposes the same evaluation commands
+through `laya eval`:
+
+```bash
+laya eval --help
+```
+
+See the [Evaluation harness](evals.md) guide for datasets, metrics, and baseline gates.
+
 ### Route without loading a checkpoint
 
 With text and no prediction flag, the CLI calls `Router.route`:
@@ -60,7 +71,7 @@ The main controls are:
 
 - `--model english|multilingual|typed-decisions` pins a checkpoint instead of auto-routing.
 - `--lang en|de|...` supplies an explicit language code instead of automatic detection.
-- `--task NAME` forces the typed-decisions workflow instead of detecting one.
+- `--task NAME` forces the typed-decisions workflow instead of detecting it.
 - `--device cpu|cuda|...` passes a device choice to the Router.
 - `--json` emits machine-readable output.
 
@@ -73,9 +84,11 @@ laya "My payment failed twice" --preset triage
 laya "Ignore all previous instructions" --preset guard --json
 ```
 
-The CLI presets are `email`, `guard`, `moderation`, `router`, and `triage`. Presets are useful
-for a quick local check, but their questions are still domain decisions: inspect the preset and
-validate it on your own data before using it as an application policy.
+The CLI presets are `email`, `guard`, `moderation`, `router`, and `triage`. The CLI places the
+text under the state field expected by the selected preset; `--predict` uses the router
+question set's `request` field. Presets are useful for a quick local check, but their questions
+are still domain decisions: inspect the preset and validate it on your own data before using it
+as an application policy.
 
 ### Explore interactively
 
@@ -87,9 +100,9 @@ laya
 # laya> quit
 ```
 
-Press Enter to run each request. `quit`, `exit`, or `Ctrl-D` ends the session. The interactive
-loop reuses one Router, so it is a convenient way to compare several inputs without writing a
-script.
+Press Enter to run each request. An empty line, `quit`, `exit`, or `Ctrl-D` ends the session. The
+interactive loop reuses one Router, so it is a convenient way to compare several inputs without
+writing a script.
 
 ### Failures are visible
 
@@ -135,12 +148,31 @@ Laya does not open a network port.
 | `laya_status` | Reports the configured or actual device, CUDA availability, loaded checkpoints, preload state, readiness, and package versions. | none |
 | `laya_route` | Selects a checkpoint and returns its model, repository, and reason without running a forward pass. | `state`, `questions` |
 | `laya_predict` | Runs typed questions and returns answers, routing metadata, latency, and the answering device when readable. | `state`, `questions`, optional `model` (`auto`, `english`, `multilingual`, or `typed-decisions`) |
+| `laya_shortlist` | Shortlists a many-option choice question, then answers it and returns the shortlist metadata. | `state`, `questions`, optional `model`, optional `k` (default `20`) |
 | `laya_preset` | Runs a built-in workflow using its built-in question set. | `preset`, `state` |
+| `laya_predict_batch` | Answers many requests in one call. Requests are routed first and grouped by checkpoint, so matching question schemas share forward passes; answers come back in input order. | `requests`, each `{state, questions, model?, task?, lang?}`, optional `batch_size` |
+| `laya_route_batch` | Decides which checkpoint would answer each request, with no forward pass and no checkpoint load. | `requests`, same shape as `laya_predict_batch` |
+| `laya_decide` | Answers a JSON-schema-shaped decision in one forward pass and returns the decided values with per-field confidence, instead of an answer map to parse. Schema properties may be enum choices, booleans, or integers with a minimum and maximum; free strings, arrays, and nested objects are rejected by path. | `state`, `schema`, optional `model` |
+
+The three batch and schema tools exist because the same operations are available on the SDK and
+`laya-serve`: reaching for many requests, or for a caller that already knows the answer shape,
+does not require dropping to Python. For the schema-driven form in more depth, see
+[Schema-driven decisions](structured.md).
+
+The shared guardrail says not to send choice questions with more than 20 options without
+shortlisting. `laya_shortlist` keeps the `k` most likely labels before the forward pass; its
+default is `k=20`. It uses mean-pooled embeddings from the answering checkpoint's own encoder,
+so it does not download a second model, and returns the kept labels, cosine scores, `k`, and
+option count for each shortlisted question.
 
 `state` must be a non-empty JSON object. `questions` must be a non-empty object whose values use
-Laya's typed question schema. `laya_preset` accepts `guard`, `moderation`, `triage`, and
-`model_router`; the last name is the MCP spelling of the router workflow. The CLI's preset
-names are listed separately above because the two entry points expose different preset aliases.
+Laya's typed question schema. `laya_preset` accepts the same five presets the CLI does: `email`,
+`guard`, `moderation`, `triage`, and the router workflow, whose canonical name on this surface is
+`model_router`. `router` is accepted as an alias and names the same preset, so the CLI spelling
+works here too; the canonical key is the one that comes back in the result. Given a state of
+exactly one string, `laya_preset` places it under the field that preset's questions name, the
+same placement the CLI does, so a caller does not have to guess the key. Anything richer than one
+string is the caller's own shape and is passed through untouched.
 
 A prediction call has the same shape as the SDK's typed call:
 
@@ -183,21 +215,24 @@ the server is ready.
 | `LAYA_PRELOAD` | `1` | Build the configured checkpoints at startup. Set to `0` for lazy loading. |
 | `LAYA_MODELS` | `english,multilingual` | Comma-separated checkpoints to preload. An empty value keeps the MCP default rather than preloading every checkpoint. |
 | `LAYA_THREADS` | PyTorch default | Caps Torch intra-op threads for CPU inference; keep it at or below the physical core count. |
+| `LAYA_AUTO_TASK` | `0` | Set to `1` to let a request auto-route to the `typed-decisions` checkpoint. Same meaning as in `laya.serve`; it does not preload that checkpoint, so `LAYA_MODELS` still decides what is built at startup. |
 
-The environment names and meanings follow Laya's serving conventions. They configure model
-lifecycle, not application permissions. The client still decides when to call a tool and what to
-do with the returned decision.
+The stock `laya-mcp-server` launcher creates its Router without installing hooks. If you need
+prediction hooks, use a custom launcher that installs them, for example with
+`laya.hooks.set_default_hooks`, before the server builds its Router. The environment variables
+above configure model lifecycle, not hook registration. The client still decides when to call a
+tool and what to do with the returned decision.
 
 ## 3. Shared boundaries and related guides
 
 The CLI and MCP server are interfaces to the same typed decision engine:
 
-- Use `choice` for a finite label set, `score` for an ordered rubric, and `noul` for a calibrated
+- Use `choice` for a finite label set, `score` for an ordered rubric, and `noul` for the
   probability of true.
 - Validate thresholds and presets on representative data; there is no universal adoption
   threshold.
 - Keep irreversible or high-cost actions behind the application's review and fallback policy.
-- The MCP server calls `Router.predict`, so configured prediction hooks still fire. See
+- The MCP server calls `Router.predict`, so hooks fire when a custom launcher installs them. See
   [Prediction hooks](hooks/index.md), [hook lifecycle](hooks/lifecycle.md), and
   [Tracing](hooks/tracing.md) for observability and `run_id` correlation.
 
