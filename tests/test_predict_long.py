@@ -309,6 +309,7 @@ check("narrow/and two states is what the forward saw", a._forward_calls, [4])
 a = make_real_agent()
 grown, exc = _attempt(
     lambda: a.predict_long(LONG, Q, on_predict_start=lambda ctx: ctx.states.append("invented")))
+check("grow/scoring one invented state is not an error", _kind(exc), None)
 check("grow/the hook's added state is scored",
       ((grown or {}).get("usage") or {}).get("windows", "<absent>"), nwin + 1)
 check("grow/the caller's split is the one that was extended", a._forward_calls, [2 * (nwin + 1)])
