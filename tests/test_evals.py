@@ -628,3 +628,133 @@ def test_cli_rejects_a_malformed_tolerance():
 
     with pytest.raises(EvalError):
         evals_cli._parse_pairs(["choice_accuracy"])
+
+
+# --------------------------------------------------------------- --revision pinning
+SHA = "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851"
+
+
+def _fake_router(monkeypatch, recorded):
+    """Replace `laya.Router` with a weight-free stand-in that records how `_cmd_run` built it.
+
+    It validates checkpoint names the way `Router.__init__` does, by calling the same
+    `normalise_name`, so the fake refuses a typo for the real reason.
+    """
+    import laya
+
+    class FakeRouter:
+        def __init__(self, device=None, preload=None, revision=None, revisions=None):
+            from laya.router import normalise_name
+            recorded.update(device=device, preload=preload, revision=revision,
+                            revisions={normalise_name(k): v for k, v in (revisions or {}).items()})
+
+        def predict(self, state, questions, model=None):
+            return {"model": model or "english", "answers": {"intent": choice_answer("a")}}
+
+        loaded_revisions = {"english": SHA}
+
+    monkeypatch.setattr(laya, "Router", FakeRouter)
+
+
+def test_cli_forwards_the_pin_and_records_the_commit_that_answered(tmp_path, monkeypatch):
+    from laya import evals_cli
+
+    recorded = {}
+    _fake_router(monkeypatch, recorded)
+    dataset = _write_dataset(tmp_path, [{"state": "s", "questions": Q, "expected": {"intent": "a"}}])
+    out = tmp_path / "report.json"
+    assert evals_cli.main(["run", dataset, "--model", "english", "--device", "cpu",
+                           "--revision", "english=" + SHA, "--json", str(out)]) == 0
+    assert recorded["revision"] is None
+    assert recorded["revisions"] == {"english": SHA}
+    # The report is the artifact a reviewer commits, so it has to carry the commit itself.
+    assert json.loads(out.read_text())["config"]["revisions"] == {"english": SHA}
+
+
+def test_cli_bare_revision_pins_every_checkpoint(tmp_path, monkeypatch):
+    from laya import evals_cli
+
+    recorded = {}
+    _fake_router(monkeypatch, recorded)
+    dataset = _write_dataset(tmp_path, [{"state": "s", "questions": Q, "expected": {"intent": "a"}}])
+    assert evals_cli.main(["run", dataset, "--revision", SHA, "--json",
+                           str(tmp_path / "r.json")]) == 0
+    # A bare SHA is one commit for every checkpoint, so nothing is pinned per name.
+    assert recorded["revision"] == SHA and recorded["revisions"] == {}
+
+
+def test_cli_records_an_unpinned_run_too(tmp_path, monkeypatch):
+    """The default branch is what an unpinned baseline was taken on; the report must say so."""
+    from laya import evals_cli
+
+    recorded = {}
+    _fake_router(monkeypatch, recorded)
+    dataset = _write_dataset(tmp_path, [{"state": "s", "questions": Q, "expected": {"intent": "a"}}])
+    out = tmp_path / "r.json"
+    assert evals_cli.main(["run", dataset, "--json", str(out)]) == 0
+    assert recorded["revision"] is None and recorded["revisions"] == {}
+    assert json.loads(out.read_text())["config"]["revisions"] == {"english": SHA}
+
+
+def test_cli_rejects_a_typo_in_a_pinned_checkpoint_name(tmp_path, monkeypatch, capsys):
+    from laya import evals_cli
+
+    recorded = {}
+    _fake_router(monkeypatch, recorded)
+    dataset = _write_dataset(tmp_path, [{"state": "s", "questions": Q, "expected": {"intent": "a"}}])
+    assert evals_cli.main(["run", dataset, "--revision", "englishg=" + SHA]) == 1
+    err = capsys.readouterr().err
+    assert "unknown model 'englishg'" in err
+    assert "choose one of" in err, "the message comes from core, with the option list"
+    assert "Traceback" not in err, "a mistyped pin is a usage error, not a crash"
+    assert not recorded, "and it fails before any checkpoint is loaded"
+
+
+def test_cli_accepts_a_checkpoint_alias_in_a_pin(tmp_path, monkeypatch):
+    """`Router` owns the alias table, so `en=` must reach it rather than be second-guessed here."""
+    from laya import evals_cli
+
+    recorded = {}
+    _fake_router(monkeypatch, recorded)
+    dataset = _write_dataset(tmp_path, [{"state": "s", "questions": Q, "expected": {"intent": "a"}}])
+    assert evals_cli.main(["run", dataset, "--revision", "en=" + SHA]) == 0
+    assert recorded["revisions"] == {"english": SHA}
+
+
+@pytest.mark.parametrize("pairs, expected", [
+    (None, (None, {})),
+    ([], (None, {})),
+    ([SHA], (SHA, {})),
+    ([SHA, SHA], (SHA, {})),                      # repeating one commit is agreement, not a clash
+    (["en=" + SHA], (None, {"en": SHA})),
+    (["en=" + SHA, SHA], (SHA, {"en": SHA})),     # both forms at once: Router lets the pair win
+])
+def test_parse_revisions_accepts_both_forms(pairs, expected):
+    from laya import evals_cli
+
+    assert evals_cli._parse_revisions(pairs) == expected
+
+
+@pytest.mark.parametrize("pair, fragment", [
+    ("=abc", "NAME=REVISION"),
+    ("en=", "NAME=REVISION"),
+    ("   ", "commit SHA"),
+    ("abc", None),
+])
+def test_parse_revisions_rejects_half_a_pair(pair, fragment):
+    from laya import evals_cli
+
+    if fragment is None:
+        assert evals_cli._parse_revisions([pair]) == (pair, {})
+        return
+    with pytest.raises(EvalError) as exc:
+        evals_cli._parse_revisions([pair])
+    assert fragment in str(exc.value)
+
+
+def test_parse_revisions_rejects_two_different_bare_commits():
+    from laya import evals_cli
+
+    with pytest.raises(EvalError) as exc:
+        evals_cli._parse_revisions(["abc", "def"])
+    assert "two commits" in str(exc.value)
