@@ -5,6 +5,7 @@ Exit codes: 0 on success, 1 when a threshold or a baseline tolerance fails, 2 on
     laya-evals validate research/evals/fixture.jsonl
     laya-evals run research/evals/fixture.jsonl --model english --min-accuracy 0.8 --max-ece 0.1
     laya-evals run data.jsonl --baseline baseline.json --tolerance choice_accuracy=0.02 --json out.json
+    laya-evals run data.jsonl --score-within 0.25 --min score_within_0.25=0.9
 
 `laya eval ...` dispatches here from the main CLI, so both spellings work.
 """
@@ -12,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -105,6 +107,20 @@ def _parse_revisions(pairs: Optional[Sequence[str]]) -> Tuple[Optional[str], Dic
     return shared, per_model
 
 
+def _score_within(tolerances: Optional[Sequence[float]]) -> List[evals.Evaluator]:
+    """Build the `ScoreWithin` evaluators `--score-within` asks for, in the order given.
+
+    A non-finite or negative tolerance would name a metric that is always 1.0 or always 0.0, and a
+    `--min` gate on that metric would then decide nothing, so the CLI rejects them up front.
+    """
+    out: List[evals.Evaluator] = []
+    for tolerance in tolerances or []:
+        if not math.isfinite(tolerance) or tolerance < 0.0:
+            raise EvalError("--score-within needs a finite tolerance >= 0, got %g" % tolerance)
+        out.append(evals.ScoreWithin(tolerance))
+    return out
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="laya-evals",
                                      description="Evaluate a Laya checkpoint on a labelled dataset.")
@@ -134,6 +150,10 @@ def _build_parser() -> argparse.ArgumentParser:
     run.add_argument("--min-accuracy", type=float,
                      help="minimum accuracy (choice, else noul) for the whole dataset")
     run.add_argument("--max-ece", type=float, help="maximum expected calibration error")
+    run.add_argument("--score-within", dest="score_within", type=float, action="append",
+                     metavar="TOL",
+                     help="also report score_within_TOL, the fraction of score answers within TOL "
+                          "of the label; repeatable, and added to the default metrics")
     run.add_argument("--min", action="append", metavar="METRIC=VALUE", help="minimum for any metric")
     run.add_argument("--max", action="append", metavar="METRIC=VALUE", help="maximum for any metric")
     run.add_argument("--slice", action="append", choices=("language", "model", "qid", "tag"),
@@ -191,11 +211,28 @@ def _cmd_validate(args) -> int:
     return 0
 
 
+def _warn_no_value(extra: Sequence[evals.Evaluator], report: evals.EvalReport) -> None:
+    """Say so when a metric the caller asked for scored nothing.
+
+    `evaluate` drops a metric no answer applied to, so a requested `--score-within` over a
+    choice-only dataset would otherwise change the command and not the report.
+    """
+    missing = [evaluator.name for evaluator in extra if evaluator.name not in report.overall]
+    if not missing:
+        return
+    score_cases = sum(1 for case in report.cases if (case.get("answer") or {}).get("type") == "score")
+    for name in missing:
+        print("laya-evals: %s has no value: %d of %d answered case(s) are score answers, and the "
+              "metric needs one whose label is a number. A threshold naming it reports it missing."
+              % (name, score_cases, len(report.cases)), file=sys.stderr)
+
+
 def _cmd_run(args) -> int:
     dataset = evals.Dataset.from_jsonl(args.dataset)
     if args.model:
         for example in dataset.examples:      # --model is authoritative over per-row model
             example.model = args.model
+    extra = _score_within(args.score_within)  # before the checkpoint loads: a bad flag is cheap
     revision, revisions = _parse_revisions(args.revision)
     router = None
     if args.onnx:
@@ -211,8 +248,12 @@ def _cmd_run(args) -> int:
     else:
         import laya
         try:
-            router = laya.Router(device=args.device, preload=False, revision=revision,
-                                 revisions=revisions)
+            pins: Dict[str, Any] = {}
+            if revision is not None:
+                pins["revision"] = revision
+            if revisions:
+                pins["revisions"] = revisions
+            router = laya.Router(device=args.device, preload=False, **pins)
         except ValueError as exc:
             # `Router` already rejects a checkpoint name it does not know -- normalising case,
             # surrounding spaces and aliases on the way -- with the option list in the message.
@@ -224,14 +265,19 @@ def _cmd_run(args) -> int:
     config = {"dataset": args.dataset, "model": args.model, "device": args.device}
     if args.onnx:
         config["onnx"] = args.onnx
-    report = evals.evaluate(runner, dataset, batch_size=args.batch_size,
-                            on_error=args.on_error, config=config)
+    if extra:
+        config["score_within"] = [evaluator.tolerance for evaluator in extra]
+    report = evals.evaluate(runner, dataset, evaluators=evals.default_evaluators() + extra,
+                            batch_size=args.batch_size, on_error=args.on_error, config=config)
     # Which commit answered belongs in the artifact a baseline is, and it can only be read after
     # the run: `preload=False` means no checkpoint is resident before the first row.
     # `loaded_revisions` reports the commit each resident agent came from -- the pin when there is
     # one, the commit the default branch resolved to when there is not, None for a local path.
     if router is not None:
-        report.config = dict(report.config, revisions=router.loaded_revisions)
+        report.config = dict(report.config, revisions=getattr(router, "loaded_revisions", {}))
+
+    if extra:
+        _warn_no_value(extra, report)
 
     mins = _parse_pairs(args.min)
     maxs = _parse_pairs(args.max)

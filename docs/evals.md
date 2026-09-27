@@ -15,7 +15,7 @@ laya-evals validate research/evals/fixture.jsonl
 
 # score a labelled set on one checkpoint, with thresholds and a baseline
 laya-evals run data.jsonl --model english --device cpu \
-    --min-accuracy 0.8 --max-ece 0.05 --slice language \
+    --min-accuracy 0.8 --max-ece 0.05 --score-within 0.25 --slice language \
     --json report.json --markdown report.md
 
 # compare a saved report to a baseline
@@ -90,7 +90,14 @@ Each metric is computed per answer where it applies and aggregated over the data
 | `cost_per_decision_p50_ms`, `cost_per_decision_p95_ms` | per decision | a call's wall time divided by the rows it carried, informational |
 
 Add `ScoreWithin(0.25)` to the evaluator list for a tolerance metric; the default set is
-`choice_accuracy`, `noul_accuracy`, `score_mae`, `mean_confidence`, plus `ece`.
+`choice_accuracy`, `noul_accuracy`, `score_mae`, `mean_confidence`, plus `ece`. From the CLI the
+same thing is one flag: `laya-evals run data.jsonl --score-within 0.25` reports `score_within_0.25`
+beside the defaults, and the flag repeats, so `--score-within 0.25 --score-within 0.5` reports both.
+
+A tolerance metric needs a `score` answer with a numeric label, so on a dataset without one it has
+no value: `run` names the metric it could not compute instead of publishing a silent zero, and a
+`--min` / `--max` gate naming that metric fails as missing. The tolerances a run was asked for are
+recorded in the report's `config` block, so a reviewed baseline says which columns it expects.
 
 ## Batching and timing
 
