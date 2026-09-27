@@ -253,6 +253,21 @@ for label, cls in (("LayaRouter", LayaRouter), ("LayaGuardrail", LayaGuardrail),
     check_true("%s has no per-call hooks_concurrent" % label,
                "hooks_concurrent" not in inspect.signature(cls.__init__).parameters)
 
+# --------------------------------------------------------------- usage block
+# `input_tokens` / `output_tokens` are the fields every client decodes, so they are always
+# present. `options` (#538) is additive and conditional: it appears only for a request whose
+# options lost their distinct token spans, which is what keeps it out of ordinary responses.
+from laya.common import build_sequence, collapsed_options  # noqa: E402
+
+check_param("build_sequence", build_sequence, "return_stats", False)
+check("collapsed_options/nothing collapsed is empty",
+      collapsed_options(["q"], [{"options": {"options": 3, "options_distinct": 3,
+                                             "tokens_per_option": None}}]), {})
+check("collapsed_options/a collapsed question is reported",
+      collapsed_options(["q"], [{"options": {"options": 58, "options_distinct": 42,
+                                             "tokens_per_option": 4}}]),
+      {"q": {"total": 58, "distinct": 42, "tokens_per_option": 4}})
+
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:

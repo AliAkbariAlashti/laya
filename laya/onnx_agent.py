@@ -16,6 +16,7 @@ from laya.common import (
     QTYPES,
     answer_confidence,
     build_sequence,
+    collapsed_options,
     collate_items,
     confidence_from_probs,
     encode_text,
@@ -481,9 +482,9 @@ class ONNXAgent(HookRegistry):
         items = []
         for qid in ids:
             q = internal[qid]
-            seq, markers = build_sequence(
+            seq, markers, stats = build_sequence(
                 self.tok, state, q, max_len, head_max_len,
-                truncate_left=truncate_left, state_ids=state_ids,
+                truncate_left=truncate_left, state_ids=state_ids, return_stats=True,
             )
             n_opts = len(render_options(q))
             if len(markers) != n_opts:
@@ -498,7 +499,7 @@ class ONNXAgent(HookRegistry):
                     "max_len=%d allows once head_max_len=%d is spent on them; lower head_max_len, "
                     "raise max_len, or use fewer options"
                     % (qid, n_opts, len(seq), max_len, head_max_len))
-            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]})
+            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]], "options": stats})
         return items
 
     def _decode_answers(self, logits, act, items: List[Dict[str, Any]], ids: List[str],
@@ -621,10 +622,15 @@ class ONNXAgent(HookRegistry):
                 for index, items in zip(indices, per_state_items):
                     nrows = len(items)
                     n_tokens = int(att[row:row + nrows].sum())
+                    usage = {"input_tokens": n_tokens, "output_tokens": 0}
+                    # Only when a question lost options to the head budget, as on the torch Agent.
+                    collapsed = collapsed_options(ids, items)
+                    if collapsed:
+                        usage["options"] = collapsed
                     window_results[index] = {
                         "model": "laya-rl-agent-onnx",
                         "answers": self._decode_answers(logits, act, items, ids, internal, row, lang=lang),
-                        "usage": {"input_tokens": n_tokens, "output_tokens": 0},
+                        "usage": usage,
                     }
                     row += nrows
             results.extend(window_results)
