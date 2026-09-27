@@ -74,6 +74,30 @@ class EmptyQuestionsTests(unittest.TestCase):
         result["usage"]["input_tokens"] = 7
         self.assertEqual(self.agent.system_one("hello", {}), self.empty)
 
+    def test_non_dict_questions_raise_a_clear_type_error(self):
+        # `list(questions.keys())` used to raise `AttributeError: 'NoneType' object has no
+        # attribute 'keys'` (or the list/str equivalent) from three frames down, naming neither
+        # the argument nor the fix. The core API is the one surface that did not validate this;
+        # serve.py, shortlist.py and evals.py all already do.
+        for name in ("predict", "system_one"):
+            method = getattr(self.agent, name)
+            for bad in (None, [], "not-a-dict"):
+                with self.subTest(method=name, questions=bad):
+                    with self.assertRaises(TypeError) as cm:
+                        method("hello", bad)
+                    self.assertIn("questions must be a dict", str(cm.exception))
+
+    def test_none_state_raises_instead_of_answering_the_literal_null(self):
+        # `serialize_state(None)` is `json.dumps(None)` == "null", so a missing state was
+        # answered as a decision about the literal text "null" -- byte-identical to passing
+        # `"null"` -- at full confidence. Reject it before serialization.
+        for name in ("predict", "system_one"):
+            method = getattr(self.agent, name)
+            with self.subTest(method=name):
+                with self.assertRaises(TypeError) as cm:
+                    method(None, {"q": {"type": "noul", "instructions": "Is it true?"}})
+                self.assertIn("state must not be None", str(cm.exception))
+
     def test_nonempty_predictions_are_unchanged_after_empty_call(self):
         questions = {
             "choice": {"type": "choice", "instructions": "Pick one", "criteria": ["yes", "no"]},

@@ -976,7 +976,16 @@ class Agent(HookRegistry):
                     raise TypeError(
                         "predict_batch expects a list of states; pass a single state to predict()/system_one()."
                     )
+                if not isinstance(questions, dict):
+                    raise TypeError(
+                        "questions must be a dict of question id -> definition, got %s"
+                        % type(questions).__name__
+                    )
                 states = list(states)
+                if any(state is None for state in states):
+                    raise TypeError(
+                        "state must not be None; pass a string, dict, or list"
+                    )
                 if not states:
                     ctx.results = []
                 else:
