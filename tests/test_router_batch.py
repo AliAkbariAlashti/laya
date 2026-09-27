@@ -389,3 +389,56 @@ def test_end_hooks_see_the_low_confidence_flag(monkeypatch):
 
     router.predict_batch([request("hello", model="english")], min_confidence=0.80)
     assert seen[-1] == {"q1": False, "q2": True}
+
+
+def _sort_recording_router(monkeypatch, accepts_sort):
+    """A Router whose attached agent records the sort_by_length it was called with."""
+    import laya.agent
+
+    calls = []
+
+    class Agent:
+        def __init__(self, repo, *, device, token, subfolder):
+            pass
+
+        if accepts_sort:
+            def predict_batch(self, states, questions, batch_size=None, sort_by_length=False,
+                              **overrides):
+                calls.append({"n": len(states), "sort": sort_by_length})
+                return [{"model": "fake", "answers": {}, "usage": {}} for _ in states]
+        else:
+            # Strict signature, no **overrides: passing sort_by_length must raise TypeError,
+            # exactly like a real Agent that predates #294.
+            def predict_batch(self, states, questions, batch_size=None):
+                calls.append({"n": len(states), "sort": "unsupported"})
+                return [{"model": "fake", "answers": {}, "usage": {}} for _ in states]
+
+        def system_one(self, state, questions):
+            return self.predict_batch([state], questions)[0]
+
+    monkeypatch.setattr(laya.agent, "Agent", Agent)
+    return Router(max_loaded=1, default="english"), calls
+
+
+def test_sort_by_length_reaches_every_agent_call(monkeypatch):
+    """`Agent.predict_batch` has had `sort_by_length` since #294, but `Router.predict_batch`
+    never forwarded it, so routing -- the normal entry point -- silently lost length grouping.
+    Every model/question-schema group the batch splits into must get the knob."""
+    router, calls = _sort_recording_router(monkeypatch, accepts_sort=True)
+    two_schemas = {"intent": {"type": "noul", "instructions": "Urgent?"}}  # different schema text -> own group
+    router.predict_batch([request("a"), request("b"),
+                          {"state": "c", "questions": two_schemas}], sort_by_length=True)
+    assert [c["sort"] for c in calls] == [True, True]  # one call per group, each with the knob
+    calls.clear()
+    router.predict_batch([request("a"), request("b")])  # default stays off
+    assert [c["sort"] for c in calls] == [False]
+
+
+def test_sort_by_length_is_dropped_for_agents_that_predate_it(monkeypatch):
+    """An attached agent-like object whose `predict_batch` predates #294 must keep serving the
+    batch instead of raising TypeError -- the same tolerance the `lang` forwarding has."""
+    router, calls = _sort_recording_router(monkeypatch, accepts_sort=False)
+    results = router.predict_batch([request("a"), request("b")], sort_by_length=True)
+    assert len(results) == 2
+    assert [c["sort"] for c in calls] == ["unsupported"]  # one group, retry without the knob
+    assert [r["routing"]["model"] for r in results] == ["english", "english"]
