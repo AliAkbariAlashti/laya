@@ -74,7 +74,11 @@ requests were served fast, not whether the run was cheap. With no `--batch-size`
 `compare` ignores any `*_ms` metric unless a tolerance names it, so these never fail a baseline on
 timing noise. What the harness actually did -- the batch size asked for, the runner shape it
 resolved to, how many rows shared a call, and the largest chunk -- is recorded in the report's
-`config.timing`, because the flag alone does not say whether anything was batched.
+`config.timing`, because the flag alone does not say whether anything was batched. Those counters
+record the calls issued, not the calls that returned: with `on_error=skip`, a chunk whose call
+raised still counts in `rows_grouped` and `max_chunk`, next to its entries in `config.errored`. The
+two `*_ms` metrics count only the calls that returned, so a failed call never contributes a latency
+it did not measure.
 
 ## Slices
 

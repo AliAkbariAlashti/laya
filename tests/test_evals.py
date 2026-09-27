@@ -386,6 +386,50 @@ def test_a_requested_batch_size_is_not_a_batched_run(monkeypatch):
     assert report.config["timing"]["rows_alone"] == 2
 
 
+def test_a_batched_call_that_raises_is_still_recorded_as_batched(monkeypatch):
+    """`config["timing"]` counts the calls the harness issued, not only the calls that returned.
+
+    A raised chunk used to contribute to none of the shape counters, which made a run that issued
+    one shared forward and lost it indistinguishable from a run that never shared a call at all --
+    the one mode where `docs/evals.md` says the block has to be right.
+    """
+    import laya.evals as evals_module
+
+    class RaisingBatch(TimedRunner):
+        def predict_batch(self, states, questions, model=None, batch_size=None):
+            self.chunks.append(len(states))
+            raise RuntimeError("the shared forward failed")
+
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"}),
+                       Example("s3", Q, {"intent": "a"}), Example("s4", QWIDE, {"intent": "a"})])
+    answers = {state: {"intent": choice_answer("a")} for state in ("s1", "s2", "s3", "s4")}
+    runner = RaisingBatch(answers)
+    monkeypatch.setattr(evals_module, "time", runner.clock)
+    report = evals_module.evaluate(runner, dataset, evaluators=[ChoiceAccuracy()],
+                                   batch_size=8, on_error="skip")
+
+    # Why the runner records it itself: the counters under test are the harness's own account, so
+    # an independent witness that a three-row forward really went out is what makes the assertion
+    # mean something.
+    assert runner.chunks == [3], "a shared forward was issued for the three matching rows"
+    timing = report.config["timing"]
+    assert (timing["chunks"], timing["rows_grouped"], timing["rows_alone"]) == (2, 3, 1)
+    assert timing["max_chunk"] == 3
+    assert len(report.config["errored"]) == 3
+
+    # Why the metric lists stay below the `continue`: a call that returned nothing has no request
+    # latency to publish, so counting the attempt must not invent one. Only s4's own `predict`
+    # reaches the percentiles here.
+    assert report.overall["latency_p50_ms"] == pytest.approx(FORWARD_MS)
+    assert [case["correct"] for case in report.cases] == [True]
+
+    # The ambiguity this closes: a runner with no `predict_batch` gave the identical three
+    # counters, so the artifact could not tell "nothing was batched" from "the batch raised".
+    plain = evaluate(StubRunner(answers), dataset, evaluators=[ChoiceAccuracy()], batch_size=8)
+    for key in ("chunks", "rows_grouped", "max_chunk"):
+        assert timing[key] != plain.config["timing"][key], key
+
+
 def test_compare_leaves_the_cost_metrics_alone():
     report = EvalReport(overall={"choice_accuracy": 0.8, "latency_p50_ms": 12.0,
                                  "cost_per_decision_p50_ms": 4.0})

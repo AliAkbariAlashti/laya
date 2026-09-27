@@ -369,6 +369,19 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
                    and (examples[index + len(chunk)].model,
                         json.dumps(examples[index + len(chunk)].questions, sort_keys=False, default=str)) == signature):
                 chunk.append(examples[index + len(chunk)])
+        # Why these sit above the call and `waits`/`shares` below: the shape counters answer "what
+        # did the harness issue", which is settled the moment the chunk is grouped, while the
+        # metric lists answer "what did a request wait", which needs a call that returned. Counting
+        # only completed calls made a run that issued one shared forward and lost it to an error
+        # under `on_error="skip"` report the same `rows_grouped` and `max_chunk` as a runner with
+        # no batching at all (#592 review).
+        chunks += 1
+        if len(chunk) > 1:
+            rows_grouped += len(chunk)
+        else:
+            rows_alone += 1
+        if len(chunk) > max_chunk:
+            max_chunk = len(chunk)
         started = time.perf_counter()
         try:
             if len(chunk) > 1:
@@ -396,13 +409,6 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
         # publish a per-decision cost under the name of the per-request one (#585).
         waits.extend([elapsed] * len(chunk))
         shares.extend([elapsed / len(chunk)] * len(chunk))
-        chunks += 1
-        if len(chunk) > 1:
-            rows_grouped += len(chunk)
-        else:
-            rows_alone += 1
-        if len(chunk) > max_chunk:
-            max_chunk = len(chunk)
         for offset, (example, result) in enumerate(zip(chunk, results)):
             answers = (result or {}).get("answers") or {}
             for qid, expected in example.expected.items():
