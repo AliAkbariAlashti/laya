@@ -366,8 +366,6 @@ class Router(HookRegistry):
         token: Optional[str] = None,
         revision: Optional[str] = None,
         revisions: Optional[Dict[str, Optional[str]]] = None,
-        agent_kwargs: Optional[Dict[str, Any]] = None,
-        sha256_digests: Optional[Dict[str, Optional[Dict[str, str]]]] = None,
         max_loaded: int = 2,
         default: str = "english",
         auto_task_detection: bool = False,
@@ -380,6 +378,8 @@ class Router(HookRegistry):
         hooks_raise: bool = True,
         hooks_concurrent: bool = True,
         hooks_timeout: Optional[float] = None,
+        agent_kwargs: Optional[Dict[str, Any]] = None,
+        sha256_digests: Optional[Dict[str, Optional[Dict[str, str]]]] = None,
     ):
         self.hooks = normalise_hooks(hooks, on_predict_start, on_predict_end)
         self.hooks_raise = bool(hooks_raise)
