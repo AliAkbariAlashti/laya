@@ -528,7 +528,12 @@ def main() -> None:
         # asyncio only sets TCP_NODELAY when the accepted socket reports IPPROTO_TCP, and
         # on macOS and Windows it reports 0, so Nagle delays small responses (#620).
         def connection_made(self, transport):
-            transport.get_extra_info("socket").setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            sock = transport.get_extra_info("socket")
+            if sock is not None and sock.family in (socket.AF_INET, socket.AF_INET6):
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                except OSError:
+                    pass  # a latency hint, never a reason to drop the connection
             super().connection_made(transport)
 
     uvicorn.run(
