@@ -1,4 +1,4 @@
-﻿# Laya benchmarks
+# Laya benchmarks
 
 Every checkpoint answered **byte-identical questions** in each run (fixed seed). Jev figures are **third-party published, never measured here** — no TypeSafe API access — so sample sizes and prompts differ; treat them as indicative.
 
@@ -393,8 +393,6 @@ Results (laya 0.3.20, CUDA; bootstrap CIs and raw predictions in the source repo
 | english | 0.754 / 0.281 | 0.520 / 0.184 | 0.520 / 0.207 | 0.667 / 0.321 | 0.575 / 0.269 |
 
 Also measured: option-order flip rate 28% (CS) / 10.6% (voice); zh-CN to native zh-TW parallel-utterance flip rate 12.8%. Task framing differs from the sweep above (6-domain routing vs 20-way intent), so these complement rather than compare.
-
-Jev (jev-latest, TypeSafe direct API) was measured on the full zh-decision-bench set (n=284): it wins or ties every question group — voice routing 0.941/ECE 0.045, CS routing 0.920/0.065, urgency 0.680, scam detection 0.933/ECE 0.084 — and is order-invariant (0-1.7% flips) and script-robust (zh-CN to native zh-TW flip 1.7%, no accuracy drop). A gateway-vs-direct channel check on the 179 shared voice items showed 100% decision agreement (TV 0.003).
 
 ### 3. Temperature refit for zh (official `temp_bucket` convention)
 
