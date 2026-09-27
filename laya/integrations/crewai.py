@@ -51,14 +51,8 @@ class LayaTaskGuardError(ValueError):
         self.raw_decision = raw_decision
 
 
-class LayaLowConfidenceError(ValueError):
-    """Raised when task routing confidence falls below the configured threshold and no fallback is set."""
-
-    def __init__(self, message: str, confidence: float, threshold: float, raw_decision: Dict[str, Any]):
-        super().__init__(message)
-        self.confidence = confidence
-        self.threshold = threshold
-        self.raw_decision = raw_decision
+# One class for every integration, so `except LayaLowConfidenceError` catches all of them.
+from ._errors import LayaLowConfidenceError  # noqa: E402
 
 
 @dataclass

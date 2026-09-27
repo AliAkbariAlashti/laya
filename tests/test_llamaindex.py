@@ -380,7 +380,7 @@ with patch("urllib.request.build_opener") as mock_build_opener:
     mock_build_opener.return_value = mock_opener
 
     remote_selector = LayaSingleSelector(
-        base_url="https://api.laya.ai",
+        base_url="http://localhost:8000",
         api_key="sk-test-token",
     )
     res_remote = remote_selector.select(tools, "Query via remote server")
@@ -389,7 +389,7 @@ with patch("urllib.request.build_opener") as mock_build_opener:
     # Check request headers and URL
     call_args = mock_opener.open.call_args
     req = call_args[0][0]
-    check("remote/url", req.full_url, "https://api.laya.ai/v1/systemone")
+    check("remote/url", req.full_url, "http://localhost:8000/v1/systemone")
     check("remote/auth", req.headers.get("Authorization"), "Bearer sk-test-token")
 
 
