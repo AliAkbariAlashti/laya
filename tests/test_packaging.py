@@ -391,8 +391,10 @@ check_true("nix/module still joins models into LAYA_MODELS",
 #
 # Both regexes carry `[A-Z0-9_]` for the same reason: `LAYA_SHA256_DIGESTS`. `[A-Z_]+` matches a
 # prefix of that name, so a narrower pattern reports no gap rather than the one it cannot see.
+# `_ENV_KEY = "LAYA_DEVICE"` is how laya/mcp/device.py names the one variable it reads, and since
+# #574 laya.serve reads the device through it, so the constant counts as a read.
 _READ_PATTERNS = (r'environ\.get\("(LAYA_[A-Z0-9_]+)"', r'_env_bool\("(LAYA_[A-Z0-9_]+)"',
-                  r'environ\["(LAYA_[A-Z0-9_]+)"\]')
+                  r'environ\["(LAYA_[A-Z0-9_]+)"\]', r'_ENV_KEY = "(LAYA_[A-Z0-9_]+)"')
 
 
 def env_reads():
@@ -468,7 +470,8 @@ def option_type(opt):
 
 # Every new knob is opt-in: unset means the unit exports nothing and the runtime's own default
 # applies, so a host that ignores them gets today's behaviour byte for byte.
-for opt in ("logLevel", "maxConcurrent", "cudaAmp", "cpuAmp", "mpsAmpMinRows"):
+for opt in ("logLevel", "maxConcurrent", "cudaAmp", "cpuAmp", "mpsAmpMinRows",
+            "maxLoaded", "maxTokenBudget", "revision"):
     _t = option_text(opt)
     check_true("nix/module declares %s" % opt, _t != "", "option not found")
     check_true("nix/%s is opt-in (nullOr, default null)" % opt,

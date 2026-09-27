@@ -192,6 +192,41 @@ in
       '';
     };
 
+    maxLoaded = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      example = 3;
+      description = ''
+        Checkpoints kept resident at once (sets `LAYA_MAX_LOADED`). The Router
+        keeps two by default, the number automatic routing chooses between;
+        with `autoTaskDetection` a third one becomes reachable on demand, and a
+        cap below what routing chooses rebuilds a checkpoint on every switch.
+        null leaves the Router's own default.
+      '';
+    };
+
+    maxTokenBudget = lib.mkOption {
+      type = lib.types.nullOr lib.types.ints.positive;
+      default = null;
+      example = 4096;
+      description = ''
+        Ceiling on the per-request `max_len` / `head_max_len` a client may ask
+        for (sets `LAYA_MAX_TOKEN_BUDGET`); a larger value is refused with 422.
+        null leaves the server's own default.
+      '';
+    };
+
+    revision = lib.mkOption {
+      type = lib.types.nullOr (lib.types.strMatching "[A-Za-z0-9._/-]+");
+      default = null;
+      example = "reviewed";
+      description = ''
+        Hub commit, branch or tag every checkpoint is downloaded at (sets
+        `LAYA_REVISION`), or `reviewed` for the reviewed commit SHAs laya ships.
+        null keeps huggingface_hub's default revision and any existing cache.
+      '';
+    };
+
     autoTaskDetection = lib.mkOption {
       type = lib.types.bool;
       default = false;
@@ -249,6 +284,12 @@ in
         LAYA_CPU_AMP = cfg.cpuAmp;
       } // lib.optionalAttrs (cfg.mpsAmpMinRows != null) {
         LAYA_MPS_AMP_MIN_ROWS = toString cfg.mpsAmpMinRows;
+      } // lib.optionalAttrs (cfg.maxLoaded != null) {
+        LAYA_MAX_LOADED = toString cfg.maxLoaded;
+      } // lib.optionalAttrs (cfg.maxTokenBudget != null) {
+        LAYA_MAX_TOKEN_BUDGET = toString cfg.maxTokenBudget;
+      } // lib.optionalAttrs (cfg.revision != null) {
+        LAYA_REVISION = cfg.revision;
       } // {
         HF_HOME = "/var/lib/${cfg.stateDirectory}/huggingface";
         # torch-bin bundles its own CUDA runtime but still needs the host
