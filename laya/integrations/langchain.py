@@ -175,6 +175,35 @@ def _predict_kwargs(model: Optional[str] = None, max_len: Optional[int] = None,
     return kwargs
 
 
+def _reject_remote_hooks(hook_kwargs: Dict[str, Any], base_url: Optional[str]) -> None:
+    """Refuse hooks on a remote node rather than dropping them silently.
+
+    A hook is a Python callable that runs inside `predict` -- it can cache a decision, gate one or
+    rewrite its state. `laya-serve` has no way to receive or run one, so a node with a `base_url`
+    and hooks configured would report success while never calling them.
+    """
+    if base_url and hook_kwargs:
+        raise ValueError(
+            "%s run in the local runner and cannot be sent to a laya-serve endpoint; "
+            "install them where serve runs, or drop them" % ", ".join(sorted(hook_kwargs))
+        )
+
+
+def _hook_kwargs(hooks: Optional[Any] = None, on_predict_start: Optional[Any] = None,
+                 on_predict_end: Optional[Any] = None, hooks_raise: Optional[bool] = None,
+                 hooks_timeout: Optional[float] = None) -> Dict[str, Any]:
+    """The per-call hook overrides, with the unset ones omitted.
+
+    Core reads `None` as "inherit whatever the runner was built with", so an unset hook has to be
+    absent rather than passed as `None`. Note the `is not None` tests: `hooks=[]` means "no hooks
+    for this call", and `hooks_raise=False` means "keep deciding after a hook fails" -- both are
+    decisions a caller made, not absences.
+    """
+    given = {"hooks": hooks, "on_predict_start": on_predict_start, "on_predict_end": on_predict_end,
+             "hooks_raise": hooks_raise, "hooks_timeout": hooks_timeout}
+    return {k: v for k, v in given.items() if v is not None}
+
+
 def _execute_decision(
     state: Any,
     questions: Dict[str, Any],
@@ -184,23 +213,37 @@ def _execute_decision(
     model: Optional[str] = None,
     max_len: Optional[int] = None,
     head_max_len: Optional[int] = None,
+    hooks: Optional[Any] = None,
+    on_predict_start: Optional[Any] = None,
+    on_predict_end: Optional[Any] = None,
+    hooks_raise: Optional[bool] = None,
+    hooks_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
+    hook_kwargs = _hook_kwargs(hooks, on_predict_start, on_predict_end, hooks_raise, hooks_timeout)
     if base_url:
         _reject_remote_budget(max_len, head_max_len, base_url)
+        _reject_remote_hooks(hook_kwargs, base_url)
         return _call_remote(base_url, state, questions, api_key=api_key, model=model)
     runner = agent if agent is not None else _get_default_router()
-    return runner.predict(state, questions, **_predict_kwargs(model, max_len, head_max_len))
+    kwargs = _predict_kwargs(model, max_len, head_max_len)
+    kwargs.update(hook_kwargs)
+    return runner.predict(state, questions, **kwargs)
 
 
-def _can_batch(agent: Optional[Any] = None, base_url: Optional[str] = None) -> bool:
+def _can_batch(agent: Optional[Any] = None, base_url: Optional[str] = None,
+               hooked: bool = False) -> bool:
     """Whether the path this runnable would take supports one batched forward call.
 
-    False for a remote deployment (`laya-serve` answers one request per POST) and for a
-    caller-supplied runner that only implements `predict`.
+    False for a remote deployment (`laya-serve` answers one request per POST), for a
+    caller-supplied runner that only implements `predict`, and for a `Router` when per-call
+    hooks are configured: `Router.predict_batch` takes no per-call hooks, so the per-input
+    loop is what keeps them running.
     """
     if base_url:
         return False
     runner = agent if agent is not None else _get_default_router()
+    if hooked and hasattr(runner, "route_batch"):
+        return False
     return getattr(runner, "predict_batch", None) is not None
 
 
@@ -211,6 +254,7 @@ def _execute_batch(
     model: Optional[str] = None,
     max_len: Optional[int] = None,
     head_max_len: Optional[int] = None,
+    hook_kwargs: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Evaluate one question set over many states, packing them into shared forward passes.
 
@@ -224,7 +268,7 @@ def _execute_batch(
     if hasattr(runner, "route_batch"):
         requests = [dict({"state": state, "questions": questions}, **overrides) for state in states]
         return runner.predict_batch(requests)
-    return runner.predict_batch(list(states), questions, **overrides)
+    return runner.predict_batch(list(states), questions, **overrides, **(hook_kwargs or {}))
 
 
 def _per_input_config(config: Any, n: int) -> List[Any]:
@@ -278,7 +322,9 @@ class _BatchedRunnable:
                 except Exception as exc:  # noqa: BLE001 - returned, per the Runnable contract
                     outcomes.append(exc)
             return outcomes
-        if not _can_batch(self.agent, self.base_url):
+        hook_kwargs = _hook_kwargs(self.hooks, self.on_predict_start, self.on_predict_end,
+                                   self.hooks_raise, self.hooks_timeout)
+        if not _can_batch(self.agent, self.base_url, hooked=bool(hook_kwargs)):
             if _RUNNABLE_AVAILABLE:
                 # LangChain's own loop already understands both config shapes.
                 return super().batch(inputs, config, **kwargs)  # type: ignore[misc]
@@ -289,7 +335,7 @@ class _BatchedRunnable:
         states = [_extract_text(item, self.state_key) for item in inputs]
         results = _execute_batch(
             states, self._questions(), agent=self.agent, model=self.model,
-            max_len=self.max_len, head_max_len=self.head_max_len,
+            max_len=self.max_len, head_max_len=self.head_max_len, hook_kwargs=hook_kwargs,
         )
         return [self._finish(result, item) for result, item in zip(results, inputs)]
 
@@ -333,6 +379,11 @@ class LayaRouter(_BatchedRunnable, RunnableSerializable):
     model: Optional[str] = None
     max_len: Optional[int] = None
     head_max_len: Optional[int] = None
+    hooks: Optional[Any] = None
+    on_predict_start: Optional[Any] = None
+    on_predict_end: Optional[Any] = None
+    hooks_raise: Optional[bool] = None
+    hooks_timeout: Optional[float] = None
     question_id: str = "route"
     last_decision: Optional[Dict[str, Any]] = None
 
@@ -353,6 +404,11 @@ class LayaRouter(_BatchedRunnable, RunnableSerializable):
         model: Optional[str] = None,
         max_len: Optional[int] = None,
         head_max_len: Optional[int] = None,
+        hooks: Optional[Any] = None,
+        on_predict_start: Optional[Any] = None,
+        on_predict_end: Optional[Any] = None,
+        hooks_raise: Optional[bool] = None,
+        hooks_timeout: Optional[float] = None,
         **kwargs: Any,
     ):
         if _RUNNABLE_AVAILABLE:
@@ -368,6 +424,11 @@ class LayaRouter(_BatchedRunnable, RunnableSerializable):
                 model=model,
                 max_len=max_len,
                 head_max_len=head_max_len,
+                hooks=hooks,
+                on_predict_start=on_predict_start,
+                on_predict_end=on_predict_end,
+                hooks_raise=hooks_raise,
+                hooks_timeout=hooks_timeout,
                 **kwargs,
             )
         else:
@@ -382,6 +443,11 @@ class LayaRouter(_BatchedRunnable, RunnableSerializable):
             self.model = model
             self.max_len = max_len
             self.head_max_len = head_max_len
+            self.hooks = hooks
+            self.on_predict_start = on_predict_start
+            self.on_predict_end = on_predict_end
+            self.hooks_raise = hooks_raise
+            self.hooks_timeout = hooks_timeout
         self.question_id = "route"
         self.last_decision: Optional[Dict[str, Any]] = None
 
@@ -420,6 +486,11 @@ class LayaRouter(_BatchedRunnable, RunnableSerializable):
             model=self.model,
             max_len=self.max_len,
             head_max_len=self.head_max_len,
+            hooks=self.hooks,
+            on_predict_start=self.on_predict_start,
+            on_predict_end=self.on_predict_end,
+            hooks_raise=self.hooks_raise,
+            hooks_timeout=self.hooks_timeout,
         )
         return self._finish(res, input)
 
@@ -447,6 +518,11 @@ class LayaGuardrail(_BatchedRunnable, RunnableSerializable):
     model: Optional[str] = None
     max_len: Optional[int] = None
     head_max_len: Optional[int] = None
+    hooks: Optional[Any] = None
+    on_predict_start: Optional[Any] = None
+    on_predict_end: Optional[Any] = None
+    hooks_raise: Optional[bool] = None
+    hooks_timeout: Optional[float] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -465,6 +541,11 @@ class LayaGuardrail(_BatchedRunnable, RunnableSerializable):
         model: Optional[str] = None,
         max_len: Optional[int] = None,
         head_max_len: Optional[int] = None,
+        hooks: Optional[Any] = None,
+        on_predict_start: Optional[Any] = None,
+        on_predict_end: Optional[Any] = None,
+        hooks_raise: Optional[bool] = None,
+        hooks_timeout: Optional[float] = None,
         **kwargs: Any,
     ):
         if _RUNNABLE_AVAILABLE:
@@ -480,6 +561,11 @@ class LayaGuardrail(_BatchedRunnable, RunnableSerializable):
                 model=model,
                 max_len=max_len,
                 head_max_len=head_max_len,
+                hooks=hooks,
+                on_predict_start=on_predict_start,
+                on_predict_end=on_predict_end,
+                hooks_raise=hooks_raise,
+                hooks_timeout=hooks_timeout,
                 **kwargs,
             )
         else:
@@ -494,6 +580,11 @@ class LayaGuardrail(_BatchedRunnable, RunnableSerializable):
             self.model = model
             self.max_len = max_len
             self.head_max_len = head_max_len
+            self.hooks = hooks
+            self.on_predict_start = on_predict_start
+            self.on_predict_end = on_predict_end
+            self.hooks_raise = hooks_raise
+            self.hooks_timeout = hooks_timeout
 
     def _default_questions(self) -> Dict[str, Any]:
         from ..presets import guard_questions
@@ -569,6 +660,11 @@ class LayaGuardrail(_BatchedRunnable, RunnableSerializable):
             model=self.model,
             max_len=self.max_len,
             head_max_len=self.head_max_len,
+            hooks=self.hooks,
+            on_predict_start=self.on_predict_start,
+            on_predict_end=self.on_predict_end,
+            hooks_raise=self.hooks_raise,
+            hooks_timeout=self.hooks_timeout,
         )
         return self._finish(res, input)
 
@@ -591,6 +687,11 @@ class LayaTriage(_BatchedRunnable, RunnableSerializable):
     model: Optional[str] = None
     max_len: Optional[int] = None
     head_max_len: Optional[int] = None
+    hooks: Optional[Any] = None
+    on_predict_start: Optional[Any] = None
+    on_predict_end: Optional[Any] = None
+    hooks_raise: Optional[bool] = None
+    hooks_timeout: Optional[float] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -605,6 +706,11 @@ class LayaTriage(_BatchedRunnable, RunnableSerializable):
         model: Optional[str] = None,
         max_len: Optional[int] = None,
         head_max_len: Optional[int] = None,
+        hooks: Optional[Any] = None,
+        on_predict_start: Optional[Any] = None,
+        on_predict_end: Optional[Any] = None,
+        hooks_raise: Optional[bool] = None,
+        hooks_timeout: Optional[float] = None,
         **kwargs: Any,
     ):
         if _RUNNABLE_AVAILABLE:
@@ -616,6 +722,11 @@ class LayaTriage(_BatchedRunnable, RunnableSerializable):
                 model=model,
                 max_len=max_len,
                 head_max_len=head_max_len,
+                hooks=hooks,
+                on_predict_start=on_predict_start,
+                on_predict_end=on_predict_end,
+                hooks_raise=hooks_raise,
+                hooks_timeout=hooks_timeout,
                 **kwargs,
             )
         else:
@@ -626,6 +737,11 @@ class LayaTriage(_BatchedRunnable, RunnableSerializable):
             self.model = model
             self.max_len = max_len
             self.head_max_len = head_max_len
+            self.hooks = hooks
+            self.on_predict_start = on_predict_start
+            self.on_predict_end = on_predict_end
+            self.hooks_raise = hooks_raise
+            self.hooks_timeout = hooks_timeout
 
     def _questions(self) -> Dict[str, Any]:
         from ..presets import triage_questions
@@ -664,6 +780,11 @@ class LayaTriage(_BatchedRunnable, RunnableSerializable):
             model=self.model,
             max_len=self.max_len,
             head_max_len=self.head_max_len,
+            hooks=self.hooks,
+            on_predict_start=self.on_predict_start,
+            on_predict_end=self.on_predict_end,
+            hooks_raise=self.hooks_raise,
+            hooks_timeout=self.hooks_timeout,
         )
         return self._finish(res, state)
 
@@ -686,6 +807,11 @@ class LayaEvaluator(_BatchedRunnable, RunnableSerializable):
     model: Optional[str] = None
     max_len: Optional[int] = None
     head_max_len: Optional[int] = None
+    hooks: Optional[Any] = None
+    on_predict_start: Optional[Any] = None
+    on_predict_end: Optional[Any] = None
+    hooks_raise: Optional[bool] = None
+    hooks_timeout: Optional[float] = None
 
     class Config:
         arbitrary_types_allowed = True
@@ -701,6 +827,11 @@ class LayaEvaluator(_BatchedRunnable, RunnableSerializable):
         model: Optional[str] = None,
         max_len: Optional[int] = None,
         head_max_len: Optional[int] = None,
+        hooks: Optional[Any] = None,
+        on_predict_start: Optional[Any] = None,
+        on_predict_end: Optional[Any] = None,
+        hooks_raise: Optional[bool] = None,
+        hooks_timeout: Optional[float] = None,
         **kwargs: Any,
     ):
         if _RUNNABLE_AVAILABLE:
@@ -713,6 +844,11 @@ class LayaEvaluator(_BatchedRunnable, RunnableSerializable):
                 model=model,
                 max_len=max_len,
                 head_max_len=head_max_len,
+                hooks=hooks,
+                on_predict_start=on_predict_start,
+                on_predict_end=on_predict_end,
+                hooks_raise=hooks_raise,
+                hooks_timeout=hooks_timeout,
                 **kwargs,
             )
         else:
@@ -724,6 +860,11 @@ class LayaEvaluator(_BatchedRunnable, RunnableSerializable):
             self.model = model
             self.max_len = max_len
             self.head_max_len = head_max_len
+            self.hooks = hooks
+            self.on_predict_start = on_predict_start
+            self.on_predict_end = on_predict_end
+            self.hooks_raise = hooks_raise
+            self.hooks_timeout = hooks_timeout
 
     def evaluate_strings(self, *, prediction: str, input: Optional[str] = None, **kwargs: Any) -> Dict[str, Any]:
         """LangChain standard string evaluation interface."""
@@ -737,6 +878,11 @@ class LayaEvaluator(_BatchedRunnable, RunnableSerializable):
             model=self.model,
             max_len=self.max_len,
             head_max_len=self.head_max_len,
+            hooks=self.hooks,
+            on_predict_start=self.on_predict_start,
+            on_predict_end=self.on_predict_end,
+            hooks_raise=self.hooks_raise,
+            hooks_timeout=self.hooks_timeout,
         )
         return res.get("answers", {})
 
@@ -757,6 +903,11 @@ class LayaEvaluator(_BatchedRunnable, RunnableSerializable):
             model=self.model,
             max_len=self.max_len,
             head_max_len=self.head_max_len,
+            hooks=self.hooks,
+            on_predict_start=self.on_predict_start,
+            on_predict_end=self.on_predict_end,
+            hooks_raise=self.hooks_raise,
+            hooks_timeout=self.hooks_timeout,
         )
         return self._finish(res, input)
 
