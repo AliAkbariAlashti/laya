@@ -96,14 +96,16 @@ def test_duck_shape_restored_after_errors_and_nesting():
 
 def test_duck_shape_restored_across_threads():
     before = fx_config.use_duck_shape
-    inside, release = threading.Barrier(4), threading.Event()
-    seen = []
+    inside, left, release = threading.Barrier(4), threading.Barrier(4), threading.Event()
+    seen, after = [], []
 
     def call():
         with independent_dims():
             inside.wait()
             seen.append(fx_config.use_duck_shape)
             release.wait()
+        left.wait()  # read once every call has returned, global or per-thread setting alike
+        after.append(fx_config.use_duck_shape)
 
     threads = [threading.Thread(target=call) for _ in range(4)]
     for t in threads:
@@ -114,6 +116,7 @@ def test_duck_shape_restored_across_threads():
     for t in threads:
         t.join()
     assert seen == [False] * 4
+    assert after == [before] * 4
     assert fx_config.use_duck_shape is before
 
 

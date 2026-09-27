@@ -15,16 +15,19 @@ switches duck sizing off while a compiled forward runs, which removes the second
 of Laya's inputs is independent, so each gets its own symbol. What is left is torch's own 0/1
 specialisation, one extra graph the first time a single-row batch arrives.
 
-`use_duck_shape` is a process-global torch setting read when a graph is traced, which happens lazily
-inside a call, so it cannot be set once at load and restored. It is set for the duration of each
-compiled forward instead and put back to whatever it was when the last one returns (refcounted, so
-concurrent calls on several threads do not restore it early). Nothing is left changed between calls.
+`use_duck_shape` is read when a graph is traced, which happens lazily inside a call, so it cannot be
+set once at load and restored. It is set for the duration of each compiled forward instead. In older
+torch (2.11, for one) the setting is process-global, so it is put back to whatever it was when the
+last call returns (refcounted, so concurrent calls on several threads do not restore it early); newer
+torch (2.14) keeps config overrides per thread (a `ContextVar` per entry), so each call sets and
+restores its own thread's value with the config's `patch`. Nothing is left changed between calls.
 
 Mode and device are unchanged from what `compile=True` has always done: the default inductor mode,
 on whatever device the agent runs on, CPU included.
 """
 import threading
 from contextlib import contextmanager
+from contextvars import ContextVar
 
 import torch
 
@@ -46,6 +49,12 @@ def _fx_config():
     return _config if hasattr(_config, "use_duck_shape") else None
 
 
+def _per_thread(cfg):
+    """True where a config override only applies to the thread that set it (torch 2.14; 2.11 is global)."""
+    entry = getattr(cfg, "_config", {}).get("use_duck_shape")
+    return isinstance(getattr(entry, "user_override", None), ContextVar)
+
+
 @contextmanager
 def independent_dims():
     """Trace with `use_duck_shape = False` inside the block, restoring the prior value afterwards."""
@@ -53,6 +62,11 @@ def independent_dims():
     cfg = _fx_config()
     if cfg is None:
         yield
+        return
+    if _per_thread(cfg):
+        # each thread traces with its own settings, so each call sets and restores its own
+        with cfg.patch(use_duck_shape=False):
+            yield
         return
     with _lock:
         if _depth == 0:
