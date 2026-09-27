@@ -69,6 +69,9 @@ for label, fn in (("Agent.__init__", Agent.__init__), ("load", load),
 check_param("Router.__init__", Router.__init__, "lang_guess", None)
 check_param("Router.__init__", Router.__init__, "revisions", None)
 
+# ONNXAgent downloads the same Hub artifacts as Agent, so it authenticates the same way
+check_param("ONNXAgent.__init__", ONNXAgent.__init__, "token", None)
+
 # --------------------------------------------------------------- predict surfaces
 for label, fn in (("Agent.predict_batch", Agent.predict_batch),
                   ("Agent.system_one", Agent.system_one),

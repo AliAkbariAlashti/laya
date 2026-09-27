@@ -43,6 +43,7 @@ class ONNXAgent(HookRegistry):
         self,
         model_id_or_path: str,
         onnx_path: str = "laya.onnx",
+        token: Optional[str] = None,
         subfolder: Optional[str] = None,
         revision: Optional[str] = None,
         expected_sha256: Optional[Dict[str, str]] = None,
@@ -60,6 +61,9 @@ class ONNXAgent(HookRegistry):
             model_id_or_path: HuggingFace Hub ID or local path to the original PyTorch checkpoint
                               (used to load the tokenizer and config).
             onnx_path: Path to the exported .onnx file.
+            token: Optional HuggingFace token for a private or gated checkpoint; falls back
+                   to `$HF_TOKEN`, exactly as `Agent` does. Only the tokenizer and config are
+                   fetched -- the graph itself is the local `onnx_path`.
             subfolder: Optional subfolder if downloading from a repo bundle.
             revision: Optional Hub revision (commit SHA/branch/tag). When omitted,
                       huggingface_hub's normal default and existing offline cache are used.
@@ -102,6 +106,7 @@ class ONNXAgent(HookRegistry):
             revision = resolve_revision(model_id_or_path, revision)
             prefix = f"{subfolder}/" if subfolder else ""
             kw = {
+                "token": token or os.environ.get("HF_TOKEN") or None,
                 "allow_patterns": [prefix + name for name in (
                     "rl_agent_config.json", "tokenizer/*", "encoder/*",
                 )],
