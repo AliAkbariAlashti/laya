@@ -2,6 +2,7 @@
 
 Text parsing, not tomllib: the floor is 3.10 and tomllib arrives in 3.11.
 """
+import ast
 import os
 import re
 import sys
@@ -207,6 +208,81 @@ check_true("compose.cuda/no stale reference to a missing file",
 for name in ("compose.yaml", "compose.example.yml", "compose.cuda.yaml", "compose.http.yaml",
              "compose.spark.yaml"):
     check_true("compose/%s exists" % name, os.path.exists(name))
+
+
+# --------------------------------------------------------------- nix: the deployment layer
+# Nix builds and evaluates nothing here in CI (`grep -rn nix .github/workflows/` is empty), so
+# these textual checks are the only gate on the two files a NixOS host deploys from. Same style
+# as the compose checks above: no nix binary, no third-party dependency.
+
+nix_pkg = read(os.path.join("nix", "package.nix"))
+nix_version = re.search(r'^\s*version\s*=\s*"([^"]+)"', nix_pkg, re.M)
+check_true("nix/package.nix declares a version", nix_version is not None, nix_pkg[:200])
+# The release job compares the tag to pyproject, and pyproject is compared to laya.__version__
+# above. This is the third declaration of the same string -- it sat at 0.3.4 for sixteen
+# releases because no reader existed.
+check("version/nix matches pyproject",
+      nix_version.group(1) if nix_version else None,
+      static_version.group(1) if static_version else None)
+
+# `services.laya-serve.models` is joined into LAYA_MODELS, which laya.serve splits and hands to
+# Router.preload() -- and preload normalises every name (laya/router.py:370), so the server takes
+# core's aliases. A closed `enum` in the module can only copy that list and fall behind it: it
+# refused ten of the thirteen spellings the same value accepts, and it refused them at nix
+# evaluation time, on the way to starting a service that would have been happy.
+nix_module = read(os.path.join("nix", "laya-serve.nix"))
+models_block = re.search(r"models = lib\.mkOption \{(.*?)\n    \};", nix_module, re.S)
+check_true("nix/module has a models option", models_block is not None, nix_module[:200])
+block = models_block.group(1) if models_block else ""
+type_line = re.search(r"^\s*type\s*=\s*(.+?)\s*$", block, re.M)
+check_true("nix/models type declaration found", type_line is not None, block[:200])
+declared_type = type_line.group(1) if type_line else ""
+check_true("nix/models declares no closed enum over checkpoint names",
+           "types.enum" not in declared_type, "type = %s" % declared_type)
+
+# The accepted name set, read out of core rather than transcribed: DEFAULT_MODELS' keys and the
+# alias table. ast, not import -- this suite takes no third-party dependency, and torch is one.
+def dict_keys(source, name):
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+    # Returning nothing rather than raising keeps the failure a named check: the population
+    # guard below reports it. A gate that dies on the way to reporting leaves the cause unsaid.
+    return []
+
+
+router_src = read(os.path.join("laya", "router.py"))
+canonical = dict_keys(router_src, "DEFAULT_MODELS")
+aliases = dict_keys(router_src, "_ALIASES")
+accepted = sorted(set(canonical) | set(aliases))
+# Non-vacuity: the derivation has to have found both tables, or every comparison against
+# `accepted` below would pass by matching an empty set.
+check_true("nix/core name tables are both populated",
+           len(canonical) >= 1 and len(aliases) >= 1,
+           "DEFAULT_MODELS=%r _ALIASES=%r -- laya/router.py changed shape" % (canonical, aliases))
+check("nix/models default is exactly core's canonical checkpoints",
+      sorted(n.strip('"') for n in
+             re.findall(r'default = \[([^\]]*)\]', block, re.S)[0].split())
+      if re.search(r"default = \[", block) else None,
+      sorted(canonical))
+
+# Whatever the module tells its reader to type must be what core accepts, and the module runs no
+# validator of its own -- so a name added to _ALIASES has to appear here or the option's own
+# description goes stale on the day the alias lands.
+description = re.search(r"description = ''(.*?)''", block, re.S)
+check_true("nix/models has a description", description is not None, block[:200])
+described = description.group(1) if description else ""
+undocumented = [n for n in accepted if "`%s`" % n not in described]
+check_true("nix/models describes every name core accepts", not undocumented,
+           "accepted by laya.router.normalise_name but absent from the option text: %s"
+           % undocumented)
+# And the module must still be the thing that sets LAYA_MODELS, or the checks above describe a
+# wire that no longer exists.
+check_true("nix/module still joins models into LAYA_MODELS",
+           re.search(r'LAYA_MODELS = lib\.concatStringsSep "," cfg\.models;', nix_module) is not None,
+           "the models option no longer feeds LAYA_MODELS; these checks need retargeting")
 
 # --------------------------------------------------------------- declared extras
 # The runtime error in laya/structured.py tells users to install `laya[structured]`, and the

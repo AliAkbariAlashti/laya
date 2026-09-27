@@ -52,12 +52,21 @@ in
     };
 
     models = lib.mkOption {
-      type = lib.types.listOf (lib.types.enum [ "english" "multilingual" "typed-decisions" ]);
+      type = lib.types.listOf lib.types.str;
       default = [ "english" "multilingual" "typed-decisions" ];
       description = ''
         Checkpoints to preload at startup. All three fit comfortably in a 24 GB
         card (~1.16B params total), so the default keeps every one hot and makes
         language routing free.
+
+        The names are validated by laya rather than by this module: the list is
+        joined into `LAYA_MODELS`, and the server normalises every entry with
+        `laya.router.normalise_name`, which accepts `english`, `multilingual` and
+        `typed-decisions` plus the aliases `en`, `laya`, `default`, `multi`, `ml`,
+        `laya-multilingual`, `typed`, `typed_decisions`, `laya-typed-decisions` and
+        `decisions`. An unknown name stops the service at startup with an error
+        listing all of them. An `enum` here could only copy that list and fall
+        behind it, refusing a spelling the server accepts.
       '';
     };
 
