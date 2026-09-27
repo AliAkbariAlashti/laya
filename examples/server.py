@@ -193,7 +193,10 @@ def _router() -> Router:
 
 
 def _predict(state: Any, questions: Dict[str, Any], **kw: Any) -> Dict[str, Any]:
-    """The one place that calls Router.predict.
+    """The one place that calls Router.predict for a single state.
+
+    `/predict/batch` goes straight to `Router.predict_batch` instead, so a batch shares forward
+    passes; it reaches `_predict` only as the per-state fallback when the batch call fails.
 
     No lock needed here: Router's own model lifecycle (load/evict/LRU) is thread-safe as of
     laya 0.3.5 (fixes #95), and inference is deliberately left outside Router's internal lock
@@ -284,14 +287,26 @@ def predict_batch(req: BatchRequest) -> Dict[str, Any]:
     for state in req.states:
         _check_request_limits(state, req.questions)
     questions = _questions(req.questions)
-    results: List[Dict[str, Any]] = []
-    for i, state in enumerate(req.states):
-        try:
-            results.append(
-                _predict(state, questions, model=req.model, task=req.task, lang=req.lang)
-            )
-        except Exception as exc:
-            results.append({"index": i, "error": f"{type(exc).__name__}: {exc}"})
+    # Only the controls that were actually set: `route_batch` reads them with `.get`, so an
+    # omitted key and an explicit null mean the same thing, and the request dicts stay minimal.
+    controls = {key: value for key, value in (("model", req.model), ("task", req.task),
+                                              ("lang", req.lang)) if value is not None}
+    requests = [{"state": state, "questions": questions, **controls} for state in req.states]
+    try:
+        # One call, not one per state: `Router.predict_batch` routes the whole batch, groups it by
+        # checkpoint and shares a forward pass across states that carry the same question schema --
+        # which is exactly this endpoint, since `BatchRequest` holds one `questions` map.
+        results: List[Dict[str, Any]] = list(_router().predict_batch(requests))
+    except Exception:
+        # The batch fails as a unit, so a single bad state would otherwise cost every other state
+        # its answer. Fall back to the per-state path to keep the documented envelope: N results,
+        # with `{"index": i, "error": ...}` only where a state genuinely failed.
+        results = []
+        for i, state in enumerate(req.states):
+            try:
+                results.append(_predict(state, questions, **controls))
+            except Exception as item_exc:
+                results.append({"index": i, "error": f"{type(item_exc).__name__}: {item_exc}"})
     return {"count": len(results), "results": results}
 
 
