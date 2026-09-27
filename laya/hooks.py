@@ -46,7 +46,12 @@ class PredictContext:
     error: Optional[BaseException] = None
 
     def skip(self, results: List[Dict[str, Any]]) -> None:
-        """Set cached results from a start hook; inference is skipped, end hooks still run."""
+        """Set cached results from a start hook; inference is skipped, end hooks still run.
+
+        `results` replaces the whole call, so it carries one entry per state in `ctx.states` --
+        the shape `predict_batch` returns -- in that order. A hook fires once per call, and a
+        call can carry many states.
+        """
         self.results = results
 
 

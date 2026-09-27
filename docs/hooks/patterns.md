@@ -88,23 +88,29 @@ import hashlib, json
 
 CACHE = {}
 
-def key(state, questions):
-    return hashlib.sha256(json.dumps([state, questions], sort_keys=True, default=str).encode()).hexdigest()
+def key(ctx, index):
+    # Not sort_keys=True: criteria order is positional, so two orders are two questions,
+    # and the checkpoint and token budget change the answer too.
+    payload = json.dumps([ctx.states[index], ctx.questions, ctx.model,
+                          ctx.max_len, ctx.head_max_len], default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
 
 def read(ctx):
-    hit = CACHE.get(key(ctx.states[0], ctx.questions))
-    if hit is not None:
-        ctx.skip([hit])
+    hits = [CACHE.get(key(ctx, i)) for i in range(len(ctx.states))]
+    if all(hit is not None for hit in hits):
+        ctx.skip(hits)   # one per state: skip replaces the whole call
 
 def write(ctx):
-    if ctx.results:
-        CACHE[key(ctx.states[0], ctx.questions)] = ctx.results[0]
+    for i, result in enumerate(ctx.results or []):
+        CACHE[key(ctx, i)] = result
 
 laya.load("convaiinnovations/laya", on_predict_start=read, on_predict_end=write)
 ```
 
-Guard the cache with a lock when serving concurrently. On the Router the cached payload still
-gets a `routing` key, so the return shape is unchanged.
+Hooks fire once per call, so keying on one state is not enough on `predict_batch`: `ctx.skip()`
+replaces every result the call would have returned. Guard the cache with a lock when serving
+concurrently. On the Router the cached payload still gets a `routing` key, so the return shape is
+unchanged.
 
 The same pair works on a single [LangChain](../langchain.md) node via its `hooks=` argument, which
 is the way to cache one hot step in a graph without changing what every other caller of that agent

@@ -95,18 +95,21 @@ import laya
 
 CACHE = {}
 
-def key(state, questions):
-    payload = json.dumps([state, questions], sort_keys=True, default=str)
+def key(ctx, index):
+    # Not sort_keys=True: criteria order is positional, so two orders are two questions,
+    # and the checkpoint and token budget change the answer too.
+    payload = json.dumps([ctx.states[index], ctx.questions, ctx.model,
+                          ctx.max_len, ctx.head_max_len], default=str)
     return hashlib.sha256(payload.encode()).hexdigest()
 
 def read(ctx):
-    hit = CACHE.get(key(ctx.states[0], ctx.questions))
-    if hit is not None:
-        ctx.skip([hit])
+    hits = [CACHE.get(key(ctx, i)) for i in range(len(ctx.states))]
+    if all(hit is not None for hit in hits):
+        ctx.skip(hits)   # one per state: skip replaces the whole call
 
 def write(ctx):
-    if ctx.results:
-        CACHE[key(ctx.states[0], ctx.questions)] = ctx.results[0]
+    for i, result in enumerate(ctx.results or []):
+        CACHE[key(ctx, i)] = result
 
 agent = laya.load("convaiinnovations/laya", on_predict_start=read, on_predict_end=write)
 first = agent.system_one("state", QUESTIONS)    # runs the model
