@@ -9,10 +9,12 @@ the key matched, so what a key covers is part of the contract, not an implementa
 
 Run: python tests/test_hooks_api.py
 """
+import contextlib
 import dataclasses
 import functools
 import hashlib
 import inspect
+import io
 import json
 import os
 import sys
@@ -166,8 +168,9 @@ for label, cls in (("Agent", Agent), ("Router", Router), ("ONNXAgent", ONNXAgent
 
 
 # ------------------------------------------------- the cache key the examples and docs teach
-# `examples/hooks/cache.py`, and the caching blocks of `docs/hooks/patterns.md` and
-# `docs/hooks/examples.md`, are three copies of one `ctx.skip()` pattern. The key is the part that
+# `examples/hooks/cache.py`, and the caching blocks of `docs/hooks/patterns.md`,
+# `docs/hooks/examples.md` and `docs/hooks/api.md`, are four copies of one `ctx.skip()` pattern.
+# The key is the part that
 # can be wrong: a payload sorted by key folds two criteria orders into one cache entry, while
 # `_question_schema` keeps them apart because a choice question's option order is positional. The
 # second caller then gets the first caller's answer. Measured on the English checkpoint, a question
@@ -191,13 +194,14 @@ def taught_cache(path):
 
     Sliced rather than imported: the example calls `laya.load()` at module scope, which would
     download a checkpoint, and a docs code block is not importable at all. The slice stops at that
-    `laya.load(...)` line for the same reason, so none of this needs weights.
+    `laya.load(...)` line, or at the closing fence of the block, for the same reason, so none of
+    this needs weights.
     """
     with open(os.path.join(REPO, path), encoding="utf-8") as handle:
         text = handle.read()
     start = text.index("CACHE = {")
     stop = len(text)
-    for cut in ("\nlaya.load", "\nagent = laya.load"):
+    for cut in ("\nlaya.load", "\nagent = laya.load", "\n```"):
         found = text.find(cut, start)
         if found != -1:
             stop = min(stop, found)
@@ -226,7 +230,10 @@ def answers_for(states):
 
 TAUGHT = [("examples/hooks/cache.py", taught_cache("examples/hooks/cache.py")),
           ("docs/hooks/patterns.md", taught_cache("docs/hooks/patterns.md")),
-          ("docs/hooks/examples.md", taught_cache("docs/hooks/examples.md"))]
+          ("docs/hooks/examples.md", taught_cache("docs/hooks/examples.md")),
+          # `api.md` is the page that documents `ctx.skip()`, so it is the page a reader copies
+          # from -- and it carries the same key, which makes it the copy most able to go stale.
+          ("docs/hooks/api.md", taught_cache("docs/hooks/api.md"))]
 
 for path, namespace in TAUGHT:
     key = functools.partial(key_of, namespace)
@@ -283,6 +290,67 @@ for path, namespace in TAUGHT[1:]:
     check("%s/per-state like the example" % path,
           key_of(namespace, cache_ctx(Q_ORDER_A, states=BATCH), 1),
           key_of(TAUGHT[0][1], cache_ctx(Q_ORDER_A, states=BATCH), 1))
+
+
+# ------------------------------------------- what the cache example's own demo claims
+# The example closes by saying its two-state batch "is served", and nothing in its printed output
+# distinguishes a served payload from a fresh one -- both are the same answers. So run the demo
+# against a stub agent that counts its own forward passes, and check the claim rather than trusting
+# the comment. No weights: `laya.load` is the only thing the example takes from the library.
+def run_cache_example():
+    with open(os.path.join(REPO, "examples/hooks/cache.py"), encoding="utf-8") as handle:
+        source = handle.read().replace("\nimport laya\n", "\n")
+    forwards = []
+
+    class StubAgent:
+        def __init__(self, on_start, on_end):
+            self.on_start, self.on_end = on_start, on_end
+
+        def _call(self, states, questions):
+            ctx = PredictContext(states=list(states), questions=questions, model="english")
+            if self.on_start:
+                self.on_start(ctx)
+            if ctx.results is None:
+                forwards.append(len(states))
+                ctx.results = [{"model": "laya-rl-agent",
+                                "answers": {"ask": {"type": "choice", "choice": s[:8]}}}
+                               for s in states]
+                ctx.usage = {"input_tokens": 10 * len(states), "output_tokens": 0}
+            if self.on_end:
+                self.on_end(ctx)
+            return ctx.results
+
+        def system_one(self, state, questions, model=None):
+            return self._call([state], questions)[0]
+
+        def predict_batch(self, states, questions, model=None, batch_size=None):
+            return self._call(states, questions)
+
+    class StubLaya:
+        @staticmethod
+        def load(name, on_predict_start=None, on_predict_end=None):
+            return StubAgent(on_predict_start, on_predict_end)
+
+    out = io.StringIO()
+    namespace = {"laya": StubLaya}
+    with contextlib.redirect_stdout(out):
+        exec(compile(source, "examples/hooks/cache.py", "exec"), namespace)
+    return namespace, forwards, out.getvalue()
+
+
+example, example_forwards, example_out = run_cache_example()
+# Why the exact list: the repeat of STATE and the warm batch are the two served calls, and the
+# batch is the only multi-state one. A demo that mixed a cold state into the batch would show
+# `[1]` here, which is the claim its comment does not make.
+check("examples/hooks/cache.py/the repeat and the batch are the served calls",
+      example["SKIPS"], [1, 2])
+check("examples/hooks/cache.py/one forward per new entry, none for the batch",
+      example_forwards, [1, 1, 1])
+check_true("examples/hooks/cache.py/its own output still says two entries",
+           "cache entries: 2" in example_out, example_out)
+check("examples/hooks/cache.py/the batch answers in the caller's order",
+      [r["answers"]["ask"]["choice"] for r in example["served"]],
+      [example["OTHER"][:8], example["STATE"][:8]])
 
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))

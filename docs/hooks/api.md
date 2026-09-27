@@ -64,12 +64,34 @@ class PredictContext:
 Short-circuits inference. Called from `on_predict_start`, it sets `ctx.results` so the forward
 pass is skipped; `on_predict_end` still runs and the supplied results are returned.
 
+The key has to cover everything the answer depends on, and the hook has to cover everything the
+call carries: hooks fire once per call, and `predict_batch` calls them with every state at once.
+
 ```python
+CACHE = {}
+
+def key(ctx, index):
+    # Not sort_keys=True: criteria order is positional, so two orders are two questions,
+    # and the checkpoint and token budget change the answer too.
+    payload = json.dumps([ctx.states[index], ctx.questions, ctx.model,
+                          ctx.max_len, ctx.head_max_len], default=str)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
 def cache_read(ctx):
-    hits = [CACHE.get(key(s, ctx.questions)) for s in ctx.states]
+    hits = [CACHE.get(key(ctx, i)) for i in range(len(ctx.states))]
     if all(hit is not None for hit in hits):
-        ctx.skip(hits)   # one entry per state in ctx.states, same shape as predict_batch's return
+        ctx.skip(hits)   # one entry per state, same shape as predict_batch's return
+
+def cache_write(ctx):
+    for i, result in enumerate(ctx.results or []):
+        CACHE[key(ctx, i)] = result
+
+laya.load("convaiinnovations/laya", on_predict_start=cache_read, on_predict_end=cache_write)
 ```
+
+`tests/test_hooks_api.py` execs this block, `examples/hooks/cache.py`, and the caching blocks of
+`docs/hooks/patterns.md` and `docs/hooks/examples.md`, and asserts all four keys the same way, so a
+page cannot teach a key the example has moved on from.
 
 On the `Router`, a skipped payload gets a `routing` key added (without overwriting one it
 already has), so `Router.predict` keeps its documented return shape.

@@ -13,6 +13,7 @@ import json
 import laya
 
 CACHE = {}
+SKIPS = []            # one entry per call `cache_read` served, so the prints below are checkable
 
 
 def cache_key(ctx, index):
@@ -32,6 +33,7 @@ def cache_key(ctx, index):
 def cache_read(ctx):
     hits = [CACHE.get(cache_key(ctx, i)) for i in range(len(ctx.states))]
     if all(hit is not None for hit in hits):
+        SKIPS.append(len(hits))
         ctx.skip(hits)   # one per state: `skip` replaces the whole call, not its first result
 
 
@@ -60,8 +62,12 @@ agent.system_one(STATE, REORDERED)             # runs too: a reordered question 
 print("cache entries:", len(CACHE))            # 2, not 1
 print("same answer:", first["answers"] == again["answers"])
 
+# Warm the second state before the batch. `cache_read` skips only when *every* state of the call
+# has an entry, so a batch that mixes one warm state with one cold state runs a full forward.
+agent.system_one(OTHER, QUESTIONS)
 # Batched, in the other order: both states are cached, so the whole call is served.
 served = agent.predict_batch([OTHER, STATE], QUESTIONS)
 print("results for a 2-state batch:", len(served))
 print("one answer per state, in the caller's order:",
       [r["answers"]["ask"]["choice"] for r in served])
+print("calls served without a forward pass:", len(SKIPS))    # 2: `again`, and this batch
