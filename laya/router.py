@@ -174,6 +174,47 @@ def _english_from_code(value: Any) -> Optional[bool]:
     return primary in _ENGLISH_SUBTAGS
 
 
+def _digests_from_env(models: Dict[str, Any]) -> Dict[str, Optional[Dict[str, str]]]:
+    """Turn `LAYA_SHA256_DIGESTS` into per-checkpoint digest maps when it names models.
+
+    The variable has two shapes, and the value types say which. A flat
+    `{artifact: digest}` map is `laya.revisions.verify_digests`'s own reading -- the same
+    files checked on every checkpoint the process loads -- and is returned as `{}` here so
+    that path stays untouched. A nested `{model: {artifact: digest}}` map pins each
+    checkpoint with its own files, which is what a server holding several resident needs:
+    the bundled repository ships a separate `model.safetensors` per checkpoint, so one flat
+    map can only ever match one of them and refuses the rest at startup.
+
+    A checkpoint the nested map does not name is returned as `{}`, meaning deliberately
+    unpinned: `Agent` falls back to the environment when given `None`, and reading a
+    model-keyed map as an artifact map fails with `cannot verify 'english': no such file`.
+    Keys are normalised exactly as `Router(sha256_digests=...)` normalises them, so `en`
+    names `english` and a name core does not know raises here rather than quietly leaving
+    that checkpoint unverified. Unset, empty or unparseable input returns `{}`:
+    `laya.revisions` reports a malformed value in its own words.
+    """
+    raw = os.environ.get("LAYA_SHA256_DIGESTS", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return {}
+    if not isinstance(data, dict) or not data:
+        return {}
+    values = list(data.values())
+    if all(isinstance(v, str) for v in values):
+        return {}                                     # flat: laya.revisions already applies it
+    if not all(isinstance(v, dict) for v in values):
+        raise ValueError("LAYA_SHA256_DIGESTS must be either {artifact: digest} for every "
+                         "checkpoint or {model: {artifact: digest}} per checkpoint; %s mixes "
+                         "the two or holds a value that is neither" % sorted(data))
+    per_model = {normalise_name(k): v for k, v in data.items()}
+    for name in models:
+        per_model.setdefault(normalise_name(name), {})
+    return per_model
+
+
 class Router(HookRegistry):
     """Lazily loads Laya checkpoints and sends each request to the right one.
 
@@ -207,14 +248,21 @@ class Router(HookRegistry):
     which is useful when standalone repositories were reviewed at different commits.
     Without either, huggingface_hub's normal default and existing offline cache are used.
 
-    Artifact digests are opt-in and only ever per model: `sha256_digests={"english": {...}}`
+    Artifact digests are opt-in and always per model: `sha256_digests={"english": {...}}`
     passes that `{path relative to the checkpoint dir: hexdigest}` map to the `Agent` that
     loads it, so a tampered or substituted weight file is refused before it is parsed. There
     is no Router-wide equivalent of `revision` because digests, unlike a commit SHA, are not
     shareable: the bundled repository ships a separate `model.safetensors` for each of
     `english`, `multilingual` and `typed-decisions`, so one flat map can only ever match one
-    of them. A model listed with `None` or `{}` is loaded unverified, which also masks the
-    `LAYA_SHA256_DIGESTS` environment default for that one checkpoint.
+    of them. A model listed with `None` or `{}` is loaded unverified.
+
+    The same split is available to a process configured only by environment: when
+    `LAYA_SHA256_DIGESTS` holds a model-keyed map (`{"english": {...}, "multilingual": {...}}`)
+    this seeds it per checkpoint, so a server that keeps several resident can pin each with its
+    own digests instead of refusing to start on the second one. A flat `LAYA_SHA256_DIGESTS`
+    keeps its existing meaning, applied by `laya.revisions` to every checkpoint the process
+    loads, which is right for a single-checkpoint one. An argument entry wins over the
+    environment for the model it names.
 
     Hooks are opt-in and run at the Router level: `on_route` sees the routing decision,
     `on_load` / `on_evict` see model lifecycle, and `on_predict_start` / `on_predict_end`
@@ -267,11 +315,14 @@ class Router(HookRegistry):
         self.revisions: Dict[str, Optional[str]] = {
             normalise_name(k): v for k, v in (revisions or {}).items()
         }
-        # Per checkpoint SHA-256 map. Keyed and normalised exactly like `revisions`, so a
-        # misspelled model name fails here rather than leaving that checkpoint unverified.
-        self.sha256_digests: Dict[str, Optional[Dict[str, str]]] = {
+        # Per checkpoint SHA-256 map: seeded from a model-named `LAYA_SHA256_DIGESTS`, then
+        # overridden checkpoint by checkpoint by the argument. Keyed and normalised exactly like
+        # `revisions`, so a misspelled model name fails here rather than leaving that checkpoint
+        # unverified.
+        self.sha256_digests: Dict[str, Optional[Dict[str, str]]] = _digests_from_env(self.models)
+        self.sha256_digests.update({
             normalise_name(k): v for k, v in (sha256_digests or {}).items()
-        }
+        })
         self.max_loaded = max(1, int(max_loaded))
         self.default = normalise_name(default)
         self.auto_task_detection = bool(auto_task_detection)

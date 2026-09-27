@@ -293,6 +293,119 @@ class RouterDigestEndToEndTests(unittest.TestCase):
         with patch.dict(os.environ, env):
             self._assert_past_the_digest_gate(router, "multilingual")
 
+    def test_nested_environment_pins_both_checkpoints(self):
+        """The shape a server with two resident checkpoints has to write.
+
+        Before this, `LAYA_SHA256_DIGESTS` was read only by `laya.revisions`, which treats every
+        key as a path -- so a model-named map failed with `cannot verify 'english': no such file`
+        on the *first* checkpoint and the flat map refused the second one.
+        """
+        with self._env({"english": {"model.safetensors": self.digests["english"]},
+                        "multilingual": {"model.safetensors": self.digests["multilingual"]}}):
+            router = self._router({})
+            self._assert_past_the_digest_gate(router, "english")
+            self._assert_past_the_digest_gate(router, "multilingual")
+
+    def test_nested_environment_fails_only_the_checkpoint_it_calls_out(self):
+        with self._env({"english": {"model.safetensors": self.digests["english"]},
+                        "multilingual": {"model.safetensors": "0" * 64}}):
+            router = self._router({})
+            self._assert_past_the_digest_gate(router, "english")
+            with self.assertRaises(ValueError) as cm:
+                router.load("multilingual")
+            self.assertIn("SHA-256 mismatch", str(cm.exception))
+
+    def test_nested_environment_leaves_an_unnamed_checkpoint_unpinned(self):
+        # `multilingual` is a resident model that the map does not name. It has to be loaded
+        # unverified, not handed the model-named map as if "english" were one of its files.
+        with self._env({"english": {"model.safetensors": self.digests["english"]}}):
+            router = self._router({})
+            self._assert_past_the_digest_gate(router, "english")
+            self._assert_past_the_digest_gate(router, "multilingual")
+
+    def _env(self, per_model):
+        return patch.dict(os.environ, {"LAYA_SHA256_DIGESTS": json.dumps(per_model)})
+
+
+class RouterEnvDigestTests(unittest.TestCase):
+    """How `Router` reads the two shapes of `LAYA_SHA256_DIGESTS`.
+
+    `serve.build_router()` builds its Router from the environment and nothing else, so the
+    environment is the only channel a container, a compose stack or a `services.laya-serve`
+    host has. These pin down which shape `Router` takes over and which it leaves to
+    `laya.revisions`, without weights: the `Agent` builds are captured, not run.
+    """
+
+    ENGLISH = {"model.safetensors": "a" * 64}
+    MULTI = {"model.safetensors": "b" * 64}
+
+    def _capture(self):
+        import laya.agent
+
+        captured: list = []
+
+        class FakeAgent:
+            def __init__(self, repo, **kwargs):
+                captured.append(kwargs)
+
+        return patch.object(laya.agent, "Agent", FakeAgent), captured
+
+    def _env(self, value):
+        return patch.dict(os.environ, {"LAYA_SHA256_DIGESTS": value})
+
+    def test_flat_map_is_left_to_revisions(self):
+        with self._env(json.dumps({"model.safetensors": "a" * 64})):
+            router = Router()
+            self.assertEqual(router.sha256_digests, {})
+            capture, captured = self._capture()
+            with capture:
+                router.load("english")
+        self.assertNotIn("expected_sha256", captured[0])
+
+    def test_nested_map_is_split_per_checkpoint(self):
+        with self._env(json.dumps({"english": self.ENGLISH, "multilingual": self.MULTI})):
+            capture, captured = self._capture()
+            with capture:
+                router = Router()
+                self.assertEqual(sorted(router.sha256_digests),
+                                 ["english", "multilingual", "typed-decisions"])
+                for name in ("english", "multilingual", "typed-decisions"):
+                    router.load(name)
+        self.assertEqual(captured[0]["expected_sha256"], self.ENGLISH)
+        self.assertEqual(captured[1]["expected_sha256"], self.MULTI)
+        # Named by neither the map nor the caller: explicitly unpinned, so `Agent` does not
+        # fall back to an environment value keyed by model names.
+        self.assertEqual(captured[2]["expected_sha256"], {})
+
+    def test_nested_map_keys_are_normalised(self):
+        with self._env(json.dumps({"en": self.ENGLISH})):
+            self.assertEqual(Router().sha256_digests["english"], self.ENGLISH)
+
+    def test_argument_wins_for_the_checkpoint_it_names(self):
+        with self._env(json.dumps({"english": self.ENGLISH, "multilingual": self.MULTI})):
+            router = Router(sha256_digests={"english": {"model.safetensors": "c" * 64}})
+            self.assertEqual(router.sha256_digests["english"], {"model.safetensors": "c" * 64})
+            self.assertEqual(router.sha256_digests["multilingual"], self.MULTI)
+
+    def test_misspelled_key_in_the_environment_fails_at_construction(self):
+        with self._env(json.dumps({"engligh": self.ENGLISH})):
+            with self.assertRaises(ValueError):
+                Router()
+
+    def test_mixed_artifact_and_model_keys_fail_rather_than_guess(self):
+        env = json.dumps({"model.safetensors": "a" * 64, "english": self.ENGLISH})
+        with self._env(env):
+            with self.assertRaises(ValueError) as cm:
+                Router()
+        self.assertIn("LAYA_SHA256_DIGESTS", str(cm.exception))
+
+    def test_unparseable_environment_is_not_this_layers_error(self):
+        # `laya.revisions.verify_digests` owns the message a malformed value gets; a Router
+        # that repeated it would be a second copy of a rule it does not enforce.
+        for value in ("", "   ", "{not json", "[]", '"digests"', "{}"):
+            with self._env(value):
+                self.assertEqual(Router().sha256_digests, {}, value)
+
 
 if __name__ == "__main__":
     unittest.main()
