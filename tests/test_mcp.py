@@ -88,7 +88,7 @@ def test_device():
             os.environ.pop("LAYA_DEVICE", None)
         else:
             os.environ["LAYA_DEVICE"] = old
-    ok("device/fallback", resolve_device(None) in ("cuda", "cpu"))
+    ok("device/fallback", resolve_device(None) in ("cuda", "mps", "xpu", "cpu"))
     # laya.serve contract: LAYA_DEVICE goes verbatim to torch; the label is lowercased.
     old_dev = os.environ.get("LAYA_DEVICE")
     try:
@@ -105,6 +105,78 @@ def test_device():
     rep = device_report()
     ok("device/report_keys", set(rep) >= {"device", "torch_cuda", "torch_version"})
     ok("device/report_cuda_bool", isinstance(rep["torch_cuda"], bool))
+
+    # The auto-detect branch is a second implementation of Agent's own chain
+    # (laya/agent.py:355-362), so it has to be exercised on devices the runner does not have.
+    # `resolve_device` imports torch inside its body, which makes the module the seam: a fake
+    # here forces every branch without CUDA, MPS or XPU hardware. Before this block the only
+    # auto-detect assertion was the domain check above, and it passed on a narrower chain.
+    def fake_torch(cuda=False, mps=False, xpu=False, mps_attr=True, xpu_attr=True):
+        from types import SimpleNamespace
+
+        mod = SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: cuda))
+        backends = {}
+        if mps_attr:
+            backends["mps"] = SimpleNamespace(is_available=lambda: mps)
+        mod.backends = SimpleNamespace(**backends)
+        if xpu_attr:
+            mod.xpu = SimpleNamespace(is_available=lambda: xpu)
+        return mod
+
+    def labelled_with(fake):
+        real = sys.modules.get("torch")
+        sys.modules["torch"] = fake
+        try:
+            return resolve_device()
+        finally:
+            if real is None:
+                del sys.modules["torch"]
+            else:
+                sys.modules["torch"] = real
+
+    old_env = os.environ.pop("LAYA_DEVICE", None)
+    try:
+        ok("device/auto_cuda_beats_mps",
+           labelled_with(fake_torch(cuda=True, mps=True)) == "cuda")
+        # The regression: an Apple-silicon machine has MPS and no CUDA, and Agent builds on MPS.
+        ok("device/auto_mps_without_cuda",
+           labelled_with(fake_torch(mps=True, xpu=True)) == "mps")
+        ok("device/auto_xpu_after_mps",
+           labelled_with(fake_torch(xpu=True)) == "xpu")
+        # The `hasattr` guards are load-bearing: without one, an absent `torch.backends.mps`
+        # raises inside the try block and the `except Exception` swallows it into `cpu`, so an
+        # XPU machine is labelled cpu. Asking for the branch that survives the missing
+        # attribute is the only way to see that happen.
+        ok("device/auto_xpu_when_mps_attribute_missing",
+           labelled_with(fake_torch(xpu=True, mps_attr=False)) == "xpu")
+        ok("device/auto_nothing_is_cpu", labelled_with(fake_torch()) == "cpu")
+        # torch.backends.mps and torch.xpu appeared in different torch versions; an older one
+        # must still label cpu rather than raising out of a status call.
+        ok("device/auto_old_torch_no_attributes",
+           labelled_with(fake_torch(mps_attr=False, xpu_attr=False)) == "cpu")
+        # laya_status reads the label through device_report, so the payload has to move with it.
+        real = sys.modules.get("torch")
+        sys.modules["torch"] = fake_torch(mps=True)
+        try:
+            ok("device/report_follows_mps", device_report()["device"] == "mps")
+        finally:
+            if real is None:
+                del sys.modules["torch"]
+            else:
+                sys.modules["torch"] = real
+        # And on the machine running this suite, the label must be the device Agent would pick.
+        import torch
+
+        available = ("cuda" if torch.cuda.is_available() else
+                     "mps" if (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()) else
+                     "xpu" if (hasattr(torch, "xpu") and torch.xpu.is_available()) else "cpu")
+        ok("device/host_matches_torch", resolve_device() == available,
+           "label=%r torch=%r (cuda=%s mps=%s)" % (
+               resolve_device(), available, torch.cuda.is_available(),
+               hasattr(torch.backends, "mps") and torch.backends.mps.is_available()))
+    finally:
+        if old_env is not None:
+            os.environ["LAYA_DEVICE"] = old_env
 
 
 # --- schema -----------------------------------------------------------------
