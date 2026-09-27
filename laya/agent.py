@@ -256,7 +256,12 @@ def _with_start_probe(hook_kwargs, probe):
 
 
 class Agent(HookRegistry):
-    """System 1 decision model runtime: fast, non-autoregressive, calibrated decisions."""
+    """System 1 decision model runtime: fast, non-autoregressive, calibrated decisions.
+
+    `dtype` is the autocast target, not the precision of every call. On MPS a call
+    autocasts only at or above `mps_amp_min_rows` rows, so `dtype` can say float16 while
+    a call runs in float32. `dtype_for(rows)` returns the precision of a call with `rows` rows.
+    """
 
     # Hooks are opt-in. `hooks`/`_hooks_mutex` defaults come from HookRegistry; the rest keep a
     # hand-built instance (`Agent.__new__` in tests) working and make an unset hook a no-op.
@@ -793,6 +798,16 @@ class Agent(HookRegistry):
         if self.device.type == "mps" and rows < self.mps_amp_min_rows:
             return False
         return True
+
+    def dtype_for(self, rows: int) -> torch.dtype:
+        """Precision that a forward pass with `rows` question rows runs in.
+
+        `dtype` is the autocast target, set once at load time. Whether a forward autocasts is
+        decided per call: on MPS only at or above `mps_amp_min_rows` rows. This returns `dtype`
+        when a forward with `rows` rows autocasts, and `torch.float32` when it does not. A
+        `predict` call runs one row per question.
+        """
+        return self.dtype if self._amp_enabled_for(rows) else torch.float32
 
     def _infer(self, b: Dict):
         """Run the forward pass under autocast, degrading gracefully on OOM or unsupported autocast."""
