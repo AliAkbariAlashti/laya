@@ -7,7 +7,7 @@ Skips cleanly (exit 0) when the mcp package is not installed, so the core
 install keeps working.
 
 Device and preload-list tests follow the laya.serve environment contract
-(LAYA_DEVICE / LAYA_PRELOAD / LAYA_MODELS / LAYA_THREADS).
+(LAYA_DEVICE / LAYA_PRELOAD / LAYA_MODELS / LAYA_THREADS / LAYA_AUTO_TASK).
 """
 import asyncio
 import os
@@ -540,6 +540,71 @@ def test_models_from_env():
             os.environ["LAYA_MODELS"] = old
 
 
+def test_auto_task_env():
+    """LAYA_AUTO_TASK must reach the Router the MCP server builds, as it does the serve one.
+
+    README's MCP section says these variables follow the contract at the top of laya.serve, so the
+    check is built through both surfaces' real builders -- `laya.mcp.server._ensure_router()` and
+    `laya.serve.build_router()` -- rather than by reading a flag off a hand-made Router.
+    `Router.route()` decides without loading anything, so no checkpoint is downloaded here.
+    """
+    import laya.mcp.server as mcp_mod  # the module, not the MCPServer instance
+    from laya.router import _TYPED_DECISION_WORKFLOWS
+    from laya.serve import build_router
+
+    state = {"body": "I was charged twice, please refund the duplicate"}
+    schemas = {name: {qid: {"type": "choice", "options": ["yes", "no"]}
+                      for qid in sorted(ids)}
+               for name, ids in sorted(_TYPED_DECISION_WORKFLOWS.items())}
+    saved = {k: os.environ.get(k) for k in ("LAYA_AUTO_TASK", "LAYA_PRELOAD")}
+    saved_router = mcp_mod._ROUTER
+    try:
+        os.environ["LAYA_PRELOAD"] = "0"  # neither surface may build a checkpoint here
+
+        def build(value):
+            if value is None:
+                os.environ.pop("LAYA_AUTO_TASK", None)
+            else:
+                os.environ["LAYA_AUTO_TASK"] = value
+            mcp_mod._ROUTER = None  # the server caches the Router it built
+            return mcp_mod._ensure_router(), build_router()
+
+        for value, label in ((None, "unset"), ("0", "off"), ("1", "on"), ("true", "true")):
+            mcp_router, serve_router = build(value)
+            want = value in ("1", "true")
+            ok("auto_task/%s_mcp" % label, mcp_router.auto_task_detection is want,
+               repr(mcp_router.auto_task_detection))
+            # The parity the README claims: one variable, one meaning on both surfaces.
+            ok("auto_task/%s_matches_serve" % label,
+               mcp_router.auto_task_detection == serve_router.auto_task_detection,
+               "mcp=%r serve=%r" % (mcp_router.auto_task_detection,
+                                    serve_router.auto_task_detection))
+
+        # And the decision each workflow actually gets, on every workflow rather than one.
+        on_mcp, on_serve = build("1")
+        off_mcp, off_serve = build(None)
+        for name, questions in sorted(schemas.items()):
+            on_got = on_mcp.route(state, questions)["model"]
+            off_got = off_mcp.route(state, questions)["model"]
+            on_serve_got = on_serve.route(state, questions)["model"]
+            off_serve_got = off_serve.route(state, questions)["model"]
+            ok("auto_task/on_routes_typed_decisions_%s" % name, on_got == "typed-decisions",
+               "got %r" % on_got)
+            ok("auto_task/on_parity_%s" % name, on_got == on_serve_got,
+               "mcp=%r serve=%r" % (on_got, on_serve_got))
+            ok("auto_task/off_parity_%s" % name, off_got == off_serve_got,
+               "mcp=%r serve=%r" % (off_got, off_serve_got))
+            ok("auto_task/off_not_typed_%s" % name, off_got != "typed-decisions",
+               "got %r" % off_got)
+    finally:
+        mcp_mod._ROUTER = saved_router
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_server_registration():
     tools = asyncio.run(mcp_server.list_tools())
     names = sorted(t.name for t in tools)
@@ -565,6 +630,7 @@ test_question_forwarding()
 test_shortlist()
 test_timeout_removed()
 test_models_from_env()
+test_auto_task_env()
 test_server_registration()
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
