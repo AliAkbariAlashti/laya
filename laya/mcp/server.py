@@ -336,7 +336,8 @@ def laya_shortlist_tool(
     """Shortlist many-option choice questions, then answer."""
     # k's default mirrors laya.shortlist.DEFAULT_SHORTLIST_K; it is a literal
     # here so the MCP schema carries the default without importing numpy at
-    # server start.
+    # server start. tests/test_mcp.py reads it out of the runtime and fails if
+    # this drifts from it.
     router = _router_or_error()
     return _wrap(
         laya_shortlist,
