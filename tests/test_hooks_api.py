@@ -83,6 +83,10 @@ check_param("Router.__init__", Router.__init__, "agent_kwargs", None)
 # ...and the per-checkpoint digests that `revisions` has always had a sibling need for
 check_param("Router.__init__", Router.__init__, "sha256_digests", None)
 
+# load() forwards Agent's own construction options, so none of them is reachable only
+# through the class; tests/test_download.py asserts that against both signatures.
+check_param("load", load, "compile", False)
+
 # --------------------------------------------------------------- predict surfaces
 for label, fn in (("Agent.predict_batch", Agent.predict_batch),
                   ("Agent.system_one", Agent.system_one),

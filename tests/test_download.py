@@ -6,6 +6,7 @@ directory, and `common.build_model`'s training-time base encoder).
 
 Run: python tests/test_download.py
 """
+import inspect
 import json
 import os
 from pathlib import Path
@@ -24,9 +25,10 @@ from huggingface_hub.utils import filter_repo_objects  # noqa: E402
 from safetensors.torch import load_file, save_file  # noqa: E402
 from tokenizers import Tokenizer  # noqa: E402
 from tokenizers.models import WordLevel  # noqa: E402
+from torch._dynamo.eval_frame import OptimizedModule  # noqa: E402
 from transformers import BertConfig, BertModel, PreTrainedTokenizerFast  # noqa: E402
 
-from laya import load  # noqa: E402
+from laya import Agent, load  # noqa: E402
 from laya.common import DecisionModel  # noqa: E402
 from laya.revisions import PINNED_REVISIONS  # noqa: E402
 
@@ -266,6 +268,28 @@ class DownloadTests(unittest.TestCase):
                 common.build_model(cfg, pretrained=True)
         self.assertEqual(seen["name"], "unused/base-encoder")
         self.assertNotIn("revision", seen)
+
+    def test_load_signature_names_every_agent_option(self):
+        # `load` is a pass-through, so an `Agent` option it does not name is unreachable
+        # from the entry point the guides recommend. Read off the signatures rather than
+        # written down, so the next option added to Agent has to be forwarded here too.
+        unreachable = (set(inspect.signature(Agent.__init__).parameters) - {"self"}
+                       - set(inspect.signature(load).parameters))
+        self.assertEqual(unreachable, set(),
+                         "laya.load cannot set: %s" % ", ".join(sorted(unreachable)))
+
+    def test_compile_true_wraps_the_model_loaded_by_load(self):
+        # The observable `Agent.__init__` produces for compile=True, reached through load().
+        # Nothing is actually compiled here: torch.compile wraps eagerly and specializes on
+        # the first forward, so this stays a weight-free-of-cost check.
+        eager = load(str(self.repo), device="cpu")
+        self.assertFalse(eager.model.encoder.config.reference_compile)
+        self.assertNotIsInstance(eager.model, OptimizedModule)
+
+        compiled = load(str(self.repo), device="cpu", compile=True)
+        self.assertTrue(compiled.model.encoder.config.reference_compile)
+        self.assertIsInstance(compiled.model, OptimizedModule)
+        self.assertIsInstance(compiled.model._orig_mod, DecisionModel)
 
 
 if __name__ == "__main__":
