@@ -66,6 +66,16 @@ describe("audit regressions", () => {
     expect(() => checkQuestion("q", { type: "choice", instructions: "?", criteria: ["a"], labels: null })).toThrow("labels");
   });
 
+  it("reads noul criteria keys case-insensitively, as Python does", () => {
+    const upper = { type: "noul", instructions: "?", criteria: { True: "it holds", FALSE: "it does not" } };
+    const lower = { type: "noul", instructions: "?", criteria: { true: "it holds", false: "it does not" } };
+    expect(() => checkQuestion("q", upper)).not.toThrow();
+    expect(toInternal(upper).crit).toEqual({ true: "it holds", false: "it does not" });
+    expect(renderOptions(toInternal(upper))).toEqual(renderOptions(toInternal(lower)));
+    expect(() => checkQuestion("q", { type: "noul", instructions: "?", criteria: { True: "x", maybe: "y" } })).toThrow("maybe");
+    expect(() => checkQuestion("q", { type: "noul", instructions: "?", criteria: { yes: "x" } })).toThrow("yes");
+  });
+
   it("rejects a null score level, as Python does (#302)", () => {
     expect(() => checkQuestion("q", { type: "score", instructions: "?", criteria: ["low", null, "high"] })).toThrow("level 1");
     expect(() => checkQuestion("q", { type: "score", instructions: "?", criteria: ["low", "mid", undefined] })).toThrow("level 2");
