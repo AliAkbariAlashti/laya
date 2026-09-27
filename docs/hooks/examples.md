@@ -45,19 +45,25 @@ import json, sys
 import laya
 
 def audit(ctx):
-    record = {
-        "run_id": ctx.run_id,
-        "model": ctx.model,
-        "routing": ctx.results[0].get("routing") if ctx.results else None,
-        "answers": ctx.results[0]["answers"] if ctx.results else None,
-        "usage": ctx.usage,
-        "elapsed_ms": round(ctx.elapsed_ms or 0.0, 3),
-    }
-    print(json.dumps(record), file=sys.stderr)
-    # ship_to_service(record)
+    for state, result in zip(ctx.states, ctx.results or []):
+        record = {
+            "run_id": ctx.run_id,
+            "model": ctx.model,
+            "state": state,
+            "routing": result.get("routing"),
+            "answers": result["answers"],
+            "usage": result.get("usage"),
+            "call_usage": ctx.usage,
+            "call_elapsed_ms": round(ctx.elapsed_ms or 0.0, 3),
+        }
+        print(json.dumps(record), file=sys.stderr)
+        # ship_to_service(record)
 
 agent = laya.load("convaiinnovations/laya", on_predict_end=audit)
 ```
+
+One hook call covers the whole call, so the loop writes one record per decision; see
+[Batch](#batch) for the same shape on `predict_batch`.
 
 A full runnable version is in [`examples/hooks/audit.py`](../../examples/hooks/audit.py).
 
@@ -146,7 +152,7 @@ class Blocked(Exception):
     pass
 
 def guard(ctx):
-    text = str(ctx.states[0]).lower()
+    text = " ".join(str(state) for state in ctx.states).lower()
     if "ignore previous instructions" in text:
         raise Blocked("prompt injection")
 
@@ -158,19 +164,26 @@ except Blocked:
     handle_block()
 ```
 
+A start hook sees every state of the call, so test them all: reading only `ctx.states[0]` lets the
+rest of a `predict_batch` call through.
+
 ## Confidence gate
 
 Rewrite a low-confidence answer, or annotate it.
 
 ```python
 def gate(ctx):
-    answer = ctx.results[0]["answers"].get("dept")
-    if answer and answer["confidence"] < 0.6:
-        answer["choice"] = "human-review"
-        answer["gated"] = True
+    for result in ctx.results or []:
+        answer = result["answers"].get("dept")
+        if answer and answer["confidence"] < 0.6:
+            answer["choice"] = "human-review"
+            answer["gated"] = True
 
 agent = laya.load("convaiinnovations/laya", on_predict_end=gate)
 ```
+
+`ctx.results` holds one dict per state of the call, so the loop annotates every answer that
+misses the threshold, not only the first state's.
 
 ## Routing pin
 
@@ -331,19 +344,33 @@ hooks.clear_default_hooks()
 
 ## Token budget
 
-Shape the token budget for one call, from a hook or a per-call argument.
+Shape the token budget for one call, from a hook or a per-call argument. A hook's value replaces
+the budget in force, so it has to read that budget first: size on the widest question of the call,
+stay above the token floor the core applies to the options, and widen `max_len` with `head_max_len`
+so the state keeps a window.
 
 ```python
 def widen(ctx):
-    k = len(next(iter(ctx.questions.values())).get("criteria", {}) or {})
-    if k >= 50:
-        ctx.head_max_len = 16 + 4 * k
+    k = max((len(q.get("criteria", {}) or {}) for q in ctx.questions.values()), default=0)
+    if k < 50:
+        return
+    cfg = getattr(ctx.agent, "cfg", None) or {}
+    head = ctx.head_max_len if ctx.head_max_len is not None else cfg.get("head_max_len", 192)
+    window = ctx.max_len if ctx.max_len is not None else cfg.get("max_len", 512)
+    need = 16 + 8 * k
+    if need > head:
+        ctx.head_max_len = need
+        ctx.max_len = max(window, need + 8 + 64)
 
 agent = laya.load("convaiinnovations/laya", on_predict_start=widen)
 
 # or per call
-agent.system_one(state, questions, head_max_len=324, max_len=1024)
+agent.system_one(state, questions, head_max_len=512, max_len=1024)
 ```
+
+[Token-budget shaping](patterns.md#token-budget-shaping) has the arithmetic behind each line, and
+[`predict_shortlist`](../reference/helpers.md) is the option when a label set cannot fit even a
+widened window.
 
 ## Async hooks
 
