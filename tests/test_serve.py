@@ -15,9 +15,14 @@ from laya.serve import (  # noqa: E402
     MAX_BODY_BYTES,
     _apply_thread_limit,
     _env_bool,
+    _resolve_max_loaded,
     _resolve_model,
     create_app,
 )
+
+# Read from the router rather than copied here: the workload below has to reach the
+# typed-decisions checkpoint the same way a request does.
+from laya.router import _TYPED_DECISION_WORKFLOWS  # noqa: E402
 
 
 class FakeRouter:
@@ -233,6 +238,116 @@ def test_thread_limit(monkeypatch):
     assert _apply_thread_limit() == 8
     import torch
     assert torch.get_num_threads() == 8
+
+
+# README's own answer to a checkpoint-rebuild storm is a constructor argument --
+# `Router(max_loaded=3)   # keep all three hot, e.g. with auto_task_detection` -- and #172
+# measured what ignoring it costs: 20-23 s per request reloading a checkpoint on CPU against
+# 49-136 ms with it resident. The server builds its own Router from the environment and had no
+# way to pass it, so the one configuration that needs the knob (auto task routing, which adds a
+# third checkpoint reached on demand) could not use it. These drive `build_router()` itself,
+# with the loader replaced by a stub, so nothing is downloaded.
+class _StubAgent:
+    def __init__(self, name):
+        self.name = name
+
+    def system_one(self, state, questions):
+        return {"model": self.name, "answers": {}, "usage": {}}
+
+
+def _server_router(monkeypatch, **env):
+    """The Router `laya-serve` builds for `env`, with loads recorded instead of performed."""
+    from laya.router import normalise_name
+    from laya.serve import build_router
+
+    monkeypatch.setenv("LAYA_PRELOAD", "0")       # nothing may download
+    monkeypatch.setenv("LAYA_AUTO_TASK", "1")     # the config that puts three checkpoints in play
+    monkeypatch.delenv("LAYA_MAX_LOADED", raising=False)
+    for name, value in env.items():
+        monkeypatch.setenv(name, value)
+    router = build_router()
+    built = []
+
+    def load(name):
+        key = normalise_name(name)
+        if key in router._agents:
+            router._touch(key)
+            return router._agents[key]
+        built.append(key)
+        router._agents[key] = _StubAgent(key)
+        router._order.append(key)
+        router._evict()
+        return router._agents[key]
+
+    router.load = load
+    return router, built
+
+
+# One request per checkpoint, so a cap of 2 cannot hold them all.
+_WORKLOAD = [
+    ({"body": "I was charged twice, please refund the duplicate"},
+     {"issue": {"type": "choice", "options": ["billing", "other"]}}),
+    ({"body": "Der Kunde wurde zweimal belastet und moechte eine Rueckerstattung"},
+     {"issue": {"type": "choice", "options": ["billing", "other"]}}),
+    ({"body": "Invoice 4411 was paid twice. Please refund the duplicate line."},
+     {qid: {"type": "choice", "options": ["yes", "no"]}
+      for qid in sorted(_TYPED_DECISION_WORKFLOWS["customer_service"])}),
+]
+
+
+def _run_workload(router, cycles):
+    for _ in range(cycles):
+        for state, questions in _WORKLOAD:
+            router.predict(state, questions)
+
+
+def test_max_loaded_reaches_the_router_the_server_builds(monkeypatch):
+    from laya.router import Router
+
+    # Unset has to be reported as "not set", not as a copy of Router's default, or the two
+    # numbers drift the day the default moves. Checked at the resolver, because a copy of 2 and
+    # the real default are otherwise indistinguishable at the Router.
+    monkeypatch.delenv("LAYA_MAX_LOADED", raising=False)
+    assert _resolve_max_loaded() is None
+    for raw in ("abc", "0", "-2", "2.5", ""):
+        monkeypatch.setenv("LAYA_MAX_LOADED", raw)
+        assert _resolve_max_loaded() is None, raw
+    monkeypatch.setenv("LAYA_MAX_LOADED", "3")
+    assert _resolve_max_loaded() == 3
+
+    # And it reaches the Router the server actually builds. The literal below is the value the
+    # docs quote, so moving Router's default has to move those too.
+    router, _ = _server_router(monkeypatch)
+    assert router.max_loaded == Router().max_loaded
+    assert router.max_loaded == 2
+    for raw, want in (("3", 3), ("1", 1), (" 4 ", 4)):
+        router, _ = _server_router(monkeypatch, LAYA_MAX_LOADED=raw)
+        assert router.max_loaded == want, raw
+    # A bad value falls back the way LAYA_MAX_CONCURRENT's does: it must not stop the server
+    # and must not be read as "no limit" or "one".
+    for raw in ("abc", "0", "-2", "2.5", ""):
+        router, _ = _server_router(monkeypatch, LAYA_MAX_LOADED=raw)
+        assert router.max_loaded == 2, raw
+
+
+def test_raising_the_cap_stops_the_server_rebuilding_a_checkpoint(monkeypatch):
+    from laya.router import DEFAULT_MODELS
+
+    cycles = 3
+    router, built = _server_router(monkeypatch)
+    _run_workload(router, cycles)
+    # The instrument has to be the workload the clause is about: three checkpoints in play,
+    # and the default cap that cannot hold them.
+    assert len(set(built)) == 3, built
+    assert router.max_loaded == 2
+    assert len(built) == 9, built               # every request after the second rebuilds one
+
+    roomy, built3 = _server_router(monkeypatch, LAYA_MAX_LOADED="3")
+    _run_workload(roomy, cycles)
+    assert roomy.max_loaded == 3
+    assert len(built3) == 3, built3             # each checkpoint once, then they stay resident
+    assert sorted(roomy.loaded) == sorted(DEFAULT_MODELS)
+
 
 
 # The endpoint is `async def` and inference is synchronous torch, which on CPU takes

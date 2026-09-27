@@ -173,6 +173,10 @@ if port_map:
     check("compose.http/both sides use the same variable", port_map.group(1), port_map.group(3))
 check_true("compose.http/the server reads the same variable",
            'LAYA_PORT: "${LAYA_PORT:-8000}"' in http)
+# The block enumerates what it forwards, so a variable the server reads and the file omits is
+# unreachable for the documented compose path -- `docker run -e` still works, compose does not.
+check_true("compose.http/forwards the resident-checkpoint cap",
+           'LAYA_MAX_LOADED: "${LAYA_MAX_LOADED:-}"' in http)
 check_true("compose.http/shares the model cache",
            "model-cache:/home/laya/.cache/huggingface" in http)
 # The base service is what `docker compose run --rm laya` uses; publishing it a port or
