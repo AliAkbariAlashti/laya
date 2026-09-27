@@ -76,6 +76,7 @@ check_param("Router.__init__", Router.__init__, "sha256_digests", None)
 # --------------------------------------------------------------- predict surfaces
 for label, fn in (("Agent.predict_batch", Agent.predict_batch),
                   ("Agent.system_one", Agent.system_one),
+                  ("Agent.predict_long", Agent.predict_long),
                   ("Router.predict", Router.predict),
                   ("Router.predict_long", Router.predict_long),
                   ("ONNXAgent.system_one", ONNXAgent.system_one)):
@@ -84,6 +85,13 @@ for label, fn in (("Agent.predict_batch", Agent.predict_batch),
     check_param(label, fn, "on_predict_end", None)
     check_param(label, fn, "hooks_raise", None)
     check_param(label, fn, "hooks_timeout", None)
+
+# The scan sizes its windows from the checkpoint budget, so it takes `window`/`stride` instead
+# of the per-call token overrides the single-window entries take.
+check_param("Agent.predict_long", Agent.predict_long, "window", None)
+check_param("Agent.predict_long", Agent.predict_long, "stride", None)
+for param in ("max_len", "head_max_len"):
+    check("Agent.predict_long/%s not accepted" % param, param in sig(Agent.predict_long), False)
 
 check_param("Agent.predict_batch", Agent.predict_batch, "batch_size", None)
 check_param("Agent.predict_batch", Agent.predict_batch, "sort_by_length", False)
