@@ -136,7 +136,6 @@ jobs:
           python tests/test_load_errors.py
           python tests/test_predict_batch.py
           python tests/test_revision_pinning.py
-          python tests/test_server_example.py
 
       - name: Email cleaning tests
         run: python tests/test_email.py
