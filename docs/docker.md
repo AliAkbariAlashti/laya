@@ -225,6 +225,7 @@ These apply to the `laya-serve` service only.
 | `LAYA_MODELS` | (all) | comma list to preload: `english,multilingual,typed-decisions` |
 | `LAYA_THREADS` | `OMP_NUM_THREADS` | caps torch intra-op threads; keep at or below physical cores |
 | `LAYA_AUTO_TASK` | `0` | `1` lets the router reach `typed-decisions` automatically |
+| `LAYA_MAX_LOADED` | `2` | Checkpoints kept resident; `LAYA_AUTO_TASK` makes a third reachable on demand, and a cap below what routing chooses rebuilds one per switch |
 | `LAYA_LOG_LEVEL` | `info` | uvicorn log level |
 | `LAYA_API_KEY` | (none) | when set, requires `Authorization: Bearer <key>` |
 

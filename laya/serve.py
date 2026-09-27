@@ -24,6 +24,8 @@ env var                 meaning                                        default
                         Keep <= physical cores; oversubscribing the     default)
                         logical/hyperthread count is a large regression.
 ``LAYA_AUTO_TASK``      auto-route to the typed-decisions checkpoint   0
+``LAYA_MAX_LOADED``     checkpoints kept resident at once. Below what    2
+                        routing can choose, one reloads per switch.
 ``LAYA_API_KEY``        if set, require ``Authorization: Bearer <it>``  (none)
 ``LAYA_LOG_LEVEL``      uvicorn log level                              info
 ``LAYA_MAX_CONCURRENT`` cap on requests past auth at once; excess      16
@@ -113,6 +115,31 @@ def _resolve_max_concurrent() -> int:
     except ValueError:
         return DEFAULT_MAX_CONCURRENT
     return n if n > 0 else DEFAULT_MAX_CONCURRENT
+
+
+def _resolve_max_loaded() -> Optional[int]:
+    """Resident-checkpoint cap from ``LAYA_MAX_LOADED``; ``None`` leaves it to ``Router``.
+
+    ``Router`` keeps two checkpoints resident, which is exactly the number automatic routing
+    picks between. ``LAYA_AUTO_TASK`` adds `typed-decisions` as a third possibility, and a cap
+    below the number of checkpoints in play unloads the least recently used one on every
+    switch -- #172 measured 20-23 s per request rebuilding a checkpoint on CPU against
+    49-136 ms with it resident. The value is left out of the constructor when unset rather
+    than defaulted to a copy of ``Router``'s own default here, so the two cannot drift.
+    Unparseable or non-positive input falls back the way ``_resolve_max_concurrent`` does: a
+    typo in a deployment file should not stop the server from starting.
+
+    Only checkpoints reached on demand are bounded by it: ``Router.preload()`` raises the cap
+    to hold whatever it builds, so a lower value never evicts a preloaded checkpoint.
+    """
+    raw = os.environ.get("LAYA_MAX_LOADED")
+    if not raw:
+        return None
+    try:
+        n = int(raw)
+    except ValueError:
+        return None
+    return n if n > 0 else None
 
 
 def _resolve_port() -> int:
@@ -235,7 +262,11 @@ def build_router():
     device = os.environ.get("LAYA_DEVICE") or None
     models_env = os.environ.get("LAYA_MODELS", "").strip()
     preload_names = [m.strip() for m in models_env.split(",") if m.strip()] or None
-    router = Router(device=device, auto_task_detection=_env_bool("LAYA_AUTO_TASK", False))
+    options = {"device": device, "auto_task_detection": _env_bool("LAYA_AUTO_TASK", False)}
+    max_loaded = _resolve_max_loaded()
+    if max_loaded is not None:
+        options["max_loaded"] = max_loaded
+    router = Router(**options)
     if _env_bool("LAYA_PRELOAD", True):
         router.preload(preload_names)
     return router
