@@ -214,6 +214,247 @@ for name in ("compose.yaml", "compose.example.yml", "compose.cuda.yaml", "compos
              "compose.spark.yaml"):
     check_true("compose/%s exists" % name, os.path.exists(name))
 
+
+# --------------------------------------------------------------- nix: the deployment layer
+# Nix builds and evaluates nothing here in CI (`grep -rn nix .github/workflows/` is empty), so
+# these textual checks are the only gate on the two files a NixOS host deploys from. Same style
+# as the compose checks above: no nix binary, no third-party dependency.
+
+nix_pkg = read(os.path.join("nix", "package.nix"))
+nix_version = re.search(r'^\s*version\s*=\s*"([^"]+)"', nix_pkg, re.M)
+check_true("nix/package.nix declares a version", nix_version is not None, nix_pkg[:200])
+# The release job compares the tag to pyproject, and pyproject is compared to laya.__version__
+# above. This is the third declaration of the same string -- it sat at 0.3.4 for sixteen
+# releases because no reader existed.
+check("version/nix matches pyproject",
+      nix_version.group(1) if nix_version else None,
+      static_version.group(1) if static_version else None)
+
+# `services.laya-serve.models` is joined into LAYA_MODELS, which laya.serve splits and hands to
+# Router.preload() -- and preload normalises every name (laya/router.py:370), so the server takes
+# core's aliases. A closed `enum` in the module can only copy that list and fall behind it: it
+# refused ten of the thirteen spellings the same value accepts, and it refused them at nix
+# evaluation time, on the way to starting a service that would have been happy.
+nix_module = read(os.path.join("nix", "laya-serve.nix"))
+models_block = re.search(r"models = lib\.mkOption \{(.*?)\n    \};", nix_module, re.S)
+check_true("nix/module has a models option", models_block is not None, nix_module[:200])
+block = models_block.group(1) if models_block else ""
+type_line = re.search(r"^\s*type\s*=\s*(.+?)\s*$", block, re.M)
+check_true("nix/models type declaration found", type_line is not None, block[:200])
+declared_type = type_line.group(1) if type_line else ""
+check_true("nix/models declares no closed enum over checkpoint names",
+           "types.enum" not in declared_type, "type = %s" % declared_type)
+
+# The accepted name set, read out of core rather than transcribed: DEFAULT_MODELS' keys and the
+# alias table. ast, not import -- this suite takes no third-party dependency, and torch is one.
+def dict_keys(source, name):
+    tree = ast.parse(source)
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == name for t in node.targets):
+            return [k.value for k in node.value.keys if isinstance(k, ast.Constant)]
+    # Returning nothing rather than raising keeps the failure a named check: the population
+    # guard below reports it. A gate that dies on the way to reporting leaves the cause unsaid.
+    return []
+
+
+router_src = read(os.path.join("laya", "router.py"))
+canonical = dict_keys(router_src, "DEFAULT_MODELS")
+aliases = dict_keys(router_src, "_ALIASES")
+accepted = sorted(set(canonical) | set(aliases))
+# Non-vacuity: the derivation has to have found both tables, or every comparison against
+# `accepted` below would pass by matching an empty set.
+check_true("nix/core name tables are both populated",
+           len(canonical) >= 1 and len(aliases) >= 1,
+           "DEFAULT_MODELS=%r _ALIASES=%r -- laya/router.py changed shape" % (canonical, aliases))
+check("nix/models default is exactly core's canonical checkpoints",
+      sorted(n.strip('"') for n in
+             re.findall(r'default = \[([^\]]*)\]', block, re.S)[0].split())
+      if re.search(r"default = \[", block) else None,
+      sorted(canonical))
+
+# Whatever the module tells its reader to type must be what core accepts, and the module runs no
+# validator of its own -- so a name added to _ALIASES has to appear here or the option's own
+# description goes stale on the day the alias lands.
+description = re.search(r"description = ''(.*?)''", block, re.S)
+check_true("nix/models has a description", description is not None, block[:200])
+described = description.group(1) if description else ""
+undocumented = [n for n in accepted if "`%s`" % n not in described]
+check_true("nix/models describes every name core accepts", not undocumented,
+           "accepted by laya.router.normalise_name but absent from the option text: %s"
+           % undocumented)
+# And the module must still be the thing that sets LAYA_MODELS, or the checks above describe a
+# wire that no longer exists.
+check_true("nix/module still joins models into LAYA_MODELS",
+           re.search(r'LAYA_MODELS = lib\.concatStringsSep "," cfg\.models;', nix_module) is not None,
+           "the models option no longer feeds LAYA_MODELS; these checks need retargeting")
+
+# ---- every knob laya reads from the environment has to be reachable from the module
+# `laya.serve` has no config file and no CLI flag for any of it: the process configures itself
+# from LAYA_* and nothing else. On a NixOS host the unit's environment is the only thing that can
+# hand those variables over, so a name the module never assigns is a control that host cannot ask
+# for.
+#
+# This set is derived from the whole package, not from `laya/serve.py`. Reading serve.py alone is
+# a scope error that passed: the three runtime knobs below were invisible to it. A deployment unit
+# configures a *process*, and the process is `laya`.
+#
+# Both regexes carry `[A-Z0-9_]` for the same reason: `LAYA_SHA256_DIGESTS`. `[A-Z_]+` matches a
+# prefix of that name, so a narrower pattern reports no gap rather than the one it cannot see.
+_READ_PATTERNS = (r'environ\.get\("(LAYA_[A-Z0-9_]+)"', r'_env_bool\("(LAYA_[A-Z0-9_]+)"',
+                  r'environ\["(LAYA_[A-Z0-9_]+)"\]')
+
+
+def env_reads():
+    """Every `LAYA_*` name the package looks up, by walking laya/ rather than listing files."""
+    found = set()
+    for root, dirs, files in os.walk(os.path.join(ROOT, "laya")):
+        dirs[:] = [d for d in dirs if d != "__pycache__"]
+        for name in files:
+            if not name.endswith(".py"):
+                continue
+            rel = os.path.relpath(os.path.join(root, name), ROOT)
+            src = read(rel)
+            for pat in _READ_PATTERNS:
+                found.update(re.findall(pat, src))
+    return found
+
+
+read_names = env_reads()
+# An assignment only. The `models` description names `LAYA_MODELS` in prose, and prose that
+# mentions a variable sets nothing.
+assigned = sorted(set(re.findall(r'\b(LAYA_[A-Z0-9_]+)\s*=', nix_module))
+                  | set(re.findall(r'export (LAYA_[A-Z0-9_]+)=', nix_module)))
+
+# Non-vacuity, twice over: an empty derivation passes both directions below for free, and a
+# digit-blind pattern reproduces the original miss while still looking like ten names found.
+check_true("nix/package's environment reads were found", len(read_names) >= 10,
+           "got %d -- retarget this if the lookup shape changes" % len(read_names))
+check_true("nix/the derivation reaches a digit-bearing env var",
+           any(any(c.isdigit() for c in n) for n in read_names),
+           "sorted: %s" % sorted(read_names))
+
+# One name is knowingly left unwired, and it is named rather than hidden by a narrower
+# derivation: `LAYA_SHA256_DIGESTS` carries a JSON object, and this module has no way to prove a
+# shell-quoting claim holds -- nothing in CI evaluates a NixOS module, so every check here is
+# textual. Listing the exception keeps the gap asserted at exactly one name.
+UNWIRED = {"LAYA_SHA256_DIGESTS"}
+check("nix/module reaches every env var laya reads",
+      sorted(read_names - set(assigned) - UNWIRED), [])
+# The other direction is the silent failure: a misspelled name is a perfectly good string,
+# systemd exports it, no Python ever looks at it, and the operator's setting does nothing.
+check("nix/module assigns no env var laya never reads",
+      [n for n in assigned if n not in read_names], [])
+# And the exception list has to stay the size of the real gap: an entry that got wired up, or a
+# name core stopped reading, is a stale excuse that would hide the next one.
+check("nix/unwired exceptions are all still unwired and still real",
+      sorted(n for n in UNWIRED if n not in read_names or n in assigned), [])
+
+# An option that nothing reads is a promise the unit does not keep, and the mirror case -- a
+# setting the unit applies with no option to turn it -- is a host that cannot change it.
+declared = re.findall(r"^    ([a-zA-Z]+) = lib\.mkOption \{", nix_module, re.M)
+check_true("nix/module's options were found", len(declared) >= 5,
+           "got %r -- retarget this if the option block changes shape" % (declared,))
+check("nix/every declared option is used by the unit",
+      [n for n in declared if "cfg.%s" % n not in nix_module], [])
+
+
+def option_text(opt):
+    _b = re.search(r"^    %s = lib\.mkOption \{(.*?)\n    \};" % opt, nix_module, re.S | re.M)
+    return _b.group(1) if _b else ""
+
+
+def option_type(opt):
+    """The declared `type = ...;` line, and nothing else from the block.
+
+    Read it off the type, not off the option: `mpsAmpMinRows`'s description spells out
+    `ints.positive` to explain why it is `ints.positive`, and a check that searched the whole
+    block was satisfied by that sentence while the type line said `ints.unsigned`. Prose naming a
+    constraint is not the constraint.
+    """
+    _t = re.search(r"^\s*type = (.+);$", option_text(opt), re.M)
+    return _t.group(1) if _t else ""
+
+
+# Every new knob is opt-in: unset means the unit exports nothing and the runtime's own default
+# applies, so a host that ignores them gets today's behaviour byte for byte.
+for opt in ("logLevel", "maxConcurrent", "cudaAmp", "cpuAmp", "mpsAmpMinRows"):
+    _t = option_text(opt)
+    check_true("nix/module declares %s" % opt, _t != "", "option not found")
+    check_true("nix/%s is opt-in (nullOr, default null)" % opt,
+               _t.count("nullOr") == 1 and re.search(r"^\s*default = null;", _t, re.M) is not None,
+               _t.strip()[:120])
+    check_true("nix/%s is guarded by a != null optionalAttrs" % opt,
+               re.search(r"lib\.optionalAttrs \(cfg\.%s != null\)" % opt, nix_module) is not None,
+               "the unit would export the variable even when the host left it unset")
+
+# The same lesson as `models`, stated for the whole module: no option may carry a closed list of
+# names that somebody else validates. uvicorn checks the log level, laya checks the checkpoint
+# name, and a copy here can only fall behind them -- which is how the module came to refuse ten
+# spellings of a value the server accepts.
+check_true("nix/module declares no closed enum over names it does not own",
+           "types.enum" not in nix_module, "an enum in this module is a copy of someone "
+           "else's list; defer to the thing that validates the value")
+
+# So the AMP vocabularies are read out of `laya.agent` instead, from the comparisons that follow
+# each lookup rather than from a list written down here: a spelling core starts accepting shows up
+# in the set on its own, and this module's prose has to name it. The sets differ by device -- CPU
+# takes bf16 only, CUDA takes fp16 too -- and that asymmetry is the whole content of the two
+# options, so the check runs in both directions like the env-var one above. A `fp16` added to the
+# `cpuAmp` description is a promise the runtime does not keep.
+agent_src = read(os.path.join("laya", "agent.py"))
+
+
+def amp_tokens(var):
+    anchor = re.search(r'environ\.get\("%s"' % var, agent_src)
+    if anchor is None:
+        return None                      # reported by the non-vacuity guard below
+    window = agent_src[anchor.end():anchor.end() + 300]
+    return sorted({t for group in re.findall(r'\bin \(([^)]*)\)', window)
+                   for t in re.findall(r'"([^"]+)"', group)})
+
+
+AMP_MEANING = {"cudaAmp": "LAYA_CUDA_AMP", "cpuAmp": "LAYA_CPU_AMP"}
+for _opt, _var in sorted(AMP_MEANING.items()):
+    accepted = amp_tokens(_var)
+    check_true("nix/%s's dtype list came from laya/agent.py" % _opt, bool(accepted),
+               "no `in (...)` comparison follows `environ.get(\"%s\")`; retarget this" % _var)
+    _d = re.search(r"description = ''(.*?)''", option_text(_opt), re.S)
+    described = _d.group(1) if _d else ""
+    check_true("nix/%s names every dtype core accepts for %s" % (_opt, _var),
+               all("`%s`" % t in described for t in accepted),
+               "core compares %s against %s; the option text says: %s"
+               % (_var, accepted, described.strip()[:160]))
+    offered = [t for t in ("fp16", "float16", "bf16", "bfloat16")
+               if "`%s`" % t in described and t not in accepted]
+    check_true("nix/%s offers no dtype core ignores for it" % _opt, not offered,
+               "%s is not in the set laya.agent compares %s against" % (offered, _var))
+
+# `mpsAmpMinRows` has no vocabulary, but its type is a claim: laya clamps a value below 1 up to 1,
+# so `ints.positive` is what keeps the module from accepting an input the service reinterprets.
+check_true("nix/mpsAmpMinRows's type refuses what the runtime would clamp",
+           "positive" in option_type("mpsAmpMinRows"),
+           "type = %s -- ints.unsigned or ints.atLeast 0 would let 0 through to be rewritten"
+           % option_type("mpsAmpMinRows"))
+
+# Both AMP options tell the operator that the transport refuses whitespace, and that is a claim
+# about the type, not the prose: the runtime lower-cases but does not trim, so `"bf16 "` is a
+# silently inert setting. Checked where the claim is made.
+for _opt in ("cudaAmp", "cpuAmp"):
+    _t = option_type(_opt)
+    check_true("nix/%s's type carries its own no-whitespace claim" % _opt,
+               "strMatching" in _t and "nullOr" in _t,
+               "type = %s -- the description promises a single token" % _t)
+
+# The device split is the entire content of those two options: CUDA takes a half-precision
+# spelling, CPU does not. Asserted from core rather than from the prose, so the day that stops
+# being true the gate says so instead of the option text quietly overpromising.
+_cuda, _cpu = amp_tokens("LAYA_CUDA_AMP"), amp_tokens("LAYA_CPU_AMP")
+check_true("nix/CUDA and CPU accept different dtype spellings", _cuda != _cpu,
+           "cuda=%r cpu=%r -- if laya honours the same set on both devices now, the `cpuAmp` "
+           "description's cross-reference needs retargeting" % (_cuda, _cpu))
+
+
 # --------------------------------------------------------------- declared extras
 # The runtime error in laya/structured.py tells users to install `laya[structured]`, and the
 # docs and README repeat it. A reference to an extra pyproject.toml does not declare is a dead
