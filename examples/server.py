@@ -155,19 +155,27 @@ _CFG: Dict[str, Any] = {
     "preload": os.getenv("LAYA_PRELOAD", "1") not in ("0", "false", "False"),
     "device": os.getenv("LAYA_DEVICE") or None,
     "default": os.getenv("LAYA_DEFAULT_MODEL", "english"),
-    "max_loaded": int(os.getenv("LAYA_MAX_LOADED", "1")),
+    # None means "not asked for", so Router keeps its own default instead of this file
+    # carrying a copy of it. The copy here said 1, the number #172 measured at one
+    # checkpoint rebuild per alternating-language request, and #180 retired it in the
+    # library without this line following.
+    "max_loaded": (int(os.environ["LAYA_MAX_LOADED"])
+                   if os.getenv("LAYA_MAX_LOADED", "").strip() else None),
 }
+
+
+def _router_kwargs(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Constructor arguments for the app's Router, with the resident cap only when asked for."""
+    kwargs = {"preload": cfg["preload"], "device": cfg["device"], "default": cfg["default"]}
+    if cfg["max_loaded"] is not None:
+        kwargs["max_loaded"] = cfg["max_loaded"]
+    return kwargs
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global ROUTER
-    ROUTER = Router(
-        preload=_CFG["preload"],
-        device=_CFG["device"],
-        default=_CFG["default"],
-        max_loaded=_CFG["max_loaded"],
-    )
+    ROUTER = Router(**_router_kwargs(_CFG))
     yield
     ROUTER = None
 
@@ -209,7 +217,13 @@ def _questions(model_map: Dict[str, Question]) -> Dict[str, Any]:
 
 @app.get("/health")
 def health(request: Request):
-    payload = {"status": "ok" if ROUTER is not None else "loading", "config": _CFG}
+    cfg = dict(_CFG)
+    if ROUTER is not None:
+        # The cap the running Router really holds, not the requested one: an unset
+        # LAYA_MAX_LOADED means "whatever the library defaults to", and this page has to
+        # say which of the two the process is living with.
+        cfg["max_loaded"] = ROUTER.max_loaded
+    payload = {"status": "ok" if ROUTER is not None else "loading", "config": cfg}
     return _health_page(payload) if _wants_html(request) else payload
 
 
@@ -3233,6 +3247,10 @@ _ENDPOINTS = (
 def _health_page(payload: Dict[str, Any]) -> HTMLResponse:
     cfg = payload.get("config", {})
     ok = payload.get("status") == "ok"
+    # Until the lifespan has built a Router there is no resident count to state, and
+    # guessing one here is how a default this file no longer owns ends up printed as fact.
+    resident = ("" if not cfg.get("max_loaded")
+                else "; up to %s kept in memory" % escape(str(cfg["max_loaded"])))
     rows = "".join(
         f"<dt>{escape(k)}</dt><dd>{escape(str(v if v is not None else 'auto'))}</dd>"
         for k, v in cfg.items()
@@ -3251,8 +3269,7 @@ def _health_page(payload: Dict[str, Any]) -> HTMLResponse:
         f"<section class='panel'><div class='pb'><div class='status{'' if ok else ' wait'}'>"
         f"{'Ready' if ok else 'Loading'}</div>"
         f"<p class='muted' style='margin:4px 0 0'>Checkpoints are "
-        f"{'preloaded' if cfg.get('preload') else 'loaded on demand'}; up to "
-        f"{escape(str(cfg.get('max_loaded', 1)))} kept in memory.</p></div></section>"
+        f"{'preloaded' if cfg.get('preload') else 'loaded on demand'}{resident}.</p></div></section>"
         f"<section class='panel'><div class='ph'><h2 class='t'>Configuration</h2></div><dl class='kvt'>{rows}</dl>"
         "<div class='pb muted' style='border-top:1px solid var(--line)'>Override with flags "
         "(<code>--device</code>, <code>--no-preload</code>, <code>--max-loaded</code>) or env vars "
@@ -3404,7 +3421,8 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--device", default=_CFG["device"], help="cuda, cpu, mps ...")
     p.add_argument("--default-model", default=_CFG["default"])
-    p.add_argument("--max-loaded", type=int, default=_CFG["max_loaded"])
+    p.add_argument("--max-loaded", type=int, default=_CFG["max_loaded"],
+                   help="checkpoints kept resident (default: LAYA_MAX_LOADED, else laya's own)")
     p.add_argument("--no-preload", action="store_true", help="load checkpoints lazily")
     p.add_argument("--reload", action="store_true")
     args = p.parse_args()
@@ -3423,7 +3441,12 @@ def main() -> None:
         # reimport picks up what was actually asked for on the command line.
         os.environ["LAYA_PRELOAD"] = "1" if _CFG["preload"] else "0"
         os.environ["LAYA_DEFAULT_MODEL"] = _CFG["default"]
-        os.environ["LAYA_MAX_LOADED"] = str(_CFG["max_loaded"])
+        if _CFG["max_loaded"] is None:
+            # "not asked for" has to stay unpushed: writing str(None) here would land on the
+            # int() above in the reimported process and stop the server at import.
+            os.environ.pop("LAYA_MAX_LOADED", None)
+        else:
+            os.environ["LAYA_MAX_LOADED"] = str(_CFG["max_loaded"])
         if _CFG["device"]:
             os.environ["LAYA_DEVICE"] = _CFG["device"]
 
