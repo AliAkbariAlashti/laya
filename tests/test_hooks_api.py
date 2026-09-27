@@ -70,6 +70,8 @@ check_param("Router.__init__", Router.__init__, "lang_guess", None)
 check_param("Router.__init__", Router.__init__, "revisions", None)
 # ...and the remaining `Agent` options, forwarded to every checkpoint it builds
 check_param("Router.__init__", Router.__init__, "agent_kwargs", None)
+# ...and the per-checkpoint digests that `revisions` has always had a sibling need for
+check_param("Router.__init__", Router.__init__, "sha256_digests", None)
 
 # --------------------------------------------------------------- predict surfaces
 for label, fn in (("Agent.predict_batch", Agent.predict_batch),
