@@ -94,17 +94,14 @@ The shipped checkpoints work zero-shot, but fine-tuning on decisions from your o
 
 **[nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/)**: guides for [prediction hooks](https://nandhakishorm.github.io/laya/hooks/), [schema-driven decisions](https://nandhakishorm.github.io/laya/structured/), [Docker](https://nandhakishorm.github.io/laya/docker/) and [LangChain and LangGraph](https://nandhakishorm.github.io/laya/langchain/), plus a full [API reference](https://nandhakishorm.github.io/laya/reference/).
 
-## What's new in 0.3.20
+## What's new in 0.3.21
 
-* **Long documents with `max_len=8192`.** A measured table below Installation shows accuracy and time for `laya-multilingual` by document length, from a reproducible benchmark: strong up to about 4,000 tokens of text, more variable beyond.
-* **Installation, quickstart and documentation first.** This README now opens with how to install Laya, runnable English and multilingual examples, how fine-tuning improves accuracy, and where the docs are.
-* **Documentation site** at [nandhakishorm.github.io/laya](https://nandhakishorm.github.io/laya/), with an API reference generated from the docstrings.
-
-The code is unchanged from the last runtime release, whose fixes are:
-
-* **Sturdier fast path.** After a CUDA out-of-memory error, the fallback to CPU switches the TileLang fast path off first instead of retrying on CUDA. A `choice` question with a single option no longer crashes it, requests longer than it was built for get a clear error, and concurrent calls can no longer overwrite each other's CUDA-graph buffers.
-* **Server and runtime.** `laya-serve` drains its inference pool on shutdown and returns 401 for a malformed bearer header, and `ONNXAgent` matches `Agent` on empty question sets and long conversation lists.
-* **Smaller fixes.** The `laya` command prints the right probability for a choice, LangChain remote calls refuse cross-origin or HTTPS-downgrade redirects, and `AGENTS.md` gives AI coding assistants the contribution rules.
+* **ONNX catches up with PyTorch.** `ONNXAgent` gains `predict_batch` (with `sort_by_length`), `predict_long` and `decide_batch`, `scripts/export_onnx.py --quantize` writes a per-channel INT8 copy for CPU, and `laya-evals run --onnx` scores an export with the same gates as the torch path.
+* **Opt-in abstention.** `min_confidence=` on `predict`, `predict_batch`, `decide` and `decide_batch` flags answers below a threshold on `answer_confidence` with `low_confidence: True`, and `decide` returns `None` for them.
+* **Batch everywhere.** `decide_batch`, `Router.predict_long`, `laya --batch FILE`, the MCP `laya_predict_batch` / `laya_route_batch` / `laya_decide` tools, and LangChain `batch()` / `abatch()` all run on shared forward passes. New `LayaDecision` (LangChain), LlamaIndex selectors (`laya[llamaindex]`) and CrewAI routing (`laya[crewai]`).
+* **Per-request token budget.** `max_len` / `head_max_len` now reach every surface: `laya-serve` (capped by `LAYA_MAX_TOKEN_BUDGET`), `Router.predict_batch` requests, the CLI (`--questions`, `--max-len`, `--head-max-len`), MCP tools and LangChain nodes.
+* **Operations.** `LAYA_MAX_LOADED`, `LAYA_REVISION` and per-checkpoint SHA-256 maps; `/health` reports the device a checkpoint really runs on and its CPU-fallback count; the 503 busy answer carries `Retry-After`; `compile=True` no longer recompiles for every request shape.
+* **Stricter inputs.** A null or duplicate `choice` label, a short temperature list, a `None` state and non-dict questions are refused with a message that names them, and `usage["options"]` says when the head budget left two options with the same tokens.
 
 ---
 
