@@ -546,7 +546,8 @@ def test_auto_task_env():
     README's MCP section says these variables follow the contract at the top of laya.serve, so the
     check is built through both surfaces' real builders -- `laya.mcp.server._ensure_router()` and
     `laya.serve.build_router()` -- rather than by reading a flag off a hand-made Router.
-    `Router.route()` decides without loading anything, so no checkpoint is downloaded here.
+    `Router.route()` delegates to the private `_route`, documented as deciding "without loading or
+    running anything", so no checkpoint is downloaded here.
     """
     import laya.mcp.server as mcp_mod  # the module, not the MCPServer instance
     from laya.router import _TYPED_DECISION_WORKFLOWS
