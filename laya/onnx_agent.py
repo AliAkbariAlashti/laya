@@ -405,11 +405,15 @@ class ONNXAgent(HookRegistry):
             aggregate: "auto" (the per-type rules above) is the only mode for now.
             batch_size: Cap on windows per session run, to bound peak memory on very long states.
             lang: Per-language temperature selection, as in `system_one`.
-            hooks, on_predict_start, on_predict_end, hooks_raise, hooks_timeout: per-call hooks,
-                    with the same contract as `Agent.predict_long`: they wrap the inference that
-                    answers the state, a start hook that answers with `ctx.skip(...)` gets
+            hooks (HookArg): Per-call hooks, appended after any installed on the agent. They
+                    follow `Agent.predict_long`'s contract: they wrap the inference that answers
+                    the state, a start hook that answers with `ctx.skip(...)` gets
                     `usage["windows"] == 0` and no window attribution, and a rewritten scan is
                     aggregated without `answer["window"]`.
+            on_predict_start (PredictHookArg): A per-call start hook, as in `system_one`.
+            on_predict_end (PredictHookArg): A per-call end hook, as in `system_one`.
+            hooks_raise: Override the agent's `hooks_raise` for this call.
+            hooks_timeout: Override the agent's `hooks_timeout` for this call.
 
         Returns a single result dict, the same shape as `system_one`, with `usage["windows"]`
         added.
