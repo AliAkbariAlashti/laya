@@ -529,3 +529,39 @@ def test_admission_slot_is_released_after_inference(monkeypatch):
     client = TestClient(create_app(router=FakeRouter()))
     assert client.post("/v1/systemone", json=REQ).status_code == 200
     assert client.post("/v1/systemone", json=REQ).status_code == 200
+
+
+def test_accepted_connections_set_tcp_nodelay(monkeypatch):
+    """#620: asyncio skips TCP_NODELAY when an accepted socket reports proto 0, as it
+    does on macOS and Windows, so Nagle held back small responses by about 50 ms."""
+    import asyncio
+    import socket
+
+    import uvicorn
+
+    import laya.serve
+
+    captured = {}
+    monkeypatch.setattr(uvicorn, "run", lambda app, **kwargs: captured.update(kwargs))
+    monkeypatch.setattr(laya.serve, "create_app", lambda: None)
+    laya.serve.main()
+
+    async def drive():
+        config = uvicorn.Config(create_app(router=FakeRouter()), host="127.0.0.1", port=0,
+                                http=captured["http"], log_level="warning")
+        server = uvicorn.Server(config)
+        serving = asyncio.ensure_future(server.serve())
+        while not server.started:
+            await asyncio.sleep(0.01)
+        port = server.servers[0].sockets[0].getsockname()[1]
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+        while not server.server_state.connections:
+            await asyncio.sleep(0.01)
+        (conn,) = server.server_state.connections
+        nodelay = conn.transport.get_extra_info("socket").getsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY)
+        writer.close()
+        server.should_exit = True
+        await serving
+        return nodelay
+
+    assert asyncio.run(drive())
