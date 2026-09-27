@@ -87,6 +87,9 @@ check_param("Router.__init__", Router.__init__, "sha256_digests", None)
 # through the class; tests/test_download.py asserts that against both signatures.
 check_param("load", load, "compile", False)
 
+# ONNXAgent downloads the same Hub artifacts as Agent, so it authenticates the same way
+check_param("ONNXAgent.__init__", ONNXAgent.__init__, "token", None)
+
 # --------------------------------------------------------------- predict surfaces
 for label, fn in (("Agent.predict_batch", Agent.predict_batch),
                   ("Agent.system_one", Agent.system_one),

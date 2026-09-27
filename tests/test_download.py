@@ -7,6 +7,7 @@ directory, and `common.build_model`'s training-time base encoder).
 Run: python tests/test_download.py
 """
 import inspect
+import inspect
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,13 @@ from transformers import BertConfig, BertModel, PreTrainedTokenizerFast  # noqa:
 from laya import Agent, load  # noqa: E402
 from laya.common import DecisionModel  # noqa: E402
 from laya.revisions import PINNED_REVISIONS  # noqa: E402
+from laya.onnx_agent import ONNXAgent  # noqa: E402
+
+
+class _NoRuntime:
+    """Stand-in for the onnxruntime module. `ONNXAgent.__init__` binds the name before it
+    touches the Hub, and the download asserted on below happens well before a session is
+    built, so nothing here is ever called."""
 
 
 class DownloadTests(unittest.TestCase):
@@ -290,6 +298,61 @@ class DownloadTests(unittest.TestCase):
         self.assertTrue(compiled.model.encoder.config.reference_compile)
         self.assertIsInstance(compiled.model, OptimizedModule)
         self.assertIsInstance(compiled.model._orig_mod, DecisionModel)
+
+    def test_onnx_agent_accepts_every_hub_option_the_agent_does(self):
+        # Both runtimes download the same checkpoint from the same place, so an option that
+        # selects *which* checkpoint, or *how* to authenticate for it, has to exist on both.
+        # Read off the signatures so the next Hub-side option added to Agent has to be
+        # copied across rather than silently diverging again.
+        #   fast/compile -- the TileLang path and torch.compile, neither of which exists
+        #                    inside onnxruntime.
+        #   device       -- ONNXAgent picks an execution provider from what onnxruntime
+        #                    reports and takes no override; a different asymmetry, with its
+        #                    own fix.
+        not_for_onnxruntime = {"fast", "compile", "device"}
+        agent_side = (set(inspect.signature(Agent.__init__).parameters)
+                      - {"self", "model_id_or_path"} - not_for_onnxruntime)
+        onnx_side = set(inspect.signature(ONNXAgent.__init__).parameters) - {"self"}
+        missing = agent_side - onnx_side
+        self.assertEqual(missing, set(),
+                         "ONNXAgent cannot set: %s" % ", ".join(sorted(missing)))
+
+    def test_onnx_agent_forwards_the_token_to_the_download(self):
+        # `token` is only useful if it reaches snapshot_download. Drive the real constructor
+        # with the transport replaced and read the call it makes: the graph file is absent
+        # on purpose, so the load stops right after the download it is meant to authenticate.
+        # onnxruntime is imported at the top of __init__ and never used before that stop, so
+        # an empty stand-in keeps this a no-extra-required check.
+        with tempfile.TemporaryDirectory() as snapshot:
+            (Path(snapshot) / "rl_agent_config.json").write_text(json.dumps({
+                "encoder": "unused/offline", "head_layers": 0, "act_costs": {"act": 0},
+                "max_len": 64, "head_max_len": 32,
+            }))
+            with patch.dict(sys.modules, {"onnxruntime": _NoRuntime}), \
+                    patch("huggingface_hub.snapshot_download", return_value=snapshot) as download:
+                with self.assertRaises(FileNotFoundError):
+                    ONNXAgent("test/private-model", token="test-token",
+                              onnx_path=str(self.repo / "absent.onnx"))
+                self.assertEqual(download.call_args.kwargs["token"], "test-token")
+                # the allow-list is unchanged: a token must not widen what gets fetched
+                self.assertNotIn("model.safetensors", download.call_args.kwargs["allow_patterns"])
+
+    def test_onnx_agent_token_defaults_and_reads_the_environment(self):
+        with tempfile.TemporaryDirectory() as snapshot:
+            (Path(snapshot) / "rl_agent_config.json").write_text(json.dumps({
+                "encoder": "unused/offline", "head_layers": 0, "act_costs": {"act": 0},
+                "max_len": 64, "head_max_len": 32,
+            }))
+            with patch.dict(sys.modules, {"onnxruntime": _NoRuntime}), \
+                    patch("huggingface_hub.snapshot_download", return_value=snapshot) as download:
+                with self.assertRaises(FileNotFoundError):
+                    ONNXAgent("test/private-model", onnx_path=str(self.repo / "absent.onnx"))
+                self.assertIsNone(download.call_args.kwargs["token"])
+
+                with patch.dict(os.environ, {"HF_TOKEN": "env-token"}):
+                    with self.assertRaises(FileNotFoundError):
+                        ONNXAgent("test/private-model", onnx_path=str(self.repo / "absent.onnx"))
+                    self.assertEqual(download.call_args.kwargs["token"], "env-token")
 
 
 if __name__ == "__main__":
