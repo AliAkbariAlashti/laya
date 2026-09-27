@@ -491,14 +491,13 @@ def _validate_batch_model(value: Any, where: str) -> str | None:
     separate from ``validate_model``, whose "auto" means "answer via
     router.predict" on the single-request path.
     """
-    if value is None or value == "auto":
+    if value is None:
         return None
-    if value not in VALID_MODELS:
-        raise ToolError(
-            "invalid_model",
-            f"{where}['model'] must be one of {sorted(VALID_MODELS)}, got {value!r}",
-        )
-    return value
+    try:
+        name = validate_model(value)
+    except ToolError as error:
+        raise ToolError("invalid_model", "%s['model']: %s" % (where, error)) from None
+    return None if name == AUTO else name
 
 
 def _validate_batch_str(value: Any, where: str, allow_empty: bool = False) -> str:
