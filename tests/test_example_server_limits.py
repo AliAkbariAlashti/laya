@@ -29,10 +29,19 @@ FAILS_ON_MAIN -- this file, against `main`'s `examples/server.py` at 4066d5d:
     AttributeError: module 'server' has no attribute '_router_kwargs'
 
 One check names the number, then the run aborts because the helper it drives does not exist
-there. That is the shape of the gap: on `main` the cap is a literal at
-`examples/server.py:158`, handed to the constructor at `:169`, reported back from that same
-`_CFG` by `/health` at `:212`, and guessed once more by the page at `:3255`. Nothing in the
-file ever asked the running Router what it was holding.
+there. So the same claims are checked on `main` through nothing but the public surface -- its
+own lifespan, the Router that builds, `/health` in both representations -- which prints:
+
+    Router()'s own default = 2      built Router's cap = 1      /health JSON = 1
+    /health HTML says      = 'Checkpoints are loaded on demand; up to 1 kept in memory.'
+    preload() lifts the cap to -> 3, while the page prints 1
+
+and `False` for "the cap came from the environment", "the Router holds laya's default", and
+"that default is more than one"; on this branch all three read `True` and the cap reads 2.
+That last line is the half that is not about the default at all: `Router.preload()` raises the
+cap to fit what it preloads (`laya/router.py:275` -> `:372`), so the demo's own default mode ran
+with three checkpoints resident while `/health` reported one. Nothing in the file ever asked the
+running Router what it was holding.
 
 Run: python tests/test_example_server_limits.py
 """
