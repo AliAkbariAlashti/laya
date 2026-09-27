@@ -112,6 +112,7 @@ jobs:
           python tests/test_doc_tables.py
           python tests/test_tokenizer_cache.py
           python tests/test_tokenizer_concurrency.py
+          python tests/test_question_token_reuse.py
           python tests/test_lazy_import.py
           python tests/test_runtime_fixes.py
           python tests/test_lang_guess.py
@@ -252,6 +253,10 @@ jobs:
         run: |
           python tests/test_hooks.py
           python tests/test_hooks_api.py
+        shell: bash
+
+      - name: Question token reuse tests
+        run: python tests/test_question_token_reuse.py
         shell: bash
 
       # Same five pytest suites as the Linux job. They are named explicitly rather than added to
