@@ -12,11 +12,14 @@ These tests need no model weights. They cover:
 import inspect
 import os
 import sys
+from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 from laya import agent as _agent  # noqa: E402
 from laya.agent import Agent  # noqa: E402
@@ -303,6 +306,66 @@ check_raises("min_confidence/out-of-range rejected", ValueError,
              lambda: make_confidence_fake().predict_batch(["s0"], QUESTIONS, min_confidence=1.5))
 check_raises("min_confidence/bool rejected", ValueError,
              lambda: make_confidence_fake().predict_batch(["s0"], QUESTIONS, min_confidence=True))
+
+
+# --------------------------------------------------------------- CUDA batch autocast lifetime
+# Fake CUDA device and autocast so this orchestration test also runs in CPU-only CI.
+def run_amp_scope_case(batch_size=2, device="cuda", amp=True, fast=None, compiled=False, fail=False):
+    fake = make_fake()
+    fake.device = torch.device(device)
+    fake.dtype = torch.bfloat16
+    fake.amp_enabled = amp
+    fake._fast = fast
+    fake._compiled = compiled
+    events = []
+
+    @contextmanager
+    def record_autocast(**kwargs):
+        events.append(("enter", kwargs))
+        try:
+            yield
+        finally:
+            events.append(("exit", kwargs))
+
+    original_forward = fake._forward
+
+    def forward(batch):
+        events.append(("forward", _agent._BATCH_AUTOCAST_CACHE.get()))
+        if fail:
+            raise ValueError("forward failed")
+        return original_forward(batch)
+
+    fake._forward = forward
+    with patch.object(torch, "autocast", side_effect=record_autocast):
+        try:
+            fake.predict_batch(["s0", "s1", "s2"], QUESTIONS, batch_size=batch_size,
+                               on_predict_end=lambda ctx: events.append(("end", None)),
+                               hooks=SimpleNamespace(on_error=lambda ctx: events.append(("error", None))))
+        except ValueError:
+            if not fail:
+                raise
+    return events
+
+
+scoped = run_amp_scope_case()
+check("autocast/multiple forwards use one enclosing scope",
+      [name for name, _ in scoped], ["enter", "forward", "forward", "exit", "end"])
+check("autocast/outer scope disables autocast between forwards",
+      scoped[0][1], {"device_type": "cuda", "dtype": torch.bfloat16, "enabled": False})
+check("autocast/batch marker only active during forwards",
+      [value for name, value in scoped if name == "forward"], [True, True])
+check("autocast/batch marker reset before end hook", _agent._BATCH_AUTOCAST_CACHE.get(), False)
+check("autocast/single forward skips extra scope",
+      [name for name, _ in run_amp_scope_case(batch_size=None)], ["forward", "end"])
+for label, settings in (("CPU", {"device": "cpu"}), ("disabled AMP", {"amp": False}),
+                        ("fast path", {"fast": object()}), ("compiled path", {"compiled": True})):
+    check("autocast/%s skips extra scope" % label,
+          [name for name, _ in run_amp_scope_case(**settings)], ["forward", "forward", "end"])
+with patch.object(torch, "is_autocast_enabled", return_value=True):
+    check("autocast/caller-owned scope needs no extra scope",
+          [name for name, _ in run_amp_scope_case()], ["forward", "forward", "end"])
+check("autocast/error closes scope before error and end hooks",
+      [name for name, _ in run_amp_scope_case(fail=True)], ["enter", "forward", "exit", "error", "end"])
 
 
 # --------------------------------------------------------------------------- report
