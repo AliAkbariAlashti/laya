@@ -96,6 +96,13 @@ describe("structured/projection", () => {
       { type: "object", properties: { x: { type: "integer", minimum: 0, maximum: 2 } } });
     expect(v.x).toBe(2);
   });
+  it("score without probabilities honours minimum when minimum != 0", () => {
+    const schema = { type: "object", properties: { x: { type: "integer", minimum: 3, maximum: 7 } } };
+    for (const [score, want] of [[0, 3], [2.4, 5], [4, 7]] as const) {
+      const got = answersToJson({ x: { type: "score", score } }, schema);
+      expect(got.x).toBe(want);
+    }
+  });
   it("null choice value projects back to null", () => {
     const v = answersToJson({ x: { type: "choice", choice: "null" } },
       { type: "object", properties: { x: { enum: ["a", null] } } });
@@ -154,7 +161,7 @@ describe("structured/rejections", () => {
 describe("structured/decide", () => {
   class FakeRunner {
     calls: { state: unknown; questions: unknown; opts: unknown }[] = [];
-    constructor(private answers: unknown) {}
+    constructor(private answers: any) {}
     async predict(state: unknown, questions: any, opts: any = {}) {
       this.calls.push({ state, questions, opts });
       return { answers: this.answers, usage: { input_tokens: 1, output_tokens: 0 },
