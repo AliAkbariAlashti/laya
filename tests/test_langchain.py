@@ -123,18 +123,29 @@ check("extract/blocks_mixed_skips_non_text",
 # The check below fails if a future langchain-core adds a non-text block that does declare one.
 # That is the moment to gate on `type` -- and the reason to have the check rather than a
 # comment asserting the vocabulary cannot change.
+#
+# Guarded because this suite is written to run *without* langchain-core installed: `DummyMessage`
+# stands in for a real message throughout, and the Windows job does not install the optional
+# dependency. An unguarded import here aborts the whole file at import time, taking the other
+# 200+ checks with it -- the same shape as the `decision/lcel` block at the end of this file.
 try:
-    from langchain_core.messages import content_blocks as _cb  # noqa: F401
-except ImportError:  # module layout moved between langchain-core versions
-    import importlib
-    _cb = importlib.import_module("langchain_core.messages.content")
+    try:  # module layout moved between langchain-core versions
+        from langchain_core.messages import content_blocks as _cb
+    except ImportError:
+        import importlib
+        _cb = importlib.import_module("langchain_core.messages.content")
+except ImportError:
+    _cb = None
 
-_TEXT_BEARING = sorted(n for n in dir(_cb)
-                       if isinstance(getattr(_cb, n, None), type)
-                       and n.endswith(("Block", "Result", "Annotation", "Call"))
-                       and "text" in (getattr(getattr(_cb, n), "__annotations__", {}) or {}))
-check("std/only_two_standard_blocks_declare_a_text_field",
-      _TEXT_BEARING, ["PlainTextContentBlock", "TextContentBlock"])
+if _cb is None:
+    PASS.append("std/block-vocabulary skipped (langchain-core not installed)")
+else:
+    _TEXT_BEARING = sorted(n for n in dir(_cb)
+                           if isinstance(getattr(_cb, n, None), type)
+                           and n.endswith(("Block", "Result", "Annotation", "Call"))
+                           and "text" in (getattr(getattr(_cb, n), "__annotations__", {}) or {}))
+    check("std/only_two_standard_blocks_declare_a_text_field",
+          _TEXT_BEARING, ["PlainTextContentBlock", "TextContentBlock"])
 
 # A `type` gate would also be a regression in the other direction: langchain-core accepts a
 # text block that carries no discriminator at all, and it keeps `.content` as a list.
