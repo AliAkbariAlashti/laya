@@ -333,7 +333,9 @@ def main() -> int:
     if bounded:
         schema = {"type": "object", "properties": {"field": {"type": "integer",
                                                              "minimum": 3, "maximum": 7}}}
-        for score, want in ((3, 3), (5, 5), (7, 7)):
+        # `score` is the 0-based level index (5 levels: 0..4 for minimum=3, maximum=7), never
+        # the absolute field value -- see `DecisionModel._decode_answers` in laya/agent.py.
+        for score, want in ((0, 3), (2, 5), (4, 7)):
             got = S.answers_to_json({"field": {"type": "score", "score": score}}, schema)
             check("projection/minimum + argmax for score %d" % score, got, {"field": want})
 

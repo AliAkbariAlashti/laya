@@ -211,7 +211,13 @@ def _project(answers: Dict[str, Any], fields: Sequence[_Field]) -> Dict[str, Any
             if probs:
                 idx = max(range(len(probs)), key=lambda i: float(probs.get(str(i), probs.get(i, 0.0))))
             else:
-                idx = int(round(float(answer.get("score", 0.0)))) - int(f.minimum or 0)
+                # `score` is always the probability-weighted 0-based level index (see
+                # `DecisionModel._decode_answers`), the same space `idx` is in above -- not an
+                # absolute field value -- so it is rounded on its own, with no `minimum`
+                # subtracted first. Subtracting it here and adding it back below used to cancel
+                # out, silently dropping `minimum` from every field whose schema does not start
+                # at 0.
+                idx = int(round(float(answer.get("score", 0.0))))
             values[f.name] = int(f.minimum or 0) + idx
         else:  # choice
             label = str(answer.get("choice"))
