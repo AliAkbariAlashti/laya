@@ -602,7 +602,10 @@ def test_cli_validate_and_dispatch(tmp_path):
 
     bad = tmp_path / "bad.jsonl"
     bad.write_text("{not json\n", encoding="utf-8")
-    assert evals_cli.main(["validate", str(bad)]) == 1
+    # A dataset that is not JSONL is a usage error, so exit 2 (docs/evals.md:28) -- not the 1
+    # that a threshold or baseline-tolerance failure uses. A CI job has to be able to tell
+    # "my dataset is broken" from "the model regressed".
+    assert evals_cli.main(["validate", str(bad)]) == 2
 
 
 def test_cli_compare_exit_codes(tmp_path):
@@ -615,6 +618,55 @@ def test_cli_compare_exit_codes(tmp_path):
                            "--tolerance", "choice_accuracy=0.02"]) == 0
     assert evals_cli.main(["compare", report, "--baseline", baseline,
                            "--tolerance", "choice_accuracy=0.001"]) == 1
+
+
+def test_cli_separates_a_usage_error_from_a_quality_failure(tmp_path, capsys):
+    """docs/evals.md:28 promises 0 / 1 / 2, and the three must stay distinguishable.
+
+    Everything the caller got wrong exits 2; only a real threshold or baseline-tolerance
+    failure exits 1. Before, `main` had a single error path returning 1, so a CI job could
+    not tell "my dataset is malformed" from "the model regressed" -- and a missing file escaped
+    as a raw traceback, a third outcome the docs never mention.
+    """
+    from laya import evals_cli
+
+    report = tmp_path / "report.json"
+    report.write_text(json.dumps({"overall": {"choice_accuracy": 0.80}}))
+    baseline = tmp_path / "baseline.json"
+    baseline.write_text(json.dumps({"overall": {"choice_accuracy": 0.79}}))
+
+    good = _write_dataset(tmp_path, [{"state": "s", "questions": Q, "expected": {"intent": "a"}}])
+
+    # --- exit 0: the request was well-formed ---
+    assert evals_cli.main(["validate", good]) == 0
+
+    # --- exit 2: the caller's mistake, and no traceback ---
+    usage = [
+        ("a dataset that is not JSONL", ["validate", _write_raw(tmp_path, "x.jsonl", "{oops\n")]),
+        ("a dataset with no examples", ["validate", _write_raw(tmp_path, "empty.jsonl", "")]),
+        ("a row missing 'expected'",
+         ["validate", _write_raw(tmp_path, "noexp.jsonl", json.dumps(
+             {"qid": "intent", "state": "s", "questions": Q}) + "\n")]),
+        ("a missing dataset file", ["validate", str(tmp_path / "nope.jsonl")]),
+        ("a missing baseline report", ["compare", str(report), "--baseline",
+                                       str(tmp_path / "nope.json")]),
+        ("an unparseable tolerance", ["compare", str(report), "--baseline", str(baseline),
+                                      "--tolerance", "choice_accuracy=abc"]),
+    ]
+    for label, argv in usage:
+        capsys.readouterr()
+        assert evals_cli.main(argv) == 2, label
+        assert "Traceback" not in capsys.readouterr().err, "%s leaked a traceback" % label
+
+    # --- exit 1: a real quality failure, still not a usage error ---
+    assert evals_cli.main(["compare", str(report), "--baseline", str(baseline),
+                           "--tolerance", "choice_accuracy=0.001"]) == 1
+
+
+def _write_raw(tmp_path, name, text):
+    path = tmp_path / name
+    path.write_text(text, encoding="utf-8")
+    return str(path)
 
 
 def test_cli_compare_fails_on_an_empty_report(tmp_path, capsys):
@@ -738,7 +790,7 @@ def test_cli_rejects_an_unusable_tolerance_before_loading_a_checkpoint(monkeypat
         if bad == "0.25":
             assert code == 0 and built == [None]
             continue
-        assert code == 1, "%r would name a metric that is always 1.0 or always 0.0" % bad
+        assert code == 2, "%r would name a metric that is always 1.0 or always 0.0" % bad
         assert "--score-within" in capsys.readouterr().err
         assert built == [None], "the flag is rejected before a checkpoint is loaded"
 
@@ -852,7 +904,9 @@ def test_cli_rejects_a_typo_in_a_pinned_checkpoint_name(tmp_path, monkeypatch, c
     recorded = {}
     _fake_router(monkeypatch, recorded)
     dataset = _write_dataset(tmp_path, [{"state": "s", "questions": Q, "expected": {"intent": "a"}}])
-    assert evals_cli.main(["run", dataset, "--revision", "englishg=" + SHA]) == 1
+    # The code's own comment calls this "a usage error", and docs/evals.md:28 gives usage
+    # errors exit 2. It used to exit 1, the code a threshold failure uses.
+    assert evals_cli.main(["run", dataset, "--revision", "englishg=" + SHA]) == 2
     err = capsys.readouterr().err
     assert "unknown model 'englishg'" in err
     assert "choose one of" in err, "the message comes from core, with the option list"

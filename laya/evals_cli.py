@@ -334,8 +334,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _cmd_run(args)
         return _cmd_compare(args)
     except EvalError as exc:
+        # A malformed dataset, an unreadable report, or a mistyped pin is a usage error, not a
+        # quality result. Returning 1 for these made "my dataset is broken" and "the model
+        # regressed" indistinguishable to a CI job, which is the one distinction the documented
+        # exit codes exist to draw. (argparse already exits 2 for a bad flag on its own.)
         print("laya-evals: %s" % exc, file=sys.stderr)
-        return 1
+        return 2
+    except FileNotFoundError as exc:
+        # A dataset or report path that does not exist is the caller's mistake. Narrowed twice on
+        # purpose. Bare `OSError` would swallow a Hub outage. `FileNotFoundError` still would too:
+        # huggingface_hub raises LocalEntryNotFoundError -- a failed *download*, subclassing
+        # FileNotFoundError -- when a checkpoint is not cached and cannot be fetched, and "the
+        # network is down" is an environment fault, not a usage error. Distinguishing the two by
+        # name is deliberate; a checkpoint that cannot be downloaded stays an unhandled failure,
+        # which is what it was before.
+        from huggingface_hub.errors import LocalEntryNotFoundError
+
+        if isinstance(exc, LocalEntryNotFoundError):
+            raise
+        print("laya-evals: %s" % exc, file=sys.stderr)
+        return 2
 
 
 if __name__ == "__main__":
