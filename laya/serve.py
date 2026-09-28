@@ -27,6 +27,7 @@ env var                    meaning                                        defaul
 ``LAYA_MAX_LOADED``        checkpoints kept resident at once. Below what  2
                            routing can choose, one reloads per switch.
 ``LAYA_API_KEY``           if set, require ``Authorization: Bearer <it>``  (none)
+``LAYA_ROOT_PATH``         public URL prefix behind a reverse proxy        (none)
 ``LAYA_LOG_LEVEL``         uvicorn log level                              info
 ``LAYA_MAX_CONCURRENT``    cap on requests past auth at once; excess      16
                            gets 503 (see below)
@@ -367,6 +368,7 @@ def create_app(router: Optional[Any] = None):
     app = FastAPI(
         title="laya-serve",
         summary="Laya System-1 decisions over the TypeSafe Jev /v1/systemone protocol",
+        root_path=os.environ.get("LAYA_ROOT_PATH", ""),
         lifespan=lifespan,
     )
 

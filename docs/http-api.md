@@ -22,6 +22,7 @@ Everything is environment variables, so one image serves a laptop dev run and a 
 |---|---|---|
 | `LAYA_HOST` | bind address | `0.0.0.0` |
 | `LAYA_PORT` | bind port | `8000` |
+| `LAYA_ROOT_PATH` | public URL prefix when served behind a reverse proxy | empty |
 | `LAYA_DEVICE` | torch device for every checkpoint | auto |
 | `LAYA_PRELOAD` | build the checkpoints at startup, not lazily | `1` |
 | `LAYA_MODELS` | comma list to preload (`english,multilingual,typed-decisions`); empty = all | all |
@@ -30,6 +31,11 @@ Everything is environment variables, so one image serves a laptop dev run and a 
 | `LAYA_API_KEY` | if set, require `Authorization: Bearer <key>` | none |
 | `LAYA_LOG_LEVEL` | uvicorn log level | `info` |
 | `LAYA_MAX_CONCURRENT` | requests admitted past auth at once; excess gets `503` | `16` |
+
+For a deployment published under a prefix such as `/laya`, set `LAYA_ROOT_PATH=/laya`.
+FastAPI uses it when generating OpenAPI and Swagger UI URLs. Configure the reverse proxy to
+strip `/laya` before forwarding requests to Laya; the app's routes remain `/health` and
+`/v1/systemone` internally.
 
 For containers, including CUDA and ARM64 images, see [Docker quickstart](docker.md).
 
