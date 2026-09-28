@@ -100,8 +100,11 @@ _CONTROLS_DOC = (
     "checkpoint and selects that checkpoint's per-language calibration. "
     "max_len / head_max_len: positive integers overriding the answering token budget for this call "
     "only -- head_max_len is the option-and-instructions budget, so raise it when a choice question "
-    "has many options and the answers look like the labels blur together. Leave any of them unset to "
-    "keep the checkpoint's own default."
+    "has many options and the answers look like the labels blur together. "
+    "min_confidence: a number in [0, 1] -- an answer whose calibrated confidence falls below it is "
+    "flagged 'low_confidence' (and, on laya_decide, its value comes back null), so a caller that "
+    "must not act on a guess can set it. Leave any of them unset to keep the checkpoint's own "
+    "default."
 )
 
 
@@ -248,6 +251,7 @@ def laya_predict_tool(
     lang: str | None = None,
     max_len: int | None = None,
     head_max_len: int | None = None,
+    min_confidence: float | None = None,
 ) -> str:
     """Answer typed questions (choice/score/noul) over any state in one forward pass."""
     router = _router_or_error()
@@ -260,6 +264,7 @@ def laya_predict_tool(
         lang=lang,
         max_len=max_len,
         head_max_len=head_max_len,
+        min_confidence=min_confidence,
         router=router,
     )
 
@@ -332,6 +337,7 @@ def laya_shortlist_tool(
     lang: str | None = None,
     max_len: int | None = None,
     head_max_len: int | None = None,
+    min_confidence: float | None = None,
 ) -> str:
     """Shortlist many-option choice questions, then answer."""
     # k's default mirrors laya.shortlist.DEFAULT_SHORTLIST_K; it is a literal
@@ -348,6 +354,7 @@ def laya_shortlist_tool(
         lang=lang,
         max_len=max_len,
         head_max_len=head_max_len,
+        min_confidence=min_confidence,
         router=router,
     )
 
@@ -386,6 +393,7 @@ def laya_preset_tool(
     lang: str | None = None,
     max_len: int | None = None,
     head_max_len: int | None = None,
+    min_confidence: float | None = None,
 ) -> str:
     """Run a built-in workflow preset; the tool description carries the names and state fields."""
     router = _router_or_error()
@@ -397,6 +405,7 @@ def laya_preset_tool(
         lang=lang,
         max_len=max_len,
         head_max_len=head_max_len,
+        min_confidence=min_confidence,
         router=router,
         preset_builder=_preset_builder,
     )
@@ -412,13 +421,18 @@ def laya_preset_tool(
         "when the caller already knows the answer shape and wants values projected onto the "
         "schema (enum member, integer level, boolean) plus per-field confidence, instead of "
         "an answer map to parse by hand. "
+        "min_confidence: a number in [0, 1] -- a field whose answer falls below it comes back as "
+        "null in values (its confidence is still reported), so a caller that must not act on a "
+        "guess can abstain per field. "
         + _GUARDRAILS
     ),
 )
-def laya_decide_tool(state: dict, schema: dict, model: str = "auto") -> str:
+def laya_decide_tool(state: dict, schema: dict, model: str = "auto",
+                     min_confidence: float | None = None) -> str:
     """Answer a JSON-schema-shaped decision and return the decided values."""
     router = _router_or_error()
-    return _wrap(laya_decide, state=state, schema=schema, model=model, router=router)
+    return _wrap(laya_decide, state=state, schema=schema, model=model,
+                 min_confidence=min_confidence, router=router)
 
 
 def main() -> None:

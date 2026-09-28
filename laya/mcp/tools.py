@@ -5,6 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any, Callable, Protocol, Sequence
 
+from ..confidence import check_min_confidence
 from ..presets import state_field
 from .device import agent_device, device_report, router_agent
 
@@ -293,6 +294,23 @@ def validate_budget(value: Any, name: str) -> int | None:
     return value
 
 
+def validate_min_confidence(value: Any) -> float | None:
+    """The per-call abstention threshold (``min_confidence``), or ``None`` when unset.
+
+    Range, booleans and non-finite values are core's rule, not this layer's, so it defers to
+    ``laya.confidence.check_min_confidence`` and only wraps its ``ValueError`` as a clean
+    ``invalid_min_confidence`` the client can read -- the way ``validate_task`` carries core's
+    task list instead of restating it. ``None`` means "answer everything", which is the flag's
+    meaning on the CLI and the checkpoint default on every surface.
+    """
+    if value is None:
+        return None
+    try:
+        return check_min_confidence(value)
+    except (TypeError, ValueError) as exc:
+        raise ToolError("invalid_min_confidence", str(exc)) from None
+
+
 def _overrides(task: Any, lang: Any, max_len: Any, head_max_len: Any) -> dict:
     """The per-call controls as keyword arguments, with the unset ones left out.
 
@@ -344,6 +362,7 @@ def laya_predict(
     lang: Any = None,
     max_len: Any = None,
     head_max_len: Any = None,
+    min_confidence: Any = None,
     router: Any = None,
     agent: Any = None,
 ) -> dict:
@@ -353,8 +372,9 @@ def laya_predict(
 
     ``task``/``lang`` are the router's own overrides (an explicit ``model`` outranks an explicit
     ``task``, which outranks an explicit ``lang``); ``max_len``/``head_max_len`` override the token
-    budget the answering checkpoint was configured with. None of them is forwarded unless set, so a
-    router or agent that predates those keywords keeps working.
+    budget the answering checkpoint was configured with; ``min_confidence`` flags any answer whose
+    calibrated confidence falls below it with ``low_confidence: true``. None of them is forwarded
+    unless set, so a router or agent that predates those keywords keeps working.
     """
     state_d = validate_state(state)
     questions_d = validate_questions(questions)
@@ -366,6 +386,11 @@ def laya_predict(
         validate_budget(max_len, "max_len"),
         validate_budget(head_max_len, "head_max_len"),
     )
+    min_conf = validate_min_confidence(min_confidence)
+    if min_conf is not None:
+        # Only when set, so a call that abstains over nothing stays byte-identical to the one
+        # that made no ``min_confidence`` keyword exist.
+        budget["min_confidence"] = min_conf
     # `task` picks a checkpoint by saying what the work is, so it means nothing once one is pinned:
     # `Router._route` checks an explicit `model` first and never reaches the task, and
     # `Agent.system_one` does not accept the keyword at all. Both would answer as if it were unset,
@@ -560,6 +585,7 @@ def laya_shortlist(
     lang: Any = None,
     max_len: Any = None,
     head_max_len: Any = None,
+    min_confidence: Any = None,
     router: Any = None,
     agent: Any = None,
     embed_fn: Callable[[Sequence[str]], Any] | None = None,
@@ -579,7 +605,8 @@ def laya_shortlist(
     ``head_max_len`` matters more here than anywhere else: shortlisting exists
     because a large label set shares that budget, and narrowing to ``k`` is only
     half of the fix. The budget override reaches the answering forward pass;
-    ``task``/``lang`` reach the route that chose the checkpoint.
+    ``task``/``lang`` reach the route that chose the checkpoint; ``min_confidence``
+    flags a kept-label answer the checkpoint is unsure of.
     """
     # Lazy: keeps numpy/shortlist out of module import for laya.mcp.tools.
     from laya.shortlist import (
@@ -595,6 +622,11 @@ def laya_shortlist(
     routing_overrides = _overrides(validate_task(task), validate_lang(lang), None, None)
     budget = _overrides(None, None, validate_budget(max_len, "max_len"),
                         validate_budget(head_max_len, "head_max_len"))
+    min_conf = validate_min_confidence(min_confidence)
+    if min_conf is not None:
+        # Forwarded to the answering predict the same way the budget is, so a shortlisted field the
+        # model reads with low confidence comes back flagged rather than as a confident-looking pick.
+        budget["min_confidence"] = min_conf
     # Same rule as `laya_predict`: a checkpoint is already pinned, so `task` has nothing left to
     # decide -- and it is a routing keyword, which the answering `system_one` does not accept.
     if model_name != AUTO and "task" in routing_overrides:
@@ -687,6 +719,7 @@ def laya_preset(
     lang: Any = None,
     max_len: Any = None,
     head_max_len: Any = None,
+    min_confidence: Any = None,
     router: Any = None,
     agent: Any = None,
     preset_builder: Callable[[str], dict] | None = None,
@@ -700,8 +733,9 @@ def laya_preset(
     shape and is passed through untouched.
 
     The preset fixes the questions, not the route or the budget, so the per-call controls a
-    hand-written :func:`laya_predict` takes are available here too -- most usefully ``lang``, since
-    a preset's instructions are English text whatever state they read.
+    hand-written :func:`laya_predict` takes -- ``task``/``lang``/``max_len``/``head_max_len`` and
+    ``min_confidence`` -- are available here too; most usefully ``lang``, since a preset's
+    instructions are English text whatever state they read.
     """
     preset_name = validate_preset(preset)
     state_d = validate_state(state)
@@ -721,6 +755,7 @@ def laya_preset(
         lang=lang,
         max_len=max_len,
         head_max_len=head_max_len,
+        min_confidence=min_confidence,
         router=router,
         agent=agent,
     )
@@ -935,6 +970,7 @@ def laya_decide(
     schema: Any,
     model: Any = "auto",
     *,
+    min_confidence: Any = None,
     router: Any = None,
     agent: Any = None,
 ) -> dict:
@@ -947,6 +983,11 @@ def laya_decide(
     answer is ``values`` -- enum members, integer levels, booleans -- beside the
     per-field ``confidence``/``probabilities`` and the usual routing/device/
     latency metadata, so a client never parses an answer map by hand.
+
+    ``min_confidence`` is ``laya.decide``'s own abstention control, not a generic
+    predict keyword: a field whose answer falls below it comes back as ``null`` in
+    ``values`` -- the raw answer stays in ``confidence``/``probabilities`` -- so a
+    client that trusts the values can tell "not confident" from a confident pick.
     """
     # Lazy: keeps laya.structured (pure Python, but a module import is still a
     # module import) out of this module's import-time surface.
@@ -954,6 +995,7 @@ def laya_decide(
 
     state_d = validate_state(state)
     model_name = validate_model(model)
+    min_conf = validate_min_confidence(min_confidence)
     try:
         # `decide` validates the schema itself (SchemaError names the offending
         # path) and projects the answers; calling it with return_details keeps
@@ -962,14 +1004,16 @@ def laya_decide(
         if model_name == "auto":
             if router is None:
                 raise ToolError("models_not_ready", "Router is not loaded (auto mode)")
-            details = decide(router, state_d, schema=schema, return_details=True)
+            details = decide(router, state_d, schema=schema, return_details=True,
+                            min_confidence=min_conf)
         elif agent is not None:
-            details = decide(agent, state_d, schema=schema, return_details=True)
+            details = decide(agent, state_d, schema=schema, return_details=True,
+                            min_confidence=min_conf)
         else:
             if router is None:
                 raise ToolError("models_not_ready", "no agent/router loaded")
             details = decide(router, state_d, schema=schema, return_details=True,
-                             model=model_name)
+                            model=model_name, min_confidence=min_conf)
     except SchemaError as exc:
         raise ToolError("invalid_schema", str(exc)) from exc
     latency_ms = (time.perf_counter() - started) * 1000.0
