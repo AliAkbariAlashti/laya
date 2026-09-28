@@ -71,6 +71,45 @@ msgs = [
 check("extract/messages_list", _extract_text(msgs), "second human message")
 check("extract/dict_with_messages", _extract_text({"messages": msgs}), "second human message")
 
+
+# A message `content` is not only a string. langchain-core accepts
+# `HumanMessage(content=[{"type": "text", "text": ...}])` and keeps `.content` as a list, so
+# `str(content)` used to hand Laya a Python repr -- braces, quotes, and the literal field
+# names -- as the state to decide on. Nothing raised, so the guardrail just answered about a
+# string the caller never wrote. `DummyMessage` is the local stand-in for that shape.
+TXT = "I was billed twice for the same plan."
+BLOCKS = [{"type": "text", "text": TXT}]
+
+check("extract/blocks_human_message", _extract_text([DummyMessage("human", BLOCKS)]), TXT)
+check("extract/blocks_ai_message_fallback", _extract_text([DummyMessage("ai", BLOCKS)]), TXT)
+check("extract/blocks_newest_human_wins",
+      _extract_text([DummyMessage("human", BLOCKS), DummyMessage("ai", BLOCKS)]), TXT)
+check("extract/blocks_dict_messages",
+      _extract_text({"messages": [DummyMessage("human", BLOCKS)]}), TXT)
+check("extract/blocks_dict_content", _extract_text({"content": BLOCKS}), TXT)
+check("extract/blocks_dict_input", _extract_text({"input": BLOCKS}), TXT)
+check("extract/blocks_bare_list", _extract_text(BLOCKS), TXT)
+
+# Several text blocks are read in order; the separator is a newline so two sentences do not
+# fuse into one token the model reads differently than the caller wrote.
+check("extract/blocks_multiple_joined",
+      _extract_text([DummyMessage("human", [{"type": "text", "text": "first part."},
+                                            {"type": "text", "text": "second part."}])]),
+      "first part.\nsecond part.")
+
+# A block with no text carries nothing to score. Rather than invent prose, the value is
+# passed through as the caller shaped it, so a structured state stays structured.
+check("extract/blocks_non_text_only_preserved",
+      _extract_text([DummyMessage("human", [{"type": "image_url", "image_url": {"url": "x"}}])]),
+      [{"type": "image_url", "image_url": {"url": "x"}}])
+check("extract/blocks_empty_list_preserved", _extract_text([]), "")
+
+# Mixed blocks: only the text-bearing ones are read, and their order is kept.
+check("extract/blocks_mixed_skips_non_text",
+      _extract_text([DummyMessage("human", [{"type": "image_url", "image_url": {"url": "x"}},
+                                            {"type": "text", "text": TXT}])]),
+      TXT)
+
 # Custom callable extractor
 check("extract/custom_callable", _extract_text({"custom": "special"}, lambda x: x["custom"].upper()), "SPECIAL")
 
