@@ -333,7 +333,19 @@ class ONNXAgent(HookRegistry):
                     raise TypeError(
                         "predict_batch expects a list of states; pass a single state to predict()/system_one()."
                     )
+                if not isinstance(questions, dict):
+                    raise TypeError(
+                        "questions must be a dict of question id -> definition, got %s"
+                        % type(questions).__name__
+                    )
                 states = list(states)
+                if any(state is None for state in states):
+                    # `serialize_state(None)` is `json.dumps(None)`, so a missing state would
+                    # otherwise be answered as a decision about the literal text "null",
+                    # byte-identical to passing `"null"` and at full confidence.
+                    raise TypeError(
+                        "state must not be None; pass a string, dict, or list"
+                    )
                 if not states:
                     ctx.results = []
                 else:
