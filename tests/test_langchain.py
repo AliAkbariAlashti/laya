@@ -110,6 +110,73 @@ check("extract/blocks_mixed_skips_non_text",
                                             {"type": "text", "text": TXT}])]),
       TXT)
 
+# --- why `block.get("text")` is not too broad -------------------------------------------
+# A dict block is read on the strength of its `text` field, with no `type` gate. That is safe
+# against langchain-core's own vocabulary rather than by luck: of the standard content blocks,
+# exactly two declare a `text` field -- TextContentBlock (`type: "text"`) and
+# PlainTextContentBlock (`type: "text-plain"`, a document body). Every other one carries its
+# payload elsewhere or not at all: image/video/audio/file hold `url`/`base64`/`file_id`,
+# ReasoningContentBlock holds `reasoning`, NonStandardContentBlock holds `value`, and the
+# tool-call and server-tool blocks hold `name`/`args`/`id`. None of them has a `text` field, so
+# there is no standard non-text block this heuristic can mistake for prose.
+#
+# The check below fails if a future langchain-core adds a non-text block that does declare one.
+# That is the moment to gate on `type` -- and the reason to have the check rather than a
+# comment asserting the vocabulary cannot change.
+try:
+    from langchain_core.messages import content_blocks as _cb  # noqa: F401
+except ImportError:  # module layout moved between langchain-core versions
+    import importlib
+    _cb = importlib.import_module("langchain_core.messages.content")
+
+_TEXT_BEARING = sorted(n for n in dir(_cb)
+                       if isinstance(getattr(_cb, n, None), type)
+                       and n.endswith(("Block", "Result", "Annotation", "Call"))
+                       and "text" in (getattr(getattr(_cb, n), "__annotations__", {}) or {}))
+check("std/only_two_standard_blocks_declare_a_text_field",
+      _TEXT_BEARING, ["PlainTextContentBlock", "TextContentBlock"])
+
+# A `type` gate would also be a regression in the other direction: langchain-core accepts a
+# text block that carries no discriminator at all, and it keeps `.content` as a list.
+for _shape, _label in (([{"text": TXT}], "untyped_text_block"),
+                       ([{"type": "text-plain", "text": TXT}], "text_plain_block")):
+    check("extract/blocks_%s" % _label, _extract_text([DummyMessage("human", _shape)]), TXT)
+
+# A `text` field that is not a string is payload, not prose, and must not be flattened.
+check("extract/blocks_non_string_text_is_not_prose",
+      _extract_text([DummyMessage("human", [{"type": "x", "text": {"nested": 1}}])]),
+      [{"type": "x", "text": {"nested": 1}}])
+
+# --- the return annotation has to admit what the function can actually return -------------
+# `_content_text` passes a content value back untouched when it holds no text block, so this
+# helper returns a list for a message carrying only structured content, and the entry itself
+# for a list entry with no `.content`. Both are accepted by `Agent._encode_state`
+# (`state: Union[str, dict, list]`) and already declared by the public `_extract_text`. An
+# annotation of `-> str` was therefore wrong, and could drift back unnoticed without this.
+import typing as _typing  # noqa: E402
+
+# `langchain_module` is the module this file already imports; `_extract_from_messages_list` is
+# private, so it is reached through the module rather than the from-import above.
+_ANNOTATED = _typing.get_type_hints(langchain_module._extract_from_messages_list).get("return")
+if _typing.get_origin(_ANNOTATED) is _typing.Union:
+    _ALLOWED = _typing.get_args(_ANNOTATED)
+else:  # a bare annotation admits only that one type
+    _ALLOWED = (_ANNOTATED,)
+
+_RUNTIME = [
+    (str, [DummyMessage("human", "plain")]),
+    (str, [DummyMessage("human", [{"type": "text", "text": TXT}])]),
+    (list, [DummyMessage("human", [{"type": "image_url", "image_url": {"url": "x"}}])]),
+    (list, [DummyMessage("ai", "prior"), DummyMessage("human", [{"type": "file", "file_id": "f"}])]),
+    (dict, [{"kind": "a"}, {"kind": "b"}]),
+    (str, []),
+]
+for _want, _msgs in _RUNTIME:
+    _got = langchain_module._extract_from_messages_list(_msgs)
+    check("contract/messages_list_returns_%s" % _want.__name__, _got.__class__, _want)
+    check("contract/annotation_admits_%s" % _want.__name__,
+          _got.__class__ in _ALLOWED, True)
+
 # Custom callable extractor
 check("extract/custom_callable", _extract_text({"custom": "special"}, lambda x: x["custom"].upper()), "SPECIAL")
 

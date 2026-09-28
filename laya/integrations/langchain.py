@@ -106,7 +106,13 @@ def _extract_from_message_or_value(val: Any) -> Any:
     return val
 
 
-def _extract_from_messages_list(msgs: Sequence[Any]) -> str:
+def _extract_from_messages_list(msgs: Sequence[Any]) -> Union[str, dict, list]:
+    # Not `-> str`. `_content_text` hands a content value back untouched when it holds no
+    # text block, so a message carrying only structured content returns that list, and a list
+    # entry with no `.content` returns the entry itself. Both are states `Agent._encode_state`
+    # already accepts (`state: Union[str, dict, list]`, documented as a conversation turn list),
+    # and the public `_extract_text` above already declares the same three types -- so this
+    # widens the annotation to match the behaviour, not the behaviour to match the annotation.
     if not msgs:
         return ""
     # Search backwards for the most recent human/user message
