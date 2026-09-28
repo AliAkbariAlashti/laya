@@ -5,13 +5,28 @@ const QUOTE_HEADERS: RegExp[] = [
   /^\s*-{2,}\s*(Original|Forwarded) Message\s*-{2,}/i,
   /^\s*-{2,}\s*(Mensagem (original|encaminhada)|Mensaje (original|reenviado))\s*-{2,}/i,
   /^\s*_{8,}\s*$/,
-  /^\s*From:\s.+$/i,
+  // `From:` opens ordinary prose too ("From: my side the integration works, but please
+  // refund..."), and a reply header always carries the sender, so the header is only recognised
+  // when an address follows -- the same rule as `De:` below. A bare `From: Name` header is
+  // caught by HEADER_FROM_NAME/HEADER_NEXT instead, which need the header's own `Sent:`/`Date:`
+  // line to tell it apart from a sentence.
+  /^\s*From:\s.*[@<]/i,
+  // `De:` also opens ordinary Portuguese/Spanish lines ("De: 10/09 a 15/09"), so the Outlook
+  // header is only recognised when it carries an address
   /^\s*De:\s.*[@<]/i,
 ];
 const ATTRIBUTION_TAIL = /^.{0,120}\S@\S+\s+(wrote|escreveu|escribi[óo]):\s*$/i;
 const ATTRIBUTION_HEAD = /^\s*(On|Em|El) (?=.*\d)/i;
-const HEADER_FROM_NAME = /^\s*De:\s+\S/i;
-const HEADER_NEXT = /^\s*(Enviad[oa]( em| el)?:\s|(Data|Fecha):\s.*\d{4})/i;
+// Exchange often leaves the address out of Outlook's reply header ("De: Maria Souza"), so a bare
+// `De:` only cuts when the header's own `Enviado:` line, or a dated `Data:`/`Fecha:` line, follows
+// it. `Para:` is not enough: "De: 10/09 / Para: 15/09" is how a leave request reads.
+//
+// The same is true of a bare English `From: Maria Souza`, which is why the marker above needs
+// this rule: the English client lines are the translations of the two `De:` neighbours. A line
+// that only looks like prose still has to be told apart from a header by its neighbours, so the
+// English pair is "From: <name>" followed by "Sent:"/"Date:".
+const HEADER_FROM_NAME = /^\s*(De|From):\s+\S/i;
+const HEADER_NEXT = /^\s*(Enviad[oa]( em| el)?:\s|Sent:\s|(Data|Fecha|Date):\s.*\d{4})/i;
 // A closing line is the closing word plus punctuation and at most a name. Anything else on
 // the line is a sentence, and the case of the next word is what separates the two: a name is
 // capitalised, "for" in "Thanks for the quick reply." is not. JS regexes have no scoped
@@ -19,9 +34,9 @@ const HEADER_NEXT = /^\s*(Enviad[oa]( em| el)?:\s|(Data|Fecha):\s.*\d{4})/i;
 // case-insensitively here and the name is checked case-sensitively by SIGNOFF_TAIL.
 const SIGNOFF_HEAD =
   /^\s*(?:best|kind|warmest|warm|many thanks|thanks|thank you|regards|cheers|sincerely)(?:\s+(?:and|&)\s+regards|\s+(?:regards|wishes|again|in advance|a lot|so much|very much))?/i;
-// Python's name class [^\W\d_a-zß-öø-ÿ] is "a word char that is not a digit, underscore or
-// lowercase letter"; \p{Lu}/\p{Lt}/\p{Lo} is the same intent: a name is capitalised in any
-// script (Regards, Łukasz) or written in a script without case (山田).
+// The name's first letter must not be lowercase, so the check is per character, not per script:
+// \p{Lu}/\p{Lt}/\p{Lo} accepts a name capitalised in any script (Regards, Łukasz) or written in
+// a script without case (山田). Python asks the same question per token (`_is_english_signoff`).
 const SIGNOFF_TAIL = /^[\s,;:!.]*(?:[\p{Lu}\p{Lt}\p{Lo}][\p{L}\p{M}\p{N}_'-]*[\s,.]*){0,3}$/u;
 function isEnglishSignoff(line: string): boolean {
   const m = SIGNOFF_HEAD.exec(line);

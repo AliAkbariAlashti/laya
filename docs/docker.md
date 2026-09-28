@@ -48,6 +48,12 @@ The sample rejects unavailable CUDA before loading a checkpoint. Laya can still
 fall back to CPU after a memory or inference error, so inspect its warnings.
 Rebuild when switching between CPU and CUDA configurations.
 
+The image sets `TORCH_DISABLE_NATIVE_JIT=1`. PyTorch 2.14 otherwise replaces some eager
+CUDA ops with Triton kernels that it compiles on the first inference, which needs a C
+compiler the slim image does not carry: the container reports healthy and then fails every
+request (#365). The stock kernels give the same answers at the same latency. Set the same
+variable on a bare-metal install if `predict` fails with `Failed to find C compiler`.
+
 This uses [Compose GPU reservations](https://docs.docker.com/compose/how-tos/gpu-support/).
 Windows requires Docker Desktop's supported WSL2 GPU setup. Apple MPS,
 AMD/ROCm and Intel GPU containers are outside this quickstart; use CPU unless
@@ -62,8 +68,11 @@ work with `docker run -e`; Compose-only settings are identified below.
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `LAYA_DEVICE` | `cpu` / `cuda` | Device selected by the base / GPU configuration |
+| `LAYA_CUDA_AMP` | unset (checkpoint's `amp_dtype`) | `fp16` or `bf16` for the CUDA forward. Not cosmetic: the README's threshold section measures bf16 flipping 3 of 864 argmaxes on the parity set where fp16 flips none |
+| `LAYA_CPU_AMP` | unset | `bf16` opts the CPU forward into bf16; anything else leaves it fp32 |
 | `LAYA_MODEL` | `auto` | Router alias: `auto`, `english`, `multilingual`, `typed-decisions` |
 | `LAYA_MODEL_PATH` | unset | Compatible checkpoint path inside the container |
+| `LAYA_REVISION` | unset | Hub commit, branch or tag used for every checkpoint download, or `reviewed` for the reviewed SHAs in `laya/revisions.py`; a `revision=` argument still wins |
 | `LAYA_REQUEST_FILE` | bundled request | JSON request path inside the container |
 | `OMP_NUM_THREADS` | `4` | CPU threads; keep within available cores |
 | `HF_TOKEN` / `HF_TOKEN_FILE` | unset | Optional Hugging Face credential |
@@ -77,7 +86,9 @@ work with `docker run -e`; Compose-only settings are identified below.
 | `LAYA_TORCH_VERSION` | `2.14.0` | **Compose build:** pinned PyTorch version |
 
 Compose forwards the runtime variables except `HF_HOME`, which stays aligned
-with its fixed cache mount. If overriding `HF_HOME` in `docker run` or your own
+with its fixed cache mount, and except `LAYA_MPS_AMP_MIN_ROWS`, the MPS row gate,
+which no image here can reach because no container here can select MPS.
+If overriding `HF_HOME` in `docker run` or your own
 Compose file, provide a matching mount writable by UID 10001. Direct Docker
 builds select PyTorch with `--build-arg TORCH_INDEX=cu128`; runtime `-e` cannot
 change the installed wheel.
@@ -206,6 +217,13 @@ The service has a healthcheck on `/health`. The server preloads before it starts
 listening, so with `LAYA_PRELOAD=1` a healthy container has its checkpoints loaded.
 `docker compose ... up -d --wait laya-serve` returns once it is healthy.
 
+`/health` reports `device` as the device a resident checkpoint actually computes
+on, which is not always what `LAYA_DEVICE` asked for: a checkpoint that wants a
+GPU it cannot get falls back to CPU silently and still answers correctly.
+`checkpoint_devices` names each loaded checkpoint, and `device_is_preference` is
+`true` only while nothing is resident, so a deployment that quietly lost its GPU
+says so instead of echoing its own configuration back.
+
 ### Server configuration
 
 These apply to the `laya-serve` service only.
@@ -219,8 +237,11 @@ These apply to the `laya-serve` service only.
 | `LAYA_MODELS` | (all) | comma list to preload: `english,multilingual,typed-decisions` |
 | `LAYA_THREADS` | `OMP_NUM_THREADS` | caps torch intra-op threads; keep at or below physical cores |
 | `LAYA_AUTO_TASK` | `0` | `1` lets the router reach `typed-decisions` automatically |
+| `LAYA_MAX_LOADED` | `2` | Checkpoints kept resident; `LAYA_AUTO_TASK` makes a third reachable on demand, and a cap below what routing chooses rebuilds one per switch |
+| `LAYA_MAX_CONCURRENT` | `16` | requests admitted at once; later ones get `503` (a value that does not parse, or is not positive, falls back to `16`) |
 | `LAYA_LOG_LEVEL` | `info` | uvicorn log level |
 | `LAYA_API_KEY` | (none) | when set, requires `Authorization: Bearer <key>` |
+| `LAYA_MAX_TOKEN_BUDGET` | `8192` | cap on per-request `max_len` and `head_max_len` overrides |
 
 `LAYA_PRELOAD` defaults to `0` here rather than the package default of `1`, because
 preloading makes the first boot download all three checkpoints. Set it to `1` for a

@@ -2,16 +2,73 @@
 import json
 import math
 import os
+import threading
+from contextlib import nullcontext
+from contextvars import ContextVar
+from functools import wraps
 from typing import Dict, List, Optional, Union
 
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 QTYPES = {"choice": 0, "score": 1, "noul": 2}
 QTYPE_NAMES = {v: k for k, v in QTYPES.items()}
 _DEFAULT_NOUL_LABELS = {"false": "false", "true": "true"}
+
+# A fast tokenizer is not read-only: `truncation=True` / `padding=True` make it call
+# `enable_truncation` / `enable_padding`, which mutates the shared Rust object. One tokenizer is
+# parsed per checkpoint directory and shared by every Agent that wants it, so concurrent
+# `predict()` calls -- on one Agent or on two sharing the cache -- raced and raised
+# `RuntimeError: Already borrowed`. Serialise encoding instead: it is a small fraction of a call
+# next to the forward pass, and this keeps the cache's single parse.
+_TOKENIZE_LOCK = threading.RLock()
+_QUESTION_TOKEN_CACHE = ContextVar("laya_question_token_cache", default=None)
+
+
+def encode_text(tok, text, **kwargs):
+    """Tokenize `text` while holding the lock a shared fast tokenizer needs."""
+    with _TOKENIZE_LOCK:
+        return tok(text, **kwargs)
+
+
+def _reuse_question_tokens(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        # One cache per prediction call: nested calls get their own scope, and exceptions
+        # restore the outer scope. Nothing is retained on an Agent or shared across threads.
+        scope = {"thread": threading.get_ident(), "tokens": {}}
+        token = _QUESTION_TOKEN_CACHE.set(scope)
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            # A timed hook can copy this context to a worker that outlives the call.
+            scope["tokens"] = None
+            _QUESTION_TOKEN_CACHE.reset(token)
+    return wrapped
+
+
+def _disable_question_token_reuse():
+    scope = _QUESTION_TOKEN_CACHE.get()
+    if scope is not None:
+        scope["tokens"] = None
+
+
+def _encode_question_text(tok, text, **kwargs):
+    scope = _QUESTION_TOKEN_CACHE.get()
+    cache = scope["tokens"] if scope is not None and scope["thread"] == threading.get_ident() else None
+    if cache is None:
+        return encode_text(tok, text, **kwargs)["input_ids"]
+    # Key the rendered, mask-sanitized text and encoding settings, not a JSON question:
+    # option order, structured criteria and custom noul labels must keep their meaning.
+    key = (id(tok), text, tuple(kwargs.items()))
+    if key not in cache:
+        # Keep the tokenizer alive so its identity cannot be reused within this scope.
+        cache[key] = (tok, tuple(encode_text(tok, text, **kwargs)["input_ids"]))
+    # Sequence assembly must not mutate token lists retained for later states.
+    return list(cache[key][1])
 
 
 def serialize_state(state: Union[str, dict, list]) -> str:
@@ -84,32 +141,40 @@ def build_sequence(
     option_order: Optional[List[int]] = None,
     truncate_left: bool = False,
     state_ids: Optional[List[int]] = None,
+    return_stats: bool = False,
 ):
     """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP].
 
     `state_ids` lets a caller tokenize the shared state once and reuse it across every question,
     instead of re-serializing and re-tokenizing the same document per question.
+
+    `return_stats` adds a third return value describing what the head budget did to the options:
+    `options` (how many the question defines), `options_distinct` (how many still have a token
+    span of their own) and `tokens_per_option` (the cap applied to each, or None when none was).
     """
     mask_tok = tok.mask_token
     opts = render_options(q)
     order = option_order if option_order is not None else list(range(len(opts)))
     ins = str(q["ins"]).replace(mask_tok, " ")
-    head_ids = tok("%s question: %s" % (q["t"], ins), add_special_tokens=False)["input_ids"]
+    head_ids = _encode_question_text(tok, "%s question: %s" % (q["t"], ins), add_special_tokens=False)
     opt_ids = []
     for i in order:
         # Cap at the tokenizer, not after the fact: `[:48]` still makes the tokenizer process the
         # whole (possibly long) description. truncation=True, max_length=48 keeps the first 48
         # tokens, which is exactly what the previous slice produced.
-        opt_tokens = tok(
+        opt_tokens = _encode_question_text(
+            tok,
             " " + opts[i].replace(mask_tok, " "),
             add_special_tokens=False,
             truncation=True,
             max_length=48,
-        )["input_ids"]
+        )
         opt_ids.append([tok.mask_token_id] + opt_tokens)
     opt_budget = head_max_len - sum(len(o) for o in opt_ids)
+    per_option = None
     if opt_budget < 16:
         per = max(4, (head_max_len - 16) // max(1, len(opt_ids)))
+        per_option = per
         opt_ids = [o[:per] for o in opt_ids]
         opt_budget = head_max_len - sum(len(o) for o in opt_ids)
     head_ids = head_ids[: max(8, opt_budget)]
@@ -121,27 +186,128 @@ def build_sequence(
     ids.append(tok.sep_token_id)
     room = max(0, max_len - len(ids) - 1)
     if state_ids is None:
-        state_ids = tok(serialize_state(state).replace(mask_tok, " "), add_special_tokens=False)["input_ids"]
+        state_ids = encode_text(tok, serialize_state(state).replace(mask_tok, " "),
+                                add_special_tokens=False)["input_ids"]
     # not state_ids[-room:]: with no room left, state_ids[-0:] is the whole state rather than none of it
     st = state_ids[max(0, len(state_ids) - room):] if truncate_left else state_ids[:room]
     ids = ids + st + [tok.sep_token_id]
-    return ids[:max_len], [m for m in markers if m < max_len]
+    ids, markers = ids[:max_len], [m for m in markers if m < max_len]
+    if not return_stats:
+        return ids, markers
+    # Two options that share a prefix can come out of the cut as the same token span: the marker
+    # count still matches the option count, so the guard in `Agent._encode_state` passes and
+    # nothing downstream can tell that the question lost the ability to name them apart. Counted
+    # on the capped option ids, before assembly: re-slicing the finished sequence cannot close
+    # the last option's span -- it runs on into the serialized state, which differs per request,
+    # so the last option always looks distinguishable however it collided (#538).
+    return ids, markers, {
+        "options": len(opt_ids),
+        "options_distinct": len({tuple(o) for o in opt_ids}),
+        "tokens_per_option": per_option,
+    }
+
+
+def collapsed_options(qids, items) -> Dict[str, Dict[str, Optional[int]]]:
+    """The questions whose options no longer have a token span each, from per-item stats.
+
+    `total` is the number of options the question defines, not the number of markers that
+    reached the sequence: a report counted from the markers would say "43/58" about a request
+    where 28 options never made it into the input at all.
+    """
+    out = {}
+    for qid, item in zip(qids, items):
+        stats = item.get("options")
+        if stats and stats["options_distinct"] < stats["options"]:
+            out[qid] = {"total": stats["options"], "distinct": stats["options_distinct"],
+                        "tokens_per_option": stats["tokens_per_option"]}
+    return out
+
+
+class _DynamicMultiheadAttention(nn.MultiheadAttention):
+    """`nn.MultiheadAttention` that keeps the shapes it traces.
+
+    The stock module reshapes the packed projection with sizes captured while tracing, so under
+    the legacy ONNX exporter the traced sequence length becomes a constant and a model exported
+    from a short dummy input only runs at that length. The parameters and the maths are the same
+    here; the reshape uses only constant shape arguments (`chunk` / `unflatten` / `flatten`) and
+    `scaled_dot_product_attention`, the kernel the stock path already uses when weights are not
+    requested.
+    """
+
+    def forward(self, query, key, value, key_padding_mask=None, need_weights=True,
+                attn_mask=None, average_attn_weights=True, is_causal=False):
+        if (need_weights or self.in_proj_weight is None or self.bias_k is not None
+                or self.bias_v is not None
+                or (attn_mask is not None and attn_mask.dtype != torch.bool)):
+            # Weight averaging, additive masks and the optional k/v bias are not on the traced
+            # path; the stock implementation keeps them correct.
+            return super().forward(query, key, value, key_padding_mask=key_padding_mask,
+                                   need_weights=need_weights, attn_mask=attn_mask,
+                                   average_attn_weights=average_attn_weights, is_causal=is_causal)
+        if self.batch_first:
+            query, key, value = query.transpose(0, 1), key.transpose(0, 1), value.transpose(0, 1)
+        # (T, B, E) from here, matching the stock module's internals; attention runs on (B, H, T, D).
+        if query is key is value:
+            q, k, v = (part.unflatten(-1, (self.num_heads, self.head_dim)).permute(1, 2, 0, 3)
+                       for part in F.linear(query, self.in_proj_weight, self.in_proj_bias).chunk(3, dim=-1))
+        else:
+            embed_dim = query.shape[-1]
+            wq, wk, wv = self.in_proj_weight.split(embed_dim, dim=0)
+            bq, bk, bv = ((None, None, None) if self.in_proj_bias is None
+                          else self.in_proj_bias.split(embed_dim, dim=0))
+            q, k, v = (
+                F.linear(t, w, b).unflatten(-1, (self.num_heads, self.head_dim)).permute(1, 2, 0, 3)
+                for t, w, b in ((query, wq, bq), (key, wk, bk), (value, wv, bv))
+            )
+        mask = None
+        if attn_mask is not None:
+            mask = ~attn_mask
+        if key_padding_mask is not None:
+            # `== 0` keeps this correct for a bool mask and for the 0 / -inf float mask the encoder
+            # layer hands over (`F._canonical_mask`), where `~` would not be defined.
+            keep = key_padding_mask[:, None, None, :] == 0
+            mask = keep if mask is None else mask & keep
+        attn = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, is_causal=is_causal and mask is None,
+                                              dropout_p=self.dropout if self.training else 0.0)
+        attn = attn.permute(2, 0, 1, 3).flatten(-2)
+        if self.batch_first:
+            attn = attn.transpose(0, 1)
+        return self.out_proj(attn), None
 
 
 class DecisionModel(nn.Module):
     """Bidirectional transformer encoder backbone + typed decision head."""
 
-    def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1):
+    def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1,
+                 no_init: bool = False):
         super().__init__()
         self.encoder = encoder
         d = encoder.config.hidden_size
-        nhead = max(1, d // 64)
-        layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
-        self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
-        self.type_emb = nn.Embedding(3, d)
-        self.scorer = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
-        self.act_head = nn.Sequential(nn.Linear(d + 4, 256), nn.GELU(), nn.Linear(256, n_act))
-        self.register_buffer("temperature", torch.ones(3))
+        # `no_init` means the caller is about to load every parameter from a checkpoint, so the
+        # head's initial values are pure overhead -- and not just time. transformers'
+        # `no_init_weights()` patches the torch.nn.init functions, but something inside
+        # nn.TransformerEncoderLayer draws from the RNG outside them, so building it still
+        # advanced the global generator and made `load()` a visible side effect. On the meta
+        # device no initialisation kernel runs at all; the layers are materialised empty and the
+        # load fills them.
+        with torch.device("meta") if no_init else nullcontext():
+            nhead = max(1, d // 64)
+            layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
+            # The stock attention bakes the traced length into an exported graph; see
+            # _DynamicMultiheadAttention. Same parameters, same maths, traceable shapes.
+            layer.self_attn = _DynamicMultiheadAttention(d, nhead, dropout=dropout, batch_first=True)
+            self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
+            self.type_emb = nn.Embedding(3, d)
+            self.scorer = nn.Sequential(nn.LayerNorm(d), nn.Linear(d, d), nn.GELU(), nn.Linear(d, 1))
+            self.act_head = nn.Sequential(nn.Linear(d + 4, 256), nn.GELU(), nn.Linear(256, n_act))
+            self.register_buffer("temperature", torch.ones(3))
+        if no_init:
+            # Only the modules created above are on the meta device; the encoder is already real
+            # and may hold non-persistent buffers (RoPE frequencies) that to_empty would wipe.
+            for module in (self.head, self.type_emb, self.scorer, self.act_head):
+                if module is not None:
+                    module.to_empty(device="cpu")
+            self.temperature = torch.empty_like(self.temperature, device="cpu")
         self.head_checkpointing = False
 
     def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False):
@@ -206,16 +372,39 @@ def _apply_rope_config(ecfg) -> None:
             setattr(ecfg, attr, float(theta))
 
 
-def build_model(cfg: Dict, encoder_dir: Optional[str] = None, pretrained: bool = True) -> DecisionModel:
+def _no_init_weights():
+    """`no_init_weights` lives in different modules across transformers versions."""
+    try:
+        from transformers.initialization import no_init_weights
+    except ImportError:  # transformers 4.x
+        from transformers.modeling_utils import no_init_weights
+    return no_init_weights()
+
+
+def build_model(cfg: Dict, encoder_dir: Optional[str] = None, pretrained: bool = True,
+                revision: Optional[str] = None) -> DecisionModel:
+    """Build the decision model described by `cfg`.
+
+    With `pretrained=False`, or when `encoder_dir` holds a saved encoder config, nothing is
+    downloaded and **no parameter is initialised**: the caller is expected to load a checkpoint
+    into the result with `load_state_dict(..., strict=True)` immediately. Skipping initialisation
+    keeps `load()` from spending time on, or consuming RNG for, weights it is about to overwrite.
+    """
     from transformers import AutoConfig, AutoModel
 
+    head_layers, n_act = cfg.get("head_layers", 2), len(cfg.get("act_costs", {})) + 1
     if not pretrained or (encoder_dir and os.path.exists(encoder_dir)):
         ecfg = AutoConfig.from_pretrained(encoder_dir or cfg["encoder"])
         _apply_rope_config(ecfg)
-        enc = AutoModel.from_config(ecfg, attn_implementation="sdpa")
-    else:
-        enc = AutoModel.from_pretrained(cfg["encoder"], attn_implementation="sdpa")
-    return DecisionModel(enc, cfg.get("head_layers", 2), len(cfg.get("act_costs", {})) + 1)
+        with _no_init_weights():
+            enc = AutoModel.from_config(ecfg, attn_implementation="sdpa")
+        return DecisionModel(enc, head_layers, n_act, no_init=True)
+    # Training-time Hub load of the base encoder; allow pinning it like the checkpoints.
+    kw = {"attn_implementation": "sdpa"}
+    if revision:
+        kw["revision"] = revision
+    enc = AutoModel.from_pretrained(cfg["encoder"], **kw)
+    return DecisionModel(enc, head_layers, n_act)
 
 
 def proper_reward(

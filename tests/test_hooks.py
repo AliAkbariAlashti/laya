@@ -6,6 +6,7 @@ with `_encode_state` / `_forward` / `_decode_answers` stubbed). The Router path 
 
 Run: python tests/test_hooks.py
 """
+import contextvars
 import os
 import sys
 import threading
@@ -532,6 +533,51 @@ check("router/predict start sees the decision", predict_seen["decision"]["model"
 check("router/predict end sees results", len(predict_seen["results"]), 1)
 check("router/predict keeps routing", out["routing"]["model"], "english")
 
+
+class PredictSuccessTrace:
+    def __init__(self):
+        self.events = []
+        self.contexts = []
+
+    def on_predict_start(self, ctx):
+        self.events.append("start")
+        self.contexts.append(ctx)
+
+    def on_predict_end(self, ctx):
+        self.events.append("end")
+        self.contexts.append(ctx)
+
+
+success_trace = PredictSuccessTrace()
+r = Router(hooks=[success_trace])
+r.attach("english", FakeAgent())
+success_out = r.predict("hello", QUESTIONS)
+check("router/predict success lifecycle", success_trace.events, ["start", "end"])
+check_true("router/predict success shares one context", success_trace.contexts[0] is success_trace.contexts[1])
+check("router/predict success shares one run_id", success_trace.contexts[0].run_id,
+      success_trace.contexts[1].run_id)
+check("router/predict success keeps the normal result", success_out["routing"]["model"], "english")
+
+
+class TimedAgent:
+    def system_one(self, state, questions, **kwargs):
+        return {"model": "timed", "answers": {}, "usage": {"input_tokens": 0, "output_tokens": 0}}
+
+
+class TimedRouter(Router):
+    def load(self, model):
+        time.sleep(0.001)
+        self.load_finished = time.perf_counter()
+        return TimedAgent()
+
+
+timed_trace = PredictSuccessTrace()
+timed_router = TimedRouter(hooks=[timed_trace])
+timed_router.predict("hello", QUESTIONS)
+timed_ctx = timed_trace.contexts[0]
+check_true("router/success elapsed starts after load", timed_ctx.started_at >= timed_router.load_finished)
+
+
 cached = [{"model": "cached", "answers": {}, "usage": {"input_tokens": 0, "output_tokens": 0}}]
 r = Router()
 r.attach("english", FakeAgent())
@@ -553,6 +599,68 @@ r = Router()
 r.attach("english", FakeAgent())
 r.predict("hello", QUESTIONS, hooks=[pcr])
 check("router/per-call hooks apply to on_route", len(pcr.decisions), 1)
+
+
+class PredictFailureTrace:
+    def __init__(self):
+        self.events = []
+        self.contexts = {}
+
+    def on_predict_start(self, ctx):
+        self.events.append("start")
+
+    def on_error(self, ctx):
+        self.events.append("error")
+        self.contexts["error"] = ctx
+
+    def on_predict_end(self, ctx):
+        self.events.append("end")
+        self.contexts["end"] = ctx
+
+
+class RaiseOnRoute(PredictFailureTrace):
+    def on_route(self, ctx):
+        raise RuntimeError("route failed")
+
+
+route_trace = RaiseOnRoute()
+route_error = None
+try:
+    Router(hooks=[route_trace]).predict("hello", QUESTIONS)
+except RuntimeError as exc:
+    route_error = exc
+check_true("router/route failure propagates", isinstance(route_error, RuntimeError))
+check("router/route failure lifecycle", route_trace.events, ["error", "end"])
+check_true("router/route failure has no start", "start" not in route_trace.events)
+route_ctx = route_trace.contexts.get("error")
+check_true("router/route failure records the original error",
+           getattr(route_ctx, "error", None) is route_error)
+check("router/route failure has no decision", getattr(route_ctx, "decision", "missing"), None)
+check("router/route failure has no model", getattr(route_ctx, "model", "missing"), None)
+check("router/route failure has no agent", getattr(route_ctx, "agent", "missing"), None)
+
+
+class LoadFailRouter(Router):
+    def load(self, model):
+        raise RuntimeError("load failed")
+
+
+load_trace = PredictFailureTrace()
+load_error = None
+try:
+    LoadFailRouter(hooks=[load_trace]).predict("hello", QUESTIONS)
+except RuntimeError as exc:
+    load_error = exc
+check_true("router/load failure propagates", isinstance(load_error, RuntimeError))
+check("router/load failure lifecycle", load_trace.events, ["error", "end"])
+check_true("router/load failure has no start", "start" not in load_trace.events)
+load_ctx = load_trace.contexts.get("error")
+check_true("router/load failure records the original error",
+           getattr(load_ctx, "error", None) is load_error)
+check("router/load failure retains the routed decision",
+      (getattr(load_ctx, "decision", None) or {}).get("model"), "english")
+check("router/load failure exposes the routed model", getattr(load_ctx, "model", "missing"), "english")
+check("router/load failure has no agent", getattr(load_ctx, "agent", "missing"), None)
 
 
 # --------------------------------------------------------------- Router.predict_batch
@@ -617,9 +725,9 @@ class BatchTrace:
 
 r, en, ml = batch_router(hooks=[BatchTrace()])
 out = r.predict_batch([req("one"), req("two", "multilingual"), req("three")])
-check("router_batch/one start and one end per request, per checkpoint group",
+check("router_batch/one start and one end per request, per checkpoint group, ends in reverse",
       [(e[0], e[1]) for e in batch_events],
-      [("start", "one"), ("start", "three"), ("end", "one"), ("end", "three"),
+      [("start", "one"), ("start", "three"), ("end", "three"), ("end", "one"),
        ("start", "two"), ("end", "two")])
 starts = {e[1]: e[2] for e in batch_events if e[0] == "start"}
 ends = {e[1]: e[2] for e in batch_events if e[0] == "end"}
@@ -742,7 +850,7 @@ check_raises("router_batch/inference failure propagates", RuntimeError,
 check("router_batch/failure pairs every started request with on_error then on_predict_end",
       [(e[0], e[1]) for e in batch_events],
       [("start", "ok"), ("end", "ok"), ("start", "boom"), ("start", "also"),
-       ("error", "boom"), ("error", "also"), ("end", "boom"), ("end", "also")])
+       ("error", "also"), ("end", "also"), ("error", "boom"), ("end", "boom")])
 ends = {e[1]: e[2] for e in batch_events if e[0] == "end"}
 check_true("router_batch/end of a failed request sees the error",
            all(isinstance(getattr(ends.get(s), "error", None), RuntimeError) for s in ("boom", "also")))
@@ -755,10 +863,33 @@ r, en, ml = batch_router(hooks=[BatchTrace()],
 check_raises("router_batch/inference failure with a cache hit in the group propagates", RuntimeError,
              lambda: r.predict_batch([req("cached"), req("boom")]))
 ends = {e[1]: e[2] for e in batch_events if e[0] == "end"}
-check("router_batch/only requests without a result get on_error",
-      [e[1] for e in batch_events if e[0] == "error"], ["boom"])
-check_true("router_batch/a cache hit in a failed group keeps its result and no error",
-           "cached" in ends and ends["cached"].error is None and ends["cached"].results is not None)
+# The caller gets the exception and no result at all, so a cache hit of the failed group was not
+# delivered either: reporting it as a success would record a decision nobody received.
+check("router_batch/every request of a failed group gets on_error, a cache hit included",
+      sorted(e[1] for e in batch_events if e[0] == "error"), ["boom", "cached"])
+check_true("router_batch/a cache hit in a failed group ends with the batch's error",
+           "cached" in ends and isinstance(ends["cached"].error, RuntimeError))
+
+batch_events = []
+r, en, ml = batch_router(hooks=[BatchTrace()],
+                         on_predict_start=lambda c: setattr(c, "questions", Q_OTHER) if c.states == ["boom"] else None)
+check_raises("router_batch/a later question group's failure propagates", RuntimeError,
+             lambda: r.predict_batch([req("inferred"), req("boom")]))
+check("router_batch/the earlier question group did run", [c[0] for c in en.calls], [["inferred"], ["boom"]])
+ends = {e[1]: e[2] for e in batch_events if e[0] == "end"}
+check_true("router_batch/a request inferred before its group failed ends with the batch's error",
+           "inferred" in ends and isinstance(ends["inferred"].error, RuntimeError))
+
+batch_events = []
+bad_usage = {"model": "cached", "answers": {}, "usage": {"input_tokens": "n/a", "output_tokens": 0}}
+r, en, ml = batch_router(hooks=[BatchTrace()],
+                         on_predict_start=lambda c: c.skip([dict(bad_usage)]) if c.states == ["bad"] else None)
+check_raises("router_batch/a malformed usage block fails the batch", ValueError,
+             lambda: r.predict_batch([req("a"), req("bad"), req("c")]))
+check("router_batch/a malformed usage block still ends every started request",
+      sorted(e[1] for e in batch_events if e[0] == "end"), ["a", "bad", "c"])
+check("router_batch/a malformed usage block fails every request of its group",
+      sorted(e[1] for e in batch_events if e[0] == "error"), ["a", "bad", "c"])
 
 batch_events = []
 
@@ -772,7 +903,7 @@ r, en, ml = batch_router(on_predict_end=fail_end_on_a, hooks=[BatchTrace()])
 check_raises("router_batch/end hook failure propagates", ValueError,
              lambda: r.predict_batch([req("a"), req("b")]))
 check("router_batch/end hook failure still ends the other requests",
-      [(e[0], e[1]) for e in batch_events if e[0] == "end"], [("end", "a"), ("end", "b")])
+      [(e[0], e[1]) for e in batch_events if e[0] == "end"], [("end", "b"), ("end", "a")])
 
 batch_events = []
 r, en, ml = batch_router(hooks=[BatchTrace()])
@@ -794,8 +925,78 @@ check_raises("router_batch/start hook failure propagates", ValueError,
              lambda: r.predict_batch([req("a"), req("b"), req("c")]))
 check("router_batch/start hook failure still ends every started request",
       [(e[0], e[1]) for e in batch_events],
-      [("start", "a"), ("start", "b"), ("error", "a"), ("error", "b"), ("end", "a"), ("end", "b")])
+      [("start", "a"), ("start", "b"), ("error", "b"), ("end", "b"), ("error", "a"), ("end", "a")])
 check("router_batch/start hook failure runs no inference", en.calls, [])
+
+# A hook that sets something in start and resets it in end (a contextvar, an OpenTelemetry
+# context attach/detach, a logging MDC) is only correct if the requests unwind in reverse: all
+# of a group's starts run before any of its ends, so ending in input order resets the wrong layer.
+_batch_cv = contextvars.ContextVar("batch_cv", default=None)
+_cv_tokens = {}
+
+
+class CvStack:
+    def on_predict_start(self, ctx):
+        _cv_tokens[ctx] = _batch_cv.set(ctx.states[0])
+
+    def on_predict_end(self, ctx):
+        _batch_cv.reset(_cv_tokens.pop(ctx))
+
+
+r, en, ml = batch_router(hooks=[CvStack()])
+r.predict_batch([req("a"), req("b"), req("c")])
+check("router_batch/set-in-start, reset-in-end hooks unwind to the caller's value", _batch_cv.get(), None)
+_cv_tokens.clear()
+r, en, ml = batch_router(hooks=[CvStack()])
+check_raises("router_batch/unwinding a failed batch propagates", RuntimeError,
+             lambda: r.predict_batch([req("a"), req("boom"), req("c")]))
+check("router_batch/a failed batch also unwinds to the caller's value", _batch_cv.get(), None)
+_cv_tokens.clear()
+
+failed_ctxs = []
+elapsed_when_first_error_ran = []
+
+
+def remember_failed_start(ctx):
+    failed_ctxs.append(ctx)
+
+
+class FirstError:
+    def on_error(self, ctx):
+        if not elapsed_when_first_error_ran:
+            elapsed_when_first_error_ran.append([c.elapsed_ms is not None for c in failed_ctxs])
+
+
+r, en, ml = batch_router(hooks=[FirstError()], on_predict_start=remember_failed_start)
+check_raises("router_batch/a failed group propagates", RuntimeError,
+             lambda: r.predict_batch([req("boom"), req("b"), req("c")]))
+check("router_batch/elapsed_ms is set for a failed group before any on_error runs",
+      elapsed_when_first_error_ran, [[True, True, True]])
+
+r, en, ml = batch_router(on_predict_end=lambda c: setattr(c, "results", [None]) if c.states == ["x"] else None)
+try:
+    got = r.predict_batch([req("x"), req("y")])
+    got = (got[0], got[1]["answers"]["seen"])
+except Exception as e:  # noqa: BLE001
+    got = repr(e)
+check("router_batch/a None result an end hook leaves is returned, as predict returns it", got, (None, "y"))
+
+
+class AliasPin:
+    """An on_route hook pinning a request with an alias, as a plain dict."""
+
+    def on_route(self, ctx):
+        if ctx.states == ["alias"]:
+            ctx.decision = {**ctx.decision, "model": "ml"}
+
+
+alias_models = []
+r, en, ml = batch_router(hooks=[AliasPin()], on_predict_start=lambda c: alias_models.append(c.model))
+r.predict_batch([req("alias"), req("full", "multilingual")])
+check("router_batch/an aliased pin shares its checkpoint's forward pass", [c[0] for c in ml.calls],
+      [["alias", "full"]])
+check("router_batch/an aliased pin reports the resolved checkpoint", alias_models,
+      ["multilingual", "multilingual"])
 
 r, en, ml = batch_router(on_predict_start=fail_on_b, hooks_raise=False)
 with warnings.catch_warnings(record=True) as caught:
@@ -866,8 +1067,16 @@ from laya.onnx_agent import ONNXAgent  # noqa: E402
 
 o = ONNXAgent.__new__(ONNXAgent)
 o.model_id = "convaiinnovations/laya-onnx"
-o._infer = lambda state, questions: {"model": "onnx", "answers": {},
-                                     "usage": {"input_tokens": 0, "output_tokens": 0}}
+
+
+def _fake_onnx_batch(states, questions, **kwargs):
+    # `system_one` runs through `predict_batch` -> `_infer_batch`, as `Agent.system_one` does,
+    # so the batch seam is what a hook test stubs.
+    return [{"model": "onnx", "answers": {},
+             "usage": {"input_tokens": 0, "output_tokens": 0}} for _ in states]
+
+
+o._infer_batch = _fake_onnx_batch
 onnx_seen = []
 onnx_models = []
 onnx_out = o.system_one("s", QUESTIONS,
@@ -880,11 +1089,11 @@ check("onnx/context model is the agent model_id", onnx_models, ["convaiinnovatio
 o = ONNXAgent.__new__(ONNXAgent)
 
 
-def _never(*args):
+def _never(*args, **kwargs):
     raise AssertionError("inference should have been skipped")
 
 
-o._infer = _never
+o._infer_batch = _never
 check("onnx/skip short-circuits",
       o.system_one("s", QUESTIONS, on_predict_start=lambda c: c.skip([{"model": "cached"}])),
       {"model": "cached"})
@@ -1016,6 +1225,224 @@ finally:
     _hooks.clear_default_hooks()
 check("defaults/cover router lifecycle", ld.events,
       [("load", "english"), ("evict", "english"), ("load", "multilingual")])
+
+events = []
+_hooks.set_default_hooks([LevelTag("default")])
+r = Router()
+r.attach("english", make_fake())
+r.predict("a", QUESTIONS, model="english")
+r.predict_batch([req("b")])
+_hooks.clear_default_hooks()
+check("defaults/fire once per request", events, [("default", "start", "router"), ("default", "end", "router")] * 2)
+
+
+# --------------------------------------------------------------- async hooks
+import asyncio  # noqa: E402
+
+from laya import AsyncHook  # noqa: E402
+from laya.hooks import run_coroutine_sync  # noqa: E402
+
+calls = []
+
+
+class AsyncAudit:
+    async def on_predict_end(self, ctx):
+        await asyncio.sleep(0)
+        calls.append("wrapped")
+
+
+f = make_fake()
+f.add_hook(AsyncHook(AsyncAudit()))
+f.predict_batch(["s0"], QUESTIONS)
+check("async/wrapped hook awaited", calls, ["wrapped"])
+
+calls.clear()
+
+
+async def async_end(ctx):
+    await asyncio.sleep(0)
+    calls.append("plain")
+
+
+f = make_fake()
+f.predict_batch(["s0"], QUESTIONS, on_predict_end=async_end)
+check("async/plain callable awaited", calls, ["plain"])
+
+calls.clear()
+
+
+async def async_start(ctx):
+    calls.append("loop")
+
+
+f = make_fake()
+
+
+async def _in_loop():
+    f.predict_batch(["s0"], QUESTIONS, on_predict_start=async_start)
+
+
+asyncio.run(_in_loop())
+check("async/works inside a running loop", calls, ["loop"])
+
+
+async def _seven():
+    return 7
+
+
+check("async/run_coroutine_sync returns", run_coroutine_sync(_seven()), 7)
+check_raises("async/AsyncHook rejects a class", TypeError, lambda: AsyncHook(AsyncAudit))
+
+
+# --------------------------------------------------------------- hook timeout
+def slow_hook(ctx):
+    time.sleep(0.3)
+
+
+f = make_fake()
+raised = None
+try:
+    f.predict_batch(["s0"], QUESTIONS, on_predict_start=slow_hook, hooks_timeout=0.05)
+except TimeoutError as exc:
+    raised = str(exc)
+check_true("timeout/raises TimeoutError", isinstance(raised, str) and "exceeded" in raised)
+
+f = make_fake()
+with warnings.catch_warnings(record=True) as caught:
+    warnings.simplefilter("always")
+    res = f.predict_batch(["s0"], QUESTIONS, on_predict_start=slow_hook,
+                          hooks_timeout=0.05, hooks_raise=False)
+check("timeout/hooks_raise=False continues", len(res), 1)
+check_true("timeout/hooks_raise=False warns",
+           any(issubclass(w.category, RuntimeWarning) for w in caught))
+
+f = make_fake()
+f.hooks_timeout = 0.05
+raised = None
+try:
+    f.predict_batch(["s0"], QUESTIONS, on_predict_start=slow_hook)
+except TimeoutError:
+    raised = True
+check("timeout/instance-level applies", raised, True)
+
+f = make_fake()
+f.hooks_timeout = 0.05
+res = f.predict_batch(["s0"], QUESTIONS, on_predict_start=slow_hook, hooks_timeout=5.0)
+check("timeout/per-call override wins", len(res), 1)
+
+f = make_fake()
+res = f.predict_batch(["s0"], QUESTIONS, on_predict_end=lambda ctx: None, hooks_timeout=1.0)
+check("timeout/fast hook unaffected", len(res), 1)
+
+
+# --------------------------------------------------------------- input validation and context
+import contextvars  # noqa: E402
+
+from laya.hooks import validate_timeout  # noqa: E402
+
+check_raises("timeout/zero is rejected", ValueError, lambda: validate_timeout(0))
+check_raises("timeout/negative is rejected", ValueError, lambda: validate_timeout(-0.5))
+check("timeout/positive passes through", validate_timeout(1.5), 1.5)
+check("timeout/None means no limit", validate_timeout(None), None)
+
+f = make_fake()
+check_raises("timeout/zero per call is rejected", ValueError,
+             lambda: f.predict_batch(["s0"], QUESTIONS, hooks_timeout=0))
+
+not_running = asyncio.new_event_loop()
+try:
+    check_raises("async/a non-running loop is rejected", ValueError,
+                 lambda: run_coroutine_sync(_seven(), loop=not_running))
+finally:
+    not_running.close()
+
+
+async def _own_loop():
+    own = asyncio.get_running_loop()
+    try:
+        run_coroutine_sync(_seven(), loop=own)
+    except ValueError:
+        return "raised"
+    return "no"
+
+
+check("async/the calling thread's own loop is rejected", asyncio.run(_own_loop()), "raised")
+check_raises("async/AsyncHook rejects an object with no events", TypeError,
+             lambda: AsyncHook(object()))
+
+_cv_seen = contextvars.ContextVar("cv_seen", default=None)
+_cv_calls = []
+
+
+class CvHook:
+    def on_predict_start(self, ctx):
+        _cv_calls.append(_cv_seen.get())
+
+
+f = make_fake()
+_token = _cv_seen.set("request-1")
+try:
+    f.predict_batch(["s0"], QUESTIONS, hooks=[CvHook()], hooks_timeout=1.0)
+finally:
+    _cv_seen.reset(_token)
+check("timeout/a timed hook sees the caller's contextvars", _cv_calls, ["request-1"])
+
+
+# ------------------------------------------- per-call timeout reaches on_route through the batches
+# #277 threaded the per-call timeout through predict_batch's own dispatches, but route_batch had no
+# hooks_timeout argument and predict_batch did not forward its override into it, so an on_route hook
+# reached through either batch entry point saw the instance timeout instead of the caller's.
+class SlowRoute:
+    def on_route(self, ctx):
+        time.sleep(0.3)
+
+
+def slow_route_router(**kwargs):
+    return batch_router(hooks=[SlowRoute()], **kwargs)[0]
+
+
+# route_batch takes the per-call timeout and applies it to on_route.
+raised = None
+try:
+    slow_route_router().route_batch([req("a")], hooks_timeout=0.05)
+except TimeoutError as exc:
+    raised = str(exc)
+check_true("timeout/route_batch per-call reaches on_route",
+           isinstance(raised, str) and "exceeded" in raised)
+
+# predict_batch forwards the same override into route_batch, so on_route times out there too.
+raised = None
+try:
+    slow_route_router().predict_batch([req("a")], hooks_timeout=0.05)
+except TimeoutError as exc:
+    raised = str(exc)
+check_true("timeout/predict_batch per-call reaches on_route",
+           isinstance(raised, str) and "exceeded" in raised)
+
+# No per-call override: the instance timeout is still the fallback for the batched route path.
+raised = None
+try:
+    slow_route_router(hooks_timeout=0.05).route_batch([req("a")])
+except TimeoutError:
+    raised = True
+check("timeout/route_batch instance-level applies", raised, True)
+
+# A longer per-call value overrides a shorter instance timeout, as on the other entry points.
+decisions = slow_route_router(hooks_timeout=0.05).route_batch([req("a")], hooks_timeout=5.0)
+check("timeout/route_batch per-call override wins", [d["model"] for d in decisions], ["english"])
+
+# With no hooks at all both batched paths are unchanged.
+plain_r, plain_en, _ = batch_router()
+check("timeout/route_batch without hooks is unchanged",
+      [d["model"] for d in plain_r.route_batch([req("a")])], ["english"])
+plain_out = plain_r.predict_batch([req("a")])
+check("timeout/predict_batch without hooks is unchanged", len(plain_out), 1)
+check("timeout/predict_batch without hooks keeps routing", plain_out[0]["routing"]["model"], "english")
+check("timeout/predict_batch without hooks still batches", [c[0] for c in plain_en.calls], [["a"]])
+
+# The forwarded value is still validated by route(), exactly like a direct route() call.
+check_raises("timeout/route_batch rejects a zero per-call timeout", ValueError,
+             lambda: Router().route_batch([req("a")], hooks_timeout=0))
 
 
 # --------------------------------------------------------------- report

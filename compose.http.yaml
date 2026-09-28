@@ -37,10 +37,17 @@ services:
       LAYA_HOST: "${LAYA_HOST:-0.0.0.0}"
       LAYA_PORT: "${LAYA_PORT:-8000}"
       LAYA_DEVICE: "${LAYA_DEVICE:-cpu}"
+      # Autocast dtype the runtime reads when building the model; empty keeps the checkpoint's own
+      # `amp_dtype`. Set LAYA_CUDA_AMP=fp16 to serve fp16 on a GPU host.
+      LAYA_CUDA_AMP: "${LAYA_CUDA_AMP:-}"
+      LAYA_CPU_AMP: "${LAYA_CPU_AMP:-}"
       LAYA_PRELOAD: "${LAYA_PRELOAD:-0}"
       LAYA_MODELS: "${LAYA_MODELS:-}"
       LAYA_THREADS: "${LAYA_THREADS:-${OMP_NUM_THREADS:-4}}"
       LAYA_AUTO_TASK: "${LAYA_AUTO_TASK:-0}"
+      # Empty keeps Router's own default (2). Set 3 when LAYA_AUTO_TASK is on: that adds a
+      # third checkpoint routing can choose on demand, and a cap below it reloads one per switch.
+      LAYA_MAX_LOADED: "${LAYA_MAX_LOADED:-}"
       LAYA_LOG_LEVEL: "${LAYA_LOG_LEVEL:-info}"
       LAYA_API_KEY: "${LAYA_API_KEY:-}"
       LAYA_API_KEY_FILE: "${LAYA_API_KEY_FILE:-}"

@@ -114,6 +114,9 @@ function enumField(path: string, name: string, values: unknown[], description: u
   if (values.length === 0) throw new SchemaError(`${path}: 'enum' must not be empty`);
   if (values.every((v) => typeof v === "boolean")) return noulField(name, description);
   const options: [string, unknown][] = values.map((v) => [v == null ? "null" : String(v), v]);
+  if (new Set(options.map(([label]) => label)).size !== options.length) {
+    throw new SchemaError(`${path}: enum values produce duplicate choice labels`);
+  }
   return {
     name,
     kind: "choice",
@@ -160,13 +163,37 @@ function fieldFor(path: string, name: string, prop: unknown): PlannedField {
   }
   const p = prop as Record<string, unknown>;
   const description = p.description;
+  if (!("const" in p || "enum" in p || "type" in p)) {
+    const union = (p.anyOf ?? p.oneOf) as unknown[] | undefined;
+    if (union !== undefined && Array.isArray(union)) {
+      const branches = union.filter(
+        (b) => b !== null && typeof b === "object" && !Array.isArray(b) && (b as Record<string, unknown>).type !== "null",
+      ) as Record<string, unknown>[];
+      if (branches.length !== 1) {
+        throw new SchemaError(
+          `${path}: only 'Optional[...]' unions (one non-null branch) are supported, got ${branches.length}`,
+        );
+      }
+      const branch: Record<string, unknown> = { ...branches[0] };
+      if (branch.description === undefined && description !== undefined) {
+        branch.description = description;
+      }
+      return fieldFor(path, name, branch);
+    }
+  }
   if ("const" in p) return enumField(path, name, [p.const], description);
   if ("enum" in p) {
     if (!Array.isArray(p.enum)) throw new SchemaError(`${path}: 'enum' must be a list, got ${pyType(p.enum)}`);
     return enumField(path, name, p.enum, description);
   }
   let jtype = p.type;
-  if (Array.isArray(jtype)) jtype = jtype.find((t) => t !== "null"); // nullable: ["string", "null"]
+  if (Array.isArray(jtype)) {
+    const nonNullTypes = jtype.filter((t) => t !== "null"); // nullable: ["string", "null"]
+    if (nonNullTypes.length > 1) {
+      throw new SchemaError(`${path}: 'type' has multiple non-null types; unions are not supported`);
+    }
+    jtype = nonNullTypes[0];
+  }
   if (jtype === "boolean") return noulField(name, description);
   if (jtype === "string") {
     throw new SchemaError(`${path}: a free string cannot be a fixed option set; use 'enum' or a boolean`);

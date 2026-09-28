@@ -13,6 +13,7 @@ from laya.structured import (  # noqa: E402
     answers_to_json,
     answer_to_pydantic,
     decide,
+    decide_batch,
     plan_from_json_schema,
     questions_from_json_schema,
     questions_from_pydantic,
@@ -70,6 +71,9 @@ check("map/boolean is noul", questions["needs_human"]["type"], "noul")
 check("map/integer enum becomes a choice", questions["priority"]["type"], "choice")
 check("map/integer enum labels are strings", list(questions["priority"]["criteria"]), ["1", "2", "3"])
 check("map/plan has one field per property", len(plan_from_json_schema(SCHEMA)), 4)
+check("map/nullable boolean remains noul",
+      questions_from_json_schema({"type": "object", "properties": {"a": {"type": ["null", "boolean"]}}})["a"]["type"],
+      "noul")
 
 
 # --------------------------------------------------------------- projection
@@ -101,6 +105,12 @@ def _bad(schema):
 
 check_raises("reject/free string", SchemaError,
              _bad({"type": "object", "properties": {"a": {"type": "string"}}}))
+check_raises("reject/multiple non-null types", SchemaError,
+             _bad({"type": "object", "properties": {"a": {"type": ["boolean", "integer"],
+                                                              "minimum": 0, "maximum": 2}}}))
+check_raises("reject/nullable union of multiple types", SchemaError,
+             _bad({"type": "object", "properties": {"a": {"type": ["null", "integer", "boolean"],
+                                                              "minimum": 0, "maximum": 2}}}))
 check_raises("reject/array", SchemaError,
              _bad({"type": "object", "properties": {"a": {"type": "array", "items": {"type": "string"}}}}))
 check_raises("reject/nested object", SchemaError,
@@ -115,6 +125,14 @@ check_raises("reject/too many properties", SchemaError,
              _bad({"type": "object", "properties": {("p%d" % i): {"type": "boolean"} for i in range(33)}}))
 check_raises("reject/too many options", SchemaError,
              _bad({"type": "object", "properties": {"a": {"type": "string", "enum": ["v%d" % i for i in range(33)]}}}))
+for colliding in ([1, "1"], [None, "null"], [True, "True"]):
+    check_raises("reject/colliding enum %r" % colliding, SchemaError,
+                 _bad({"type": "object", "properties": {"x": {"enum": colliding}}}))
+try:
+    questions_from_json_schema({"type": "object", "properties": {"x": {"enum": [1, "1"]}}})
+except SchemaError as exc:
+    check("reject/colliding enum names the field", str(exc),
+          "properties.x: enum values produce duplicate choice labels")
 check_raises("reject/non-object root", SchemaError, _bad({"type": "array"}))
 check_raises("reject/empty properties", SchemaError, _bad({"type": "object", "properties": {}}))
 
@@ -156,6 +174,166 @@ runner = FakeRunner(ANSWERS)
 decide(runner, "s", schema=SCHEMA, hooks_raise=False)
 check("decide/forwards predict kwargs", runner.calls[0]["kwargs"], {"hooks_raise": False})
 
+# --------------------------------------------------------------- min_confidence abstention (#361)
+# Default behavior unchanged: all fields project normally when min_confidence is omitted
+runner_default = FakeRunner(ANSWERS)
+out_default = decide(runner_default, "s", schema=SCHEMA)
+check("decide/default department unchanged", out_default["department"], "billing")
+check("decide/default urgency unchanged", out_default["urgency"], 2)
+check("decide/default needs_human unchanged", out_default["needs_human"], True)
+check("decide/default priority unchanged", out_default["priority"], 2)
+check_true("decide/default has no low_confidence flags",
+           not any(a.get("low_confidence") for a in ANSWERS.values()))
+
+# With min_confidence=0.85: answers below 0.85 project as None, raw confidence preserved
+runner_gated = FakeRunner({k: dict(v) for k, v in ANSWERS.items()})
+out_gated = decide(runner_gated, "s", schema=SCHEMA, min_confidence=0.85)
+check("decide/gated high-confidence field kept", out_gated["department"], "billing")
+check("decide/gated low-confidence score becomes None", out_gated["urgency"], None)
+check("decide/gated low-confidence noul becomes None", out_gated["needs_human"], None)
+check("decide/gated low-confidence choice becomes None", out_gated["priority"], None)
+
+# With return_details=True, details keep raw confidence and answers dict
+runner_det = FakeRunner({k: dict(v) for k, v in ANSWERS.items()})
+det = decide(runner_det, "s", schema=SCHEMA, min_confidence=0.85, return_details=True)
+check("decide/details values has None for low conf", det.values["urgency"], None)
+check("decide/details raw confidence preserved", det.confidence["urgency"], 0.5)
+check_true("decide/details answers flag set", det.answers["urgency"].get("low_confidence") is True)
+check("decide/details high conf value kept", det.values["department"], "billing")
+check_true("decide/details high conf flag unset", det.answers["department"].get("low_confidence") is not True)
+
+# Direct projection with low_confidence: True in answer
+answers_with_flag = {
+    "department": {"type": "choice", "choice": "billing", "confidence": 0.4, "low_confidence": True},
+    "urgency": {"type": "score", "score": 2.0, "confidence": 0.9, "probabilities": {"0": 0.0, "1": 0.1, "2": 0.9}, "legend": {}},
+}
+proj = answers_to_json(answers_with_flag, SCHEMA)
+check("project/flagged answer becomes None", proj["department"], None)
+check("project/unflagged answer keeps value", proj["urgency"], 2)
+
+# Invalid min_confidence validation
+check_raises("decide/rejects min_confidence > 1", ValueError,
+             lambda: decide(runner, "s", schema=SCHEMA, min_confidence=1.2))
+check_raises("decide/rejects min_confidence < 0", ValueError,
+             lambda: decide(runner, "s", schema=SCHEMA, min_confidence=-0.1))
+check_raises("decide/rejects bool min_confidence", ValueError,
+             lambda: decide(runner, "s", schema=SCHEMA, min_confidence=True))
+check_raises("decide/rejects str min_confidence", ValueError,
+             lambda: decide(runner, "s", schema=SCHEMA, min_confidence="0.85"))
+
+
+# --------------------------------------------------------------- decide_batch
+class FakeBatchRunner:
+    """predict_batch(states, questions, **kwargs) like Agent's/Router's: one
+    result dict per state, in input order."""
+
+    def __init__(self, answers_by_state):
+        self.answers_by_state = answers_by_state
+        self.calls = []
+
+    def predict_batch(self, states, questions, **kwargs):
+        self.calls.append({"states": states, "questions": questions, "kwargs": kwargs})
+        # like Router.predict_batch: empty answers only for a state that was
+        # genuinely skipped by a hook -- the fake keys them off an unknown text.
+        return [{"answers": self.answers_by_state.get(s, {}), "routing": {"model": "english"}}
+                for s in states]
+
+
+STATES = ["first ticket", "second ticket"]
+BATCH_ANSWERS = {
+    "first ticket": ANSWERS,
+    "second ticket": {
+        "department": {"type": "choice", "choice": "sales", "confidence": 0.8,
+                       "probabilities": {"billing": 0.0, "support": 0.1, "sales": 0.9}},
+        "urgency": {"type": "score", "score": 0.4, "confidence": 0.5,
+                    "probabilities": {"0": 0.7, "1": 0.2, "2": 0.1}},
+        "needs_human": {"type": "noul", "noul": 0.1, "confidence": 0.8},
+        "priority": {"type": "choice", "choice": "1", "confidence": 0.6,
+                    "probabilities": {"1": 0.6, "2": 0.3, "3": 0.1}},
+    },
+}
+
+batch_runner = FakeBatchRunner(BATCH_ANSWERS)
+outs = decide_batch(batch_runner, STATES, schema=SCHEMA)
+check("batch/one predict_batch call", len(batch_runner.calls), 1)
+check("batch/states forwarded", batch_runner.calls[0]["states"], STATES)
+check("batch/questions planned once", batch_runner.calls[0]["questions"],
+      {f.name: f.question for f in plan_from_json_schema(SCHEMA)})
+check("batch/input order", [o["department"] for o in outs], ["billing", "sales"])
+check("batch/projection matches decide", outs[0], decide(FakeRunner(ANSWERS), "x", schema=SCHEMA))
+check("batch/per-state values", outs[1],
+      {"department": "sales", "urgency": 0, "needs_human": False, "priority": 1})
+
+# kwargs are forwarded to predict_batch (batch_size, model, hooks, ...)
+batch_runner = FakeBatchRunner(BATCH_ANSWERS)
+decide_batch(batch_runner, STATES, schema=SCHEMA, batch_size=4, model="english")
+check("batch/forwards predict kwargs", batch_runner.calls[0]["kwargs"],
+      {"batch_size": 4, "model": "english"})
+
+# return_details: one DecisionResult per state with the usual fields
+details = decide_batch(FakeBatchRunner(BATCH_ANSWERS), STATES, schema=SCHEMA, return_details=True)
+check_true("batch/details are DecisionResult", all(isinstance(d, laya.DecisionResult) for d in details))
+check("batch/details values", [d.values["department"] for d in details], ["billing", "sales"])
+check("batch/details confidence", details[0].confidence["department"], 0.9)
+check("batch/details routing", details[0].routing, {"model": "english"})
+
+# questions= is the raw-answers pass-through, exactly like decide()
+raw = decide_batch(FakeBatchRunner({"a": {"x": {"type": "noul", "noul": 0.9, "confidence": 0.9}}}),
+                   ["a"], questions={"x": {"type": "noul", "instructions": "?"}})
+check("batch/questions pass-through", raw, [{"x": {"type": "noul", "noul": 0.9, "confidence": 0.9}}])
+
+
+class FakeRouterLike:
+    """predict_batch(requests, **kwargs) like Router's: one request dict per
+    state (no positional questions), routed through route_batch."""
+
+    def __init__(self, answers_by_state):
+        self.answers_by_state = answers_by_state
+        self.calls = []
+
+    def route_batch(self, requests):
+        return [{"model": "english"} for _ in requests]
+
+    def predict_batch(self, requests, **kwargs):
+        self.calls.append({"requests": requests, "kwargs": kwargs})
+        return [{"answers": self.answers_by_state.get(r["state"], {}),
+                 "routing": {"model": "english"}} for r in requests]
+
+
+router_like = FakeRouterLike(BATCH_ANSWERS)
+router_outs = decide_batch(router_like, STATES, schema=SCHEMA, batch_size=3)
+expected_questions = {f.name: f.question for f in plan_from_json_schema(SCHEMA)}
+check("batch/router one call", len(router_like.calls), 1)
+check("batch/router request dicts", [r["state"] for r in router_like.calls[0]["requests"]], STATES)
+check("batch/router questions per request",
+      all(r["questions"] == expected_questions for r in router_like.calls[0]["requests"]), True)
+check("batch/router kwargs forwarded", router_like.calls[0]["kwargs"], {"batch_size": 3})
+check("batch/router projection matches agent path", router_outs, outs)
+
+# a string is a sequence of states only accidentally: refuse it like route_batch does
+check_raises("batch/rejects string states", TypeError,
+             lambda: decide_batch(FakeBatchRunner({}), "abc", schema=SCHEMA))
+check_raises("batch/requires schema or questions", ValueError,
+             lambda: decide_batch(FakeBatchRunner({}), ["a"]))
+check_raises("batch/rejects both", ValueError,
+             lambda: decide_batch(FakeBatchRunner({}), ["a"], schema=SCHEMA, questions={}))
+check_raises("batch/rejects bad schema", SchemaError,
+             lambda: decide_batch(FakeBatchRunner({}), ["a"],
+                                  schema={"type": "object", "properties": {"s": {"type": "string"}}}))
+
+
+class NoBatchRunner(FakeRunner):
+    pass  # has predict() but no predict_batch
+
+
+check_raises("batch/runner without predict_batch", TypeError,
+             lambda: decide_batch(NoBatchRunner(ANSWERS), ["a"], schema=SCHEMA))
+
+# a runner that answers nothing (hook-skipped states surface as empty values)
+noop_runner = FakeBatchRunner({})
+check("batch/skipped states", decide_batch(noop_runner, ["unmatched"], schema=SCHEMA), [{}])
+check("batch/noop still batches", len(noop_runner.calls), 1)
+
 
 # --------------------------------------------------------------- pydantic (optional)
 try:
@@ -186,12 +364,43 @@ except ImportError:
 
 # --------------------------------------------------------------- exports and methods
 check("export/decide", callable(laya.decide), True)
+check("export/decide_batch", callable(laya.decide_batch), True)
 check("export/DecisionResult", hasattr(laya, "DecisionResult"), True)
 check("method/Agent.decide", callable(getattr(laya.Agent, "decide", None)), True)
+check("method/Agent.decide_batch", callable(getattr(laya.Agent, "decide_batch", None)), True)
 check("method/Router.decide", callable(getattr(laya.Router, "decide", None)), True)
+check("method/Router.decide_batch", callable(getattr(laya.Router, "decide_batch", None)), True)
 from laya.onnx_agent import ONNXAgent  # noqa: E402
 
 check("method/ONNXAgent.decide", callable(getattr(ONNXAgent, "decide", None)), True)
+
+
+# --------------------------------------------------------------- nullable via anyOf (pydantic v2)
+# Pydantic v2 renders Optional[X] as {"anyOf": [<X>, {"type": "null"}]}, the same nullable intent
+# as the list form type:["string","null"]. Both must map to the underlying field, not raise.
+NULLABLE = {
+    "type": "object",
+    "properties": {
+        "dept": {"anyOf": [{"type": "string", "enum": ["billing", "sales"]}, {"type": "null"}],
+                 "description": "Which team?"},
+        "score": {"anyOf": [{"type": "integer", "minimum": 0, "maximum": 2}, {"type": "null"}]},
+        "flag": {"anyOf": [{"type": "boolean"}, {"type": "null"}]},
+    },
+}
+nq = questions_from_json_schema(NULLABLE)
+check("nullable/anyOf enum is a choice", nq["dept"]["type"], "choice")
+check("nullable/anyOf carries the outer description", nq["dept"]["instructions"], "Which team?")
+check("nullable/anyOf bounded integer is a score", nq["score"]["type"], "score")
+check("nullable/anyOf boolean is a noul", nq["flag"]["type"], "noul")
+# oneOf is accepted the same way
+check("nullable/oneOf enum is a choice",
+      questions_from_json_schema(
+          {"type": "object", "properties": {"a": {"oneOf": [{"enum": ["x", "y"]}, {"type": "null"}]}}}
+      )["a"]["type"], "choice")
+# a union of two real types stays ambiguous and is rejected
+check_raises("nullable/two real branches rejected", SchemaError,
+             _bad({"type": "object",
+                   "properties": {"a": {"anyOf": [{"type": "boolean"}, {"type": "integer"}]}}}))
 
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))

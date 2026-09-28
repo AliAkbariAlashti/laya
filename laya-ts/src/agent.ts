@@ -6,6 +6,7 @@ import {
   collateItems,
   confidenceFromProbs,
   answerConfidence,
+  renderCriterion,
   renderOptions,
   sequenceWithState,
   serializeState,
@@ -20,7 +21,8 @@ import {
   PredictContext,
   aggregateUsage,
   composeHooks,
-  dispatch,
+  defaultsAlreadyRan,
+  dispatchAsync,
   normaliseHooks,
   type HookArg,
   type PredictHook,
@@ -51,7 +53,7 @@ export interface ChoiceAnswer {
 export interface ScoreAnswer {
   type: "score";
   score: number;
-  legend: Record<string, unknown>;
+  legend: Record<string, string>;
   probabilities: Record<string, number>;
   confidence: number;
   answer_confidence: number;
@@ -91,6 +93,8 @@ export interface AgentOptions {
   provider: SessionProvider;
   tok?: TokenizerLike;
   cfg?: AgentCfg;
+  /** Commit SHA the artifacts were loaded from (pinned/requested or `x-repo-commit`); null for local dirs. */
+  revision?: string | null;
   max_len?: number;
   head_max_len?: number;
   temperature?: unknown;
@@ -155,6 +159,16 @@ export function checkQuestion(qid: string, qdef: unknown): void {
     if (Object.keys(crit as object).length === 0) {
       throw new Error(`question ${qidStr(qid)}: a choice question needs at least one criterion`);
     }
+    if (Array.isArray(crit)) {
+      crit.forEach((label: unknown, i) => {
+        if (typeof label !== "object" || label === null) return;
+        throw new Error(
+          `question ${qidStr(qid)}: choice label ${i} is a ${Array.isArray(label) ? "list" : "dict"}; a label is ` +
+            `rendered as option text and used as the answer key, so it must be a scalar (a string, number or ` +
+            `null), got ${JSON.stringify(label)}`,
+        );
+      });
+    }
   } else if (t === "score") {
     if (!Array.isArray(crit)) {
       throw new Error(
@@ -175,7 +189,7 @@ export function checkQuestion(qid: string, qdef: unknown): void {
       `question ${qidStr(qid)}: a noul question takes 'criteria' as a dict with optional 'true'/'false' descriptions, or omits it`,
     );
   } else if (crit && typeof crit === "object" && !Array.isArray(crit)) {
-    const invalid = Object.keys(crit as Record<string, unknown>).filter((key) => key !== "true" && key !== "false");
+    const invalid = Object.keys(crit as Record<string, unknown>).filter((key) => key.toLowerCase() !== "true" && key.toLowerCase() !== "false");
     if (invalid.length > 0) {
       throw new Error(
         `question ${qidStr(qid)}: noul criteria may contain only 'true' and 'false'; got ${JSON.stringify(invalid)}`,
@@ -185,7 +199,7 @@ export function checkQuestion(qid: string, qdef: unknown): void {
   if ("labels" in q && t !== "noul") {
     throw new Error(`question ${qidStr(qid)}: 'labels' is only supported for noul questions`);
   }
-  if (t === "noul" && "labels" in q) {
+  if (t === "noul" && q["labels"] !== null && q["labels"] !== undefined) {
     const labels = q["labels"];
     if (typeof labels !== "object" || labels === null || Array.isArray(labels)) {
       throw new Error(`question ${qidStr(qid)}: noul labels must be an object with 'false' and 'true'`);
@@ -259,6 +273,7 @@ export class Agent extends HookRegistry {
   hooksRaise: boolean;
   cfg: AgentCfg;
   provider: SessionProvider;
+  revision: string | null;
   tok: TokenizerLike;
   maxLen: number;
   headMaxLen: number;
@@ -275,6 +290,7 @@ export class Agent extends HookRegistry {
     super();
     if (!opts || !opts.provider) throw new Error("Agent needs a provider");
     this.provider = opts.provider;
+    this.revision = opts.revision ?? null;
     // Hooks are opt-in; an unset hook list is a no-op. See hooks.ts.
     this.hooks = normaliseHooks(opts.hooks, opts.onPredictStart, opts.onPredictEnd);
     this.hooksRaise = opts.hooksRaise ?? true;
@@ -356,7 +372,9 @@ export class Agent extends HookRegistry {
     questions: Record<string, QuestionDef>,
     opts: PredictOptions,
   ): Promise<SystemOneResult[]> {
-    const active = composeHooks(this.hooks, opts.hooks, opts.onPredictStart, opts.onPredictEnd);
+    const active = defaultsAlreadyRan(opts)
+      ? [...this.hooks, ...normaliseHooks(opts.hooks, opts.onPredictStart, opts.onPredictEnd)]
+      : composeHooks(this.hooks, opts.hooks, opts.onPredictStart, opts.onPredictEnd);
     const raiseErrors = opts.hooksRaise ?? this.hooksRaise;
     const ctx = new PredictContext({
       states,
@@ -364,7 +382,7 @@ export class Agent extends HookRegistry {
       agent: this,
     });
     try {
-      dispatch(active, "onPredictStart", ctx, { raiseErrors });
+      await dispatchAsync(active, "onPredictStart", ctx, { raiseErrors });
       if (ctx.results === null) {
         const out: SystemOneResult[] = [];
         for (const st of ctx.states) {
@@ -382,7 +400,7 @@ export class Agent extends HookRegistry {
     } catch (err) {
       ctx.error = err;
       try {
-        dispatch(active, "onError", ctx, { raiseErrors });
+        await dispatchAsync(active, "onError", ctx, { raiseErrors });
       } catch {
         // A failing onError hook must not hide the failure that triggered it.
       }
@@ -391,7 +409,7 @@ export class Agent extends HookRegistry {
       ctx.markElapsed();
       if (ctx.results !== null) ctx.usage = aggregateUsage(ctx.results);
       try {
-        dispatch(active, "onPredictEnd", ctx, { raiseErrors });
+        await dispatchAsync(active, "onPredictEnd", ctx, { raiseErrors });
       } catch (hookErr) {
         // End hooks run on the failure path too; do not let one mask the real error.
         if (ctx.error === null) throw hookErr;
@@ -483,7 +501,15 @@ export class Agent extends HookRegistry {
         answers[qid] = {
           type: "score",
           score: r4(exp),
-          legend: Object.fromEntries((q.crit as unknown[]).map((c, i) => [String(i), c])),
+          // `renderCriterion`, not the raw `c`: a legend maps an index to the TEXT of a level, and
+          // the keys are already strings. A numeric scale written directly used to come back with
+          // the caller's own JSON types (`{"0": 1}`), so a client that reads a level as a string
+          // had to handle a number, a boolean and null as well -- and `{"0": null}` is not even
+          // parseable by a Jev client (#302). Same change as the Python `agent.py` and
+          // `onnx_agent.py` legends, so the two runtimes return the same value types.
+          legend: Object.fromEntries(
+            (q.crit as unknown[]).map((c, i) => [String(i), renderCriterion(c)]),
+          ),
           probabilities: Object.fromEntries(p.map((v, i) => [String(i), r4(v)])),
           confidence: r4(confidenceFromProbs(p)),
           answer_confidence: ansConf,
@@ -545,6 +571,13 @@ export class Agent extends HookRegistry {
       numThreads?: number;
       /** Per-language temperature overrides; see AgentOptions.lang_temperatures. */
       lang_temperatures?: AgentOptions["lang_temperatures"];
+      /** Optional commit SHA/branch/tag to fetch; omitted uses the Hub default and existing cache. */
+      revision?: string | null;
+      /**
+       * Opt-in `{artifact name: SHA-256 hexdigest}` check before any artifact is parsed
+       * or executed. A missing artifact or digest mismatch throws and loading is refused.
+       */
+      expectedSha256?: Record<string, string>;
     },
   ): Promise<Agent> {
     const sub = opts?.subfolder ?? null;
@@ -553,25 +586,39 @@ export class Agent extends HookRegistry {
     let cfg: AgentCfg = {};
     let tokenizerJson: unknown | null = null;
     let dir = opts?.localDir ?? modelDirOrRepo;
+    let revision: string | null = null;
     let provider: SessionProvider;
     if (isBrowser) {
       const { loadWebBundle, createWebProvider } = await import("./providers.js");
-      const bundle = await loadWebBundle(modelDirOrRepo, { subfolder: sub });
+      const bundle = await loadWebBundle(modelDirOrRepo, {
+        subfolder: sub,
+        revision: opts?.revision,
+        expectedSha256: opts?.expectedSha256,
+      });
       cfg = bundle.cfg;
       tokenizerJson = bundle.tokenizerJson;
       dir = bundle.dir;
-      provider = await createWebProvider(dir, { numThreads: opts?.numThreads });
+      revision = bundle.revision;
+      provider = await createWebProvider(dir, {
+        numThreads: opts?.numThreads,
+        expectedSha256: opts?.expectedSha256,
+      });
     } else {
       const { loadNodeBundle, createNodeProvider } = await import("./providers.js");
       const bundle = await loadNodeBundle(modelDirOrRepo, {
         subfolder: sub,
         localDir: opts?.localDir,
         token: opts?.token,
+        revision: opts?.revision,
+        expectedSha256: opts?.expectedSha256,
       });
       cfg = bundle.cfg;
       tokenizerJson = bundle.tokenizerJson;
       dir = bundle.dir;
-      provider = await createNodeProvider(dir, { device: opts?.device, numThreads: opts?.numThreads });
+      revision = bundle.revision;
+      provider = await createNodeProvider(dir, {
+        device: opts?.device, numThreads: opts?.numThreads, expectedSha256: opts?.expectedSha256,
+      });
     }
     if (!tokenizerJson) {
       throw new Error(
@@ -588,6 +635,6 @@ export class Agent extends HookRegistry {
         `Incompatible model: tokenizer.json is missing or invalid in ${JSON.stringify(dir)}: ${String(error)}`,
       );
     }
-    return new Agent({ provider, tok, cfg, lang_temperatures: opts?.lang_temperatures });
+    return new Agent({ provider, tok, cfg, revision, lang_temperatures: opts?.lang_temperatures });
   }
 }

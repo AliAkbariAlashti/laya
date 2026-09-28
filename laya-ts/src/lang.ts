@@ -101,17 +101,32 @@ const STOP: Record<string, Set<string>> = {
 };
 
 const NON_EN_DIACRITICS = new Set(
-  ("àâäãáåçéèêëíìîïñóòôöõøúùûüýÿßæœ" +
-    "ăâîșțşţ" +
-    "ąćęłńśźż" +
-    "čďěňřšťůž" +
-    "őű" +
-    "ğı" +
-    "āēģīķļņūž" +
-    "đ").split(""),
+  ("àâäãáåçéèêëíìîïñóòôöõøúùûüýÿßæœ" +   // Western European
+    "ăâîșțşţ" +                            // Romanian
+    "ąćęłńśźż" +                           // Polish
+    "čďěňřšťůž" +                          // Czech / Slovak
+    "őű" +                                 // Hungarian
+    "ğı" +                                 // Turkish (text is lowercased before matching)
+    "āēģīķļņūž" +                          // Baltic
+    "đ" +                                  // Serbo-Croatian / Vietnamese
+    "ə").split(""),                        // Azerbaijani
 );
 
 export const NON_EN_DIACRITIC_RATE = 0.02;
+const ENGLISH_RESCUE_DIACRITIC_RATE = 0.06;
+
+// One accented loanword (`café`, `José`) clears the rate above on its own; two English-only function words
+// and at most one accented word keep the text English, as in laya/lang.py.
+function englishRescuedByWords(wordSet: Set<string>, diacRate: number): boolean {
+  if (diacRate >= ENGLISH_RESCUE_DIACRITIC_RATE) return false;
+  let englishOnly = 0;
+  let accented = 0;
+  for (const w of wordSet) {
+    if (EN_ONLY_WORDS.has(w)) englishOnly += 1;
+    if ([...w].some((ch) => NON_EN_DIACRITICS.has(ch))) accented += 1;
+  }
+  return englishOnly >= 2 && accented <= 1;
+}
 
 const SHARED_WORDS: Set<string> = (() => {
   const counts = new Map<string, number>();
@@ -122,8 +137,10 @@ const SHARED_WORDS: Set<string> = (() => {
   for (const [w, n] of counts) if (n > 1) out.add(w);
   return out;
 })();
+const EN_ONLY_WORDS = new Set([...STOP["en"]].filter((w) => !SHARED_WORDS.has(w)));
 
-const WORD_RE = /[^\W\d_]+/gu;
+// JS `\w` is ASCII-only, so Python's `[^\W\d_]` needs the Unicode classes spelled out (Nl/No are in Python's `\w`).
+const WORD_RE = /[\p{L}\p{Nl}\p{No}]+/gu;
 // Lookbehind for the same reason as the Python side (see laya/lang.py): without it the
 // greedy prefix is retried at every offset inside a run of word characters, which is
 // quadratic in the run's length -- 50 000 characters of one token took 1540 ms here.
@@ -149,16 +166,32 @@ function scriptOf(ch: string): string | null {
   return null;
 }
 
+/** String leaves of a state. Keys are ignored: they are usually English field names. */
+function iterText(state: unknown, depth = 0): string[] {
+  if (depth > 6 || state == null) return [];
+  if (typeof state === "string") return [state];
+  if (state instanceof Uint8Array) {
+    try {
+      return [new TextDecoder("utf-8", { fatal: true }).decode(state)];
+    } catch {
+      return [];
+    }
+  }
+  if (Array.isArray(state)) {
+    const out: string[] = [];
+    for (const v of state) out.push(...iterText(v, depth + 1));
+    return out;
+  }
+  if (typeof state === "object") {
+    const out: string[] = [];
+    for (const v of Object.values(state as object)) out.push(...iterText(v, depth + 1));
+    return out;
+  }
+  return [];
+}
+
 export function stateText(state: unknown, maxChars = 4000): string {
-  const parts: string[] = [];
-  const walk = (v: unknown, d: number): void => {
-    if (d > 6 || v == null) return;
-    if (typeof v === "string") { parts.push(v); return; }
-    if (Array.isArray(v)) { for (const x of v) walk(x, d + 1); return; }
-    if (typeof v === "object") { for (const x of Object.values(v as object)) walk(x, d + 1); }
-  };
-  walk(state, 0);
-  return parts.join(" ").slice(0, maxChars);
+  return iterText(state).join(" ").slice(0, maxChars);
 }
 
 export function detectScript(text: string): string {
@@ -289,7 +322,7 @@ export function latinProfile(text: string): LatinProfile {
     lang = bestLg;
   } else if (bestLg && nonEnglish && best >= Math.max(2, en)) {
     lang = bestLg;
-  } else if (en && !nonEnglish) {
+  } else if (en && (!nonEnglish || englishRescuedByWords(wordSet, diacRate))) {
     lang = "en";
   }
   return { language: lang, englishHits: en, diacriticRate: diacRate, looksNonEnglish: nonEnglish };
@@ -307,14 +340,77 @@ export interface AnalyseResult {
   languageUndecided: boolean;
   diacriticRate: number;
   nonLatinFraction: number;
+  mixedSegment: string | null;
+}
+
+// Code is not prose in any language, but split into words it reads as one: `os.path` is Portuguese
+// (`os`), `round(el, 2)` Spanish (`el`), `non_english` Italian (`non`). A line pasted from a program
+// into an English request must not count as a foreign segment, so a line carrying code syntax --
+// `=`, `;`, braces, brackets or a call `name(` -- is skipped, and dotted or underscored identifiers
+// are dropped from the rest. Prose keeps "Deu erro (500)": the parenthesis follows a space.
+const CODE_LINE_RE = /[=;{}[\]]|\w\(/;
+// Slash and backslash compounds are names, not sentences: `Nav/Com` and `OS/2` read as Portuguese
+// (`com`, `os`), `C:\DOS\mode` as Portuguese (`dos`), `ESA/UN` as Spanish (`un`). A whitespace token
+// holding a letter or digit, a joiner (`.`, `_`, `/`, `\`) and another letter or digit is an
+// identifier or a compound and is dropped whole.
+const JOINED_RE = /[^\W_][._/\\][^\W_]/;
+// An all-caps token inside mixed-case text is an acronym or a code: `MON`, `LA`, `EST`, `COM`, `DES`
+// are hockey teams, states, time zones and radio bands, not French or Portuguese. A segment written
+// entirely in capitals keeps its words -- a customer shouting in Portuguese is still Portuguese.
+const LETTER_RUN_RE = /[\p{L}]{2,}/gu;
+
+/** Language code for one non-code line, or null when it does not name a foreign language.
+ *
+ * Same evidence bar as `nonEnglishSegment`: four words, a language `latinProfile` will name,
+ * and two *different* words of that language. Acronyms and slash compounds are not words.
+ */
+function namedProseLanguage(segment: string): string | null {
+  if (!segment.trim() || CODE_LINE_RE.test(segment)) return null;
+  const prose = segment.split(/\s+/).filter((tok) => !JOINED_RE.test(tok)).join(" ");
+  // In mixed-case text, replace all-caps runs with spaces (they are acronyms).
+  let cleaned = prose;
+  if ([...prose].some((ch) => /\p{Ll}/u.test(ch))) {
+    cleaned = prose.replace(LETTER_RUN_RE, (m) => (m === m.toUpperCase() ? " " : m));
+  }
+  const tokens = cleaned.match(WORD_RE) ?? [];
+  if (tokens.length < 4) return null;
+  const lang = latinProfile(cleaned).language;
+  if (lang === null || lang === "en") return null;
+  const stopSet = STOP[lang];
+  if (!stopSet) return null;
+  const distinctHits = new Set(tokens.map((w) => w.toLowerCase()).filter((w) => stopSet.has(w)));
+  if (distinctHits.size < 2) return null;
+  return lang;
+}
+
+/** First line or field that, read on its own, is named a non-English language, else null.
+ *
+ * Returns [language, segment]. A segment needs the evidence a whole state needs -- at least four
+ * words, and a language named by `latinProfile` -- and, because one line carries far less text
+ * than a state, two things more: the words that name the language must be two *different* ones
+ * (`COM ... COM` in an English radio listing is one word seen twice), and acronyms and slash
+ * compounds are not words. This adds no new way to call English text foreign; it only stops a
+ * longer English part from outvoting a foreign one. Reads at most `maxChars` characters in all.
+ */
+function nonEnglishSegment(state: unknown, maxChars = 4000): [string, string] | null {
+  let seen = 0;
+  for (const leaf of iterText(state)) {
+    for (const seg of leaf.split("\n")) {
+      if (seen >= maxChars) return null;
+      const capped = seg.slice(0, maxChars - seen);
+      seen += capped.length;
+      const lang = namedProseLanguage(capped);
+      if (lang) return [lang, capped.trim()];
+    }
+  }
+  return null;
 }
 
 function round4(x: number): number {
   return Math.round(x * 10000) / 10000;
 }
 
-export function analyse(state: unknown): AnalyseResult {
-  const text = stateText(state);
+function analyseText(text: string): AnalyseResult {
   const prof = scriptProfile(text);
   let script = detectScript(text);
   const nonLatin = prof && Object.keys(prof).length ? round4(1.0 - (prof["latin"] ?? 0.0)) : 0.0;
@@ -340,14 +436,14 @@ export function analyse(state: unknown): AnalyseResult {
     return {
       script: "unknown", scriptProfile: prof, language: null,
       isEnglish: true, languageUndecided: true, diacriticRate: 0.0,
-      nonLatinFraction: 0.0,
+      nonLatinFraction: 0.0, mixedSegment: null,
     };
   }
   if (script !== "latin") {
     return {
       script, scriptProfile: prof, language: null,
       isEnglish: false, languageUndecided: true, diacriticRate: 0.0,
-      nonLatinFraction: nonLatin,
+      nonLatinFraction: nonLatin, mixedSegment: null,
     };
   }
   const profLat = latinProfile(text);
@@ -358,8 +454,78 @@ export function analyse(state: unknown): AnalyseResult {
     script: "latin", scriptProfile: prof, language: lang,
     isEnglish: english, languageUndecided: undecided,
     diacriticRate: round4(profLat.diacriticRate),
-    nonLatinFraction: nonLatin,
+    nonLatinFraction: nonLatin, mixedSegment: null,
   };
+}
+
+function alphaCount(text: string): number {
+  let n = 0;
+  for (const ch of text) if (IS_ALPHA_RE.test(ch)) n += 1;
+  return n;
+}
+
+/** A string value that is itself not safe for the English checkpoint, else null. */
+function leafNonEnglish(leaf: string): AnalyseResult | null {
+  const sample = leaf.slice(0, 4000);
+  if (!sample.trim()) return null;
+  const det = analyseText(sample);
+  if (det.isEnglish) return null;
+  if (det.language !== null && det.language !== "en") return det;
+  const nAlpha = alphaCount(sample);
+  if (det.script !== "latin" && det.script !== "unknown") {
+    if (nonLatinWords(sample).length > 0 && nAlpha >= NON_LATIN_MIN_LETTERS) return det;
+    return null;
+  }
+  const words = sample.match(WORD_RE) ?? [];
+  if (det.languageUndecided && det.diacriticRate >= NON_EN_DIACRITIC_RATE && words.length >= 4) {
+    return det;
+  }
+  return null;
+}
+
+export function analyse(state: unknown): AnalyseResult {
+  // One non-English string value is enough. Joining every value let a long English
+  // note fill the window, or outvote a short German message, and that message was
+  // then sent to the English checkpoint.
+  const result = analyseText(stateText(state));
+  if (result.script === "latin" && result.isEnglish) {
+    // A Portuguese ticket with an English stack trace, error payload or form template reads as
+    // English as a whole, because the English part is longer -- yet the part a question is about
+    // is the customer's, and the English checkpoint cannot read it. So a state that would go to
+    // English is checked line by line and field by field.
+    const leaves = iterText(state);
+    // a single line has no other part to be outvoted by, and was just read whole
+    if (leaves.length > 1 || leaves.some((leaf) => leaf.includes("\n"))) {
+      const found = nonEnglishSegment(state);
+      if (found) {
+        const [lang, mixed] = found;
+        return {
+          ...result,
+          language: lang,
+          isEnglish: false,
+          languageUndecided: false,
+          mixedSegment: mixed,
+        };
+      }
+    }
+  }
+  // A plain string was just read whole. A structured state can still hide a message past the
+  // segment cap, or in a script `latinProfile` does not name.
+  if (typeof state === "string" || state == null || state instanceof Uint8Array || !result.isEnglish) {
+    return result;
+  }
+  let best: AnalyseResult | null = null;
+  let bestN = -1;
+  for (const leaf of iterText(state)) {
+    const det = leafNonEnglish(leaf);
+    if (!det) continue;
+    const n = alphaCount(leaf.slice(0, 4000));
+    if (n > bestN) {
+      bestN = n;
+      best = det;
+    }
+  }
+  return best ?? result;
 }
 
 export function isEnglish(state: unknown): boolean {

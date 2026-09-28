@@ -58,6 +58,35 @@ describe("email+presets", () => {
     const out = cleanEmailBody("Please review the draft when you can.\nIt is two pages.\nWarmest regards,\nŁukasz");
     expect(out).toBe("Please review the draft when you can.\nIt is two pages.");
   });
+  // `From:` opens ordinary prose as well as a reply header, and a reply header always carries
+  // the sender, so the marker only cuts when an address follows -- Python's `From:\s.*[@<]`.
+  // The looser `From:\s.+$` this port shipped with deleted the rest of every request whose body
+  // happened to contain a line starting "From: ", which is issue #338 on the Python side.
+  it("keeps a request whose prose line starts with From: (Python parity)", () => {
+    const body = "Hi team, the export failed again this morning.\n"
+      + "From: my side the integration works, but the downstream job still times out.\n"
+      + "Could you take a look before Friday?";
+    expect(cleanEmailBody(body)).toBe(body);
+  });
+  it("still cuts a From: line that carries an address", () => {
+    const out = cleanEmailBody("Please refund my order\n\nFrom: Bob <bob@example.com>\nold text");
+    expect(out).toContain("Please refund my order");
+    expect(out).not.toContain("old text");
+  });
+  // A bare `From: Name` header has no address, so it is told apart from a sentence by its
+  // neighbours: the English client lines are the translations of the `De:` pair below.
+  it("cuts a bare From: name header followed by Sent:", () => {
+    const out = cleanEmailBody("Please refund order 123.\nFrom: Maria Souza\nSent: Monday\nold");
+    expect(out).toBe("Please refund order 123.");
+  });
+  it("does not cut a bare From: name with no header after it", () => {
+    const body = "Please refund order 123.\nFrom: Maria Souza\nPlease help with my refund.";
+    expect(cleanEmailBody(body)).toBe(body);
+  });
+  it("cuts a De: name header followed by a dated Date: (Python parity)", () => {
+    const out = cleanEmailBody("Please refund order 123.\nDe: Maria Souza\nDate: 12/09/2026\nold");
+    expect(out).toBe("Please refund order 123.");
+  });
   it("cuts thanks in advance plus a two-word name", () => {
     const out = cleanEmailBody("Please review the draft when you can.\nIt is two pages.\nThanks in advance,\nPriya Nair");
     expect(out).toBe("Please review the draft when you can.\nIt is two pages.");

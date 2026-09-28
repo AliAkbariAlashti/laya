@@ -15,7 +15,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from laya.agent import MPS_AMP_MIN_ROWS_DEFAULT, Agent, _amp_context, _mps_amp_min_rows  # noqa: E402
+from laya.agent import MPS_AMP_MIN_ROWS_DEFAULT, Agent, _amp_context, _cuda_amp_dtype, _mps_amp_min_rows  # noqa: E402
 from laya.common import DecisionModel, build_sequence, serialize_state  # noqa: E402
 
 PASS, FAIL = [], []
@@ -210,6 +210,17 @@ check("mps-gate/env invalid falls back", _mps_amp_min_rows(), MPS_AMP_MIN_ROWS_D
 del os.environ["LAYA_MPS_AMP_MIN_ROWS"]
 check("mps-gate/env default", _mps_amp_min_rows(), MPS_AMP_MIN_ROWS_DEFAULT)
 
+os.environ.pop("LAYA_CUDA_AMP", None)
+check("cuda-amp/checkpoint default wins when unset", _cuda_amp_dtype("bf16"), torch.bfloat16)
+check("cuda-amp/no checkpoint value means fp16", _cuda_amp_dtype(None), torch.float16)
+os.environ["LAYA_CUDA_AMP"] = "fp16"
+check("cuda-amp/env fp16 overrides a bf16 checkpoint", _cuda_amp_dtype("bf16"), torch.float16)
+os.environ["LAYA_CUDA_AMP"] = "BF16"
+check("cuda-amp/env bf16 overrides an fp16 checkpoint", _cuda_amp_dtype("fp16"), torch.bfloat16)
+os.environ["LAYA_CUDA_AMP"] = "int8"
+check("cuda-amp/env invalid falls back to the checkpoint", _cuda_amp_dtype("bf16"), torch.bfloat16)
+del os.environ["LAYA_CUDA_AMP"]
+
 
 # ------------------------------------------------------------------ amp context shape
 # A disabled gate must never construct torch.autocast: on torch builds without an MPS
@@ -229,6 +240,59 @@ check("amp-context/enabled cpu is autocast",
 cpu_disabled = _bare_agent(FakeModel())  # amp=False
 cpu_disabled._infer(batch)
 check("amp-context/_infer disabled completes", True, True)
+
+
+# ------------------------------------------------------------------ OOM fallback observability (#351)
+class FakeCUDAInput:
+    """An input_ids that fails the way a real CUDA OOM does when moved off CPU.
+
+    Only `input_ids` needs this: it is the first tensor `_infer` moves, so the
+    failure fires before the other (real, CPU-safe) tensors are touched, and on
+    the CPU retry `.to('cpu')` passes it straight through.
+    """
+
+    shape = (1, 8)
+
+    def __init__(self):
+        self.moves = 0
+
+    def to(self, device):
+        self.moves += 1
+        if str(device) != "cpu":
+            raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
+        return self
+
+
+class ImmovableModel:
+    """Accepts model.to() without moving anything (there is no real tensor to move)."""
+
+    def to(self, device):
+        self.placed = str(device)
+        return self
+
+    def __call__(self, *args):
+        return torch.zeros((1, 2)), torch.zeros((1, 2))
+
+
+oom_batch = dict(batch, input_ids=FakeCUDAInput())
+oom = _bare_agent(ImmovableModel(), dtype=torch.float16)
+oom.device = torch.device("cuda")   # the OOM branch only reads .type
+check("oom-fallback/count starts at 0", oom.cpu_fallback_count, 0)
+check("oom-fallback/reason starts None", oom.last_fallback_reason, None)
+
+out = oom._infer(oom_batch)          # first forward raises OOM -> scoped CPU retry
+check("oom-fallback/retry answered", isinstance(out, tuple), True)
+check("oom-fallback/count recorded", oom.cpu_fallback_count, 1)
+check("oom-fallback/reason recorded",
+      "out of memory" in (oom.last_fallback_reason or ""), True)
+check("oom-fallback/scoped: device restored", oom.device.type, "cuda")
+
+oom._infer(oom_batch)                # a second OOM accumulates
+check("oom-fallback/second OOM counts too", oom.cpu_fallback_count, 2)
+
+# a plain forward never touches the counters
+check("oom-fallback/plain CPU infer stays 0", cpu_disabled.cpu_fallback_count, 0)
+check("oom-fallback/plain CPU reason stays None", cpu_disabled.last_fallback_reason, None)
 
 
 # ------------------------------------------------------------------ report

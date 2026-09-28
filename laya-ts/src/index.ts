@@ -13,7 +13,7 @@ export type {
   AgentOptions,
   PredictOptions,
 } from "./agent.js";
-export { createNodeProvider, createWebProvider, feed, feedHead, loadNodeBundle, loadWebBundle } from "./providers.js";
+export { createNodeProvider, createWebProvider, feed, feedHead, loadNodeBundle, loadWebBundle, PINNED_REVISIONS, resolveRevision } from "./providers.js";
 export type { Batch, SessionProvider, ProviderOptions, NodeBundle, WebBundle } from "./providers.js";
 export { Router, normaliseName, DEFAULT_MODELS } from "./router.js";
 export type { RoutedResult, RouteDecision, ModelName, ModelSpec } from "./router.js";

@@ -206,7 +206,7 @@ How often the answer changes when the options are permuted. Jev measured at 0.13
 At 20 options both are less order-stable than Jev — worth fixing with more aggressive option-order shuffling during training.
 
 
-## Other hardware: GB10 and a laptop CPU
+## Other hardware: GB10, a laptop CPU, and an Intel Arc
 
 Contributed measurements from a router deployment (laya 0.3.5). They were taken through a small HTTP server wrapping `Agent.system_one`, not in-process, so every figure includes one HTTP round trip.
 
@@ -241,6 +241,18 @@ With inter-op pinned, one question in-process on a quieter host:
 | 10 (every vCPU) | 388 ms | 708 ms |
 
 The best setting is the physical core count plus a little, not one thread per vCPU. SMT siblings contend.
+
+### Intel Arc B390 (torch 2.14.0+xpu), XPU — before/after vs CPU
+
+`english` checkpoint (421M, ModernBERT-large), in-process `agent.predict()`, one 2-option `choice` question (~90 tokens), 40 calls per row after 5 warm-ups. XPU row at the default bf16 with autocast (XPU autocast supports bf16/fp16 only); CPU row fp32, pinned as recommended above (intra-op 8, inter-op 1). Rows measured on the same laptop; CPU rows are stable across sessions (p95 within ~10% of p50).
+
+| questions per call | CPU p50 | XPU p50 | XPU p95 | speedup (p50) |
+|---|---|---|---|---|
+| 1 | 288.2 ms | **29.7 ms** | 30.4 ms | 9.7x |
+| 3 | 730.6 ms | **45.4 ms** | 46.8 ms | 16.1x |
+| 10 | 2608.7 ms | **96.9 ms** | 102.5 ms | 26.9x |
+
+CPU scales roughly linearly with question count (288.2 -> 2608.7 ms, 9.1x for 10x the questions), while XPU scales sub-linearly (29.7 -> 96.9 ms, 3.3x), so the speedup widens from ~10x to ~27x. The XPU p95 stays within ~6% of its p50 on every row (30.4, 46.8, 102.5). At one question the Arc B390 is slightly faster than the T4's 32.8 ms p50 above.
 
 ### Calibration on a routing task runs the other way
 
@@ -304,6 +316,34 @@ fast path is (0.0446 against 0.0455), so this table does not show that the fast 
 Dataset accuracy / ECE (AG News, dair-ai emotion, 1,000 samples each) are identical within noise; see
 `benchmarks/bench_fast.py --eval 1000`.
 
+### fp16
+
+The fast path runs in the agent's autocast dtype when `accelerate()` is called, so an agent set to fp16
+(`agent.dtype = torch.float16`, or the CUDA autocast override proposed for #443) gets fp16 kernels and fp16
+weights; the residual stream and every accumulation stay fp32 in both dtypes. Same fixed set,
+`parity_fast.py --dtype fp16 | bf16`, RTX 4070 Ti SUPER; per-option probabilities in
+`benchmarks/results/parity_*_rtx4070.json` (the bf16 columns are the table above, plus a bf16 run of
+`laya-typed-decisions`):
+
+| checkpoint | type | n | max \|p_fast - p_fp32\| bf16 | max \|p_fast - p_fp32\| fp16 | argmax fast = fp32, bf16 | fp16 |
+|---|---|---|---|---|---|---|
+| laya | choice | 48 | 0.022 | **0.004** | 47/48 | 48/48 |
+| laya | noul | 180 | 0.043 | **0.005** | 180/180 | 180/180 |
+| laya | score | 60 | 0.011 | **0.003** | 60/60 | 60/60 |
+| laya-multilingual | choice | 48 | 0.015 | **0.002** | 47/48 | 48/48 |
+| laya-multilingual | noul | 180 | 0.045 | **0.009** | 179/180 | 180/180 |
+| laya-multilingual | score | 60 | 0.009 | **0.001** | 59/60 | 60/60 |
+| laya-typed-decisions | choice | 48 | 0.019 | **0.002** | 47/48 | 47/48 |
+| laya-typed-decisions | noul | 180 | 0.023 | **0.005** | 180/180 | 180/180 |
+| laya-typed-decisions | score | 60 | 0.009 | **0.001** | 60/60 | 60/60 |
+
+In fp16 the fast path is 3-10x closer to fp32 than in bf16 and agrees with the fp16 stock path on every argmax
+(864/864; the most it moves a probability against fp16 stock is 0.009). The one fp16 disagreement with fp32 is a
+`laya-typed-decisions` choice question whose top two options are 0.001 apart in fp32; the fp16 stock path flips it too.
+`agent.predict()` latency shows no consistent difference between the dtypes: on every case of the table below, on
+both checkpoints, fp16 and bf16 are within 10% of each other in both directions (single runs of 50 iterations), for
+stock and fast alike.
+
 ### Latency, `agent.predict()` end to end (ms, incl. tokenization)
 
 | checkpoint | case | stock | fast | speedup |
@@ -323,3 +363,46 @@ graph removes that. Large batches are GEMM bound; the fused kernels sit at ~80 T
 cuBLAS, so the gain comes from the fused epilogues and the sliding-window attention (16× faster than SDPA
 with a dense mask at L=1024). First use of a new length bucket compiles kernels (a few seconds, cached on
 disk); inputs ≤256 tokens share one dynamic-shape kernel and never recompile.
+
+## Community evaluation: zh-CN / zh-TW (external, 2026-09-25)
+
+From [@CodyQin](https://github.com/CodyQin)'s [zh-decision-bench](https://github.com/CodyQin/zh-decision-bench) (dataset CC BY 4.0, raw predictions published). Three parts:
+
+### 1. Same-methodology rerun of Part A (zh only, current package)
+
+`bench_local.py` Part A rerun on laya **0.3.20** (CUDA), public checkpoints, `--per-lang 100`, seed 13 — result file: `research/results/zh_rerun_part_a.json`. The english checkpoint's accuracies replicate the sweep above **exactly**; multilingual zh-TW improves under 0.3.20 + the temperature clamp.
+
+| checkpoint | zh-CN acc / ECE | zh-TW acc / ECE | vs sweep above (0.2.0, pre-clamp) |
+|---|---|---|---|
+| english | 0.620 / 0.320 | 0.460 / 0.434 | accuracy identical (0.62 / 0.46); ECE lower post-clamp |
+| multilingual | 0.650 / 0.219 | 0.610 / 0.266 | zh-CN within noise; zh-TW 0.54 -> 0.61 |
+
+### 2. zh-decision-bench: business-scenario eval set (laya-evals format)
+
+219 items / 284 questions: MASSIVE zh-CN dev (quality-filtered, 6-domain routing) plus human-adjudicated synthetic e-commerce CS and content-moderation items. Ships in this harness's format as `research/evals/zh_decision_bench.jsonl`:
+
+```bash
+laya-evals run research/evals/zh_decision_bench.jsonl --model multilingual --slice tag
+```
+
+Results (laya 0.3.20, CUDA; bootstrap CIs and raw predictions in the source repo):
+
+| checkpoint | voice routing (n=179) | CS routing (n=25) | urgency (n=25) | scam/promo (n=15) | escalate (n=40) |
+|---|---|---|---|---|---|
+| multilingual | 0.883 / 0.061 | 0.640 / 0.293 | 0.560 / 0.091 | 0.667 / 0.311 | 0.550 / 0.230 |
+| english | 0.754 / 0.281 | 0.520 / 0.184 | 0.520 / 0.207 | 0.667 / 0.321 | 0.575 / 0.269 |
+
+Also measured: option-order flip rate 28% (CS) / 10.6% (voice); zh-CN to native zh-TW parallel-utterance flip rate 12.8%. Task framing differs from the sweep above (6-domain routing vs 20-way intent), so these complement rather than compare.
+
+### 3. Temperature refit for zh (official `temp_bucket` convention)
+
+Refit on zh-decision-bench (multilingual checkpoint; 50/50 fit/test split by item hash), clamped to `[0.5, 5]`:
+
+| bucket | T raw | T clamped | test ECE before -> after |
+|---|---|---|---|
+| choice:6-10 | 1.52 | 1.52 | 0.062 -> 0.093 |
+| choice:3-5 | 2.61 | 2.61 | 0.329 -> 0.352 |
+| score:3-5 | 1.33 | 1.33 | 0.118 -> 0.126 |
+| noul:2 | 10.23 | 5.00 | 0.180 -> 0.098 |
+
+The `noul:2` raw fit (10.2) exceeds `TEMP_MAX`: Chinese binary-judgment over-confidence outruns the shipped clamp's correction range (NLL still improves, 0.79 -> 0.55).

@@ -3,7 +3,7 @@ import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Agent, checkQuestion, toInternal } from "../src/agent.js";
-import { buildSequence } from "../src/common.js";
+import { buildSequence, renderOptions } from "../src/common.js";
 import { loadNodeBundle } from "../src/providers.js";
 
 const tokenizer = () => ({
@@ -53,9 +53,41 @@ describe("audit regressions", () => {
     expect(() => checkQuestion("q", { type: "choice", instructions: "?", criteria: ["yes"], labels: { false: "No", true: "Yes" } })).toThrow("labels");
   });
 
+  it("treats a null or undefined noul `labels` as the defaults, as Python does", () => {
+    const defaults = renderOptions(toInternal({ type: "noul", instructions: "?" }));
+    for (const labels of [null, undefined]) {
+      const q = { type: "noul", instructions: "?", labels };
+      expect(() => checkQuestion("q", q)).not.toThrow();
+      expect(renderOptions(toInternal(q))).toEqual(defaults);
+    }
+    for (const labels of ["x", [], {}, 5, { false: "No" }]) {
+      expect(() => checkQuestion("q", { type: "noul", instructions: "?", labels })).toThrow("labels");
+    }
+    expect(() => checkQuestion("q", { type: "choice", instructions: "?", criteria: ["a"], labels: null })).toThrow("labels");
+  });
+
+  it("reads noul criteria keys case-insensitively, as Python does", () => {
+    const upper = { type: "noul", instructions: "?", criteria: { True: "it holds", FALSE: "it does not" } };
+    const lower = { type: "noul", instructions: "?", criteria: { true: "it holds", false: "it does not" } };
+    expect(() => checkQuestion("q", upper)).not.toThrow();
+    expect(toInternal(upper).crit).toEqual({ true: "it holds", false: "it does not" });
+    expect(renderOptions(toInternal(upper))).toEqual(renderOptions(toInternal(lower)));
+    expect(() => checkQuestion("q", { type: "noul", instructions: "?", criteria: { True: "x", maybe: "y" } })).toThrow("maybe");
+    expect(() => checkQuestion("q", { type: "noul", instructions: "?", criteria: { yes: "x" } })).toThrow("yes");
+  });
+
   it("rejects a null score level, as Python does (#302)", () => {
     expect(() => checkQuestion("q", { type: "score", instructions: "?", criteria: ["low", null, "high"] })).toThrow("level 1");
     expect(() => checkQuestion("q", { type: "score", instructions: "?", criteria: ["low", "mid", undefined] })).toThrow("level 2");
+  });
+
+  it("rejects a nested choice label, as Python does (#425)", () => {
+    const check = (criteria: unknown[]) => () => checkQuestion("q", { type: "choice", instructions: "?", criteria });
+    expect(check(["yes", { k: 1 }])).toThrow("choice label 1 is a dict");
+    expect(check([["y", ["z"]], "no"])).toThrow("choice label 0 is a list");
+    expect(check(["a", "b", [1]])).toThrow('question "q": choice label 2 is a list');
+    expect(check(["a", 1, true, null, 2.5])).not.toThrow();
+    expect(() => checkQuestion("q", { type: "choice", instructions: "?", criteria: { a: "x", b: { d: 1 } } })).not.toThrow();
   });
 
   it("rejects malformed provider output", async () => {

@@ -20,6 +20,50 @@ class FakeRouter:
         }
 
 
+def test_serve_rejects_large_answer_option_map_before_inference():
+    from fastapi.testclient import TestClient
+
+    class RecordingRouter(FakeRouter):
+        def __init__(self):
+            self.calls = []
+
+        def predict(self, state, questions, model=None):
+            self.calls.append((state, questions))
+            return super().predict(state, questions, model=model)
+
+    router = RecordingRouter()
+    client = TestClient(create_app(router=router))
+    response = client.post("/v1/systemone", json={
+        "state": "hello",
+        "questions": {
+            "q": {
+                "type": "choice",
+                "instructions": "pick one",
+                "criteria": {str(i): None for i in range(101)},
+            }
+        },
+    })
+    assert response.status_code == 413
+    assert router.calls == []
+
+
+def test_serve_rejects_total_answer_option_amplification():
+    from fastapi.testclient import TestClient
+
+    client = TestClient(create_app(router=FakeRouter()))
+    questions = {
+        "q%d" % i: {
+            "type": "choice",
+            "instructions": "pick one",
+            "criteria": {str(j): None for j in range(100)},
+        }
+        for i in range(6)
+    }
+    response = client.post("/v1/systemone", json={"state": "hello", "questions": questions})
+    assert response.status_code == 413
+    assert "across questions" in response.json()["detail"]
+
+
 def test_serve_rejects_oversized_stream_without_content_length():
     from fastapi.testclient import TestClient
 

@@ -1,6 +1,15 @@
 import type { TokenizerLike } from "./tokenizer.js";
 export type QType = "choice" | "score" | "noul";
 export interface InternalQ { t: QType; ins: string; crit: unknown; labels?: { false: string; true: string } }
+/** Python `json.dumps` for a finite number. JavaScript prints the same shortest round-trip
+digits, but Python switches to exponent notation below 1e-4 (JavaScript: below 1e-6) and pads the
+exponent to two digits (`5e-05`, not `5e-5`). An integer-valued number prints as before, which
+matches a Python int below 1e21: JavaScript cannot tell Python's `49.0` from `49`. */
+function pyNumber(v: number): string {
+  const [mant, exp] = v.toExponential().split("e");
+  const e = Number(exp);
+  return e >= -4 ? String(v) : `${mant}e-${String(-e).padStart(2, "0")}`;
+}
 /** Python `json.dumps(v, ensure_ascii=False)` replica: separators (", ", ": "),
 unicode raw, unknown types fall back to undefined (caller applies str()). */
 function pyJson(v: unknown): string | undefined {
@@ -10,7 +19,7 @@ function pyJson(v: unknown): string | undefined {
     if (Number.isNaN(v)) return "NaN";
     if (v === Infinity) return "Infinity";
     if (v === -Infinity) return "-Infinity";
-    return JSON.stringify(v);
+    return pyNumber(v);
   }
   if (Array.isArray(v)) return `[${v.map((x) => pyJson(x) ?? "null").join(", ")}]`;
   if (typeof v === "object") {
@@ -29,7 +38,14 @@ export function serializeState(state: unknown): string {
   if (typeof state === "string") return state;
   return pyJson(state) ?? String(state);
 }
-function renderCriterion(v: unknown): string {
+/** The text of a criterion: the string itself, else the JSON the model was shown.
+ *
+ * Exported because `agent.ts` needs it for a `score` answer's `legend`, which maps an index to the
+ * text of that level. Putting the raw value in made the response's JSON types depend on the
+ * caller's input -- a numeric scale came back as `{"0": 1}`, a boolean as `{"0": true}` and a null
+ * as `{"0": null}`, which a Jev client refuses to parse (#302).
+ */
+export function renderCriterion(v: unknown): string {
   return typeof v === "string" ? v : pyJson(v) ?? String(v);
 }
 export function renderOptions(q: InternalQ): string[] {
@@ -86,7 +102,8 @@ export function buildQuestionPrefix(tok: TokenizerLike, q: InternalQ,
 export function sequenceWithState(prefix: QuestionPrefix, stateIds: number[], sepId: number,
     maxLen = 512, truncateLeft = false): { ids: number[]; markers: number[] } {
   const room = Math.max(0, maxLen - prefix.ids.length - 1);
-  const st = truncateLeft ? stateIds.slice(-room) : stateIds.slice(0, room);
+  // not stateIds.slice(-room): with no room left, slice(-0) is the whole state rather than none of it
+  const st = truncateLeft ? stateIds.slice(Math.max(0, stateIds.length - room)) : stateIds.slice(0, room);
   const ids = [...prefix.ids, ...st, sepId].slice(0, maxLen);
   return { ids, markers: prefix.markers.filter((m) => m < maxLen) };
 }
@@ -126,6 +143,12 @@ export function tempBucket(qtype: number, k: number): string {
   const size = k <= 2 ? "2" : k <= 5 ? "3-5" : k <= 10 ? "6-10" : "11+";
   return `${["choice", "score", "noul"][qtype]}:${size}`;
 }
+/** Max of a length list without spread (Math.max(...arr) throws RangeError past ~100k args). */
+export function maxOf(values: ArrayLike<number>, fallback = 0): number {
+  let m = fallback;
+  for (let i = 0; i < values.length; i++) if (values[i] > m) m = values[i];
+  return m;
+}
 export interface CollateItem {
   ids: number[];
   markers: number[];
@@ -148,8 +171,12 @@ export interface CollatedBatch {
 export function collateItems(batch: CollateItem[][], padId: number): CollatedBatch | null {
   const items = (batch ?? []).flat();
   if (items.length === 0) return null;
-  const L = Math.max(...items.map((it) => it.ids.length));
-  const K = Math.max(...items.map((it) => it.markers.length));
+  let L = 0;
+  let K = 0;
+  for (const it of items) {
+    if (it.ids.length > L) L = it.ids.length;
+    if (it.markers.length > K) K = it.markers.length;
+  }
   const hasTarget = items.some((it) => "target" in it);
   const inputIds = items.map((it) => [...it.ids, ...Array(L - it.ids.length).fill(padId)]);
   const attentionMask = items.map((it) => [...Array(it.ids.length).fill(1), ...Array(L - it.ids.length).fill(0)]);

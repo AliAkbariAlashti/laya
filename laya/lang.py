@@ -12,6 +12,7 @@ is explicitly best-effort: pass an explicit model or `lang=` when you already kn
 """
 import re
 import unicodedata
+from collections.abc import Mapping
 from typing import Dict, List, Optional, Union
 
 # Unicode blocks that the English (ModernBERT-large, 50k English BPE) checkpoint cannot read.
@@ -172,6 +173,9 @@ _NON_EN_DIACRITICS = set(
 # way), though it still counts toward the total of a language that also matched a word of its own.
 _SHARED_WORDS = {w for w in {word for words in _STOP.values() for word in words}
                  if sum(w in words for words in _STOP.values()) > 1}
+# English function words no other list holds (`in`, `is`, `as`, `was` are shared with German,
+# Dutch and Portuguese). They alone carry the English rescue of `latin_profile`.
+_EN_ONLY_WORDS = _STOP["en"] - _SHARED_WORDS
 
 _WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
 # A token whose dot or @ joins word characters is an identifier, not prose: `github.com`,
@@ -190,13 +194,23 @@ _WORD = re.compile(r"[^\W\d_]+", re.UNICODE)
 _IDENTIFIER = re.compile(r"(?<![\w-])[\w-]*(?:[.@][\w-]+)+", re.UNICODE)
 
 
-def _iter_text(state: Union[str, dict, list, None], _depth: int = 0) -> List[str]:
-    """Collect the string leaves of a state (str / dict / list), so detection sees real content."""
+def _iter_text(state: Union[str, bytes, Mapping, list, None], _depth: int = 0) -> List[str]:
+    """Collect the string leaves of a state, so detection sees real content.
+
+    Keys are ignored: they are usually English field names. Any mapping counts, not only
+    `dict` -- a UserDict or mappingproxy has the same string values and used to contribute
+    nothing, which made `analyse` report no letters and the router fall through to English.
+    """
     if _depth > 6 or state is None:
         return []
     if isinstance(state, str):
         return [state]
-    if isinstance(state, dict):
+    if isinstance(state, (bytes, bytearray)):
+        try:
+            return [bytes(state).decode("utf-8")]
+        except UnicodeDecodeError:
+            return []
+    if isinstance(state, Mapping):
         out = []
         for v in state.values():
             out.extend(_iter_text(v, _depth + 1))
@@ -209,7 +223,7 @@ def _iter_text(state: Union[str, dict, list, None], _depth: int = 0) -> List[str
     return []
 
 
-def state_text(state: Union[str, dict, list, None], max_chars: int = 4000) -> str:
+def state_text(state: Union[str, bytes, Mapping, list, None], max_chars: int = 4000) -> str:
     """Flatten a state into the text used for detection (keys are ignored: they are usually English)."""
     parts: List[str] = []
     budget = max_chars
@@ -295,6 +309,13 @@ def script_profile(text: str) -> Dict[str, float]:
 # stopword list matches it.
 NON_EN_DIACRITIC_RATE = 0.02
 
+# One accented loanword or proper noun (`café`, `résumé`, `José`) must not alone pull otherwise
+# plain English off the English checkpoint: the rate is measured over every character, so a
+# single `é` in a short sentence clears the floor above. English function words keep their say
+# only through the rescue below -- two distinct words no other list holds, at most one
+# non-English letter word, and a rate still well above the floor vetoes regardless.
+ENGLISH_RESCUE_DIACRITIC_RATE = 0.06
+
 # Non-Latin text is not for the English checkpoint even when Latin letters are the plurality: a
 # brand name or order code outvotes the CJK request around it letter for letter, though one CJK
 # character carries far more than a letter. A short message needs a large share to count; a long
@@ -341,6 +362,23 @@ def _non_latin_words(text: str) -> List[str]:
     return [w for w in runs if len(w) >= 2 and not w[0].isupper()]
 
 
+def _english_rescued_by_words(words: List[str], diac_rate: float) -> bool:
+    """Whether plain-English function words outvote a marginal diacritic rate (#337).
+
+    The rate is measured over every character, so one accented loanword or proper noun in a
+    short sentence clears `NON_EN_DIACRITIC_RATE` outright. English still wins when it shows at
+    least two distinct function words no other list holds and at most one word carrying a
+    non-English letter: one loanword is not a non-English vocabulary, while the odd word a
+    Danish or Swedish sentence picks up (`i`, `at`, `for`, `have`) is not an English sentence
+    either. A rate well above `ENGLISH_RESCUE_DIACRITIC_RATE` vetoes regardless.
+    """
+    if diac_rate >= ENGLISH_RESCUE_DIACRITIC_RATE:
+        return False
+    if len(set(words) & _EN_ONLY_WORDS) < 2:
+        return False
+    return sum(1 for w in set(words) if any(ch in _NON_EN_DIACRITICS for ch in w)) <= 1
+
+
 def latin_profile(text: str) -> Dict[str, object]:
     """Evidence behind the Latin-script language guess.
 
@@ -381,7 +419,7 @@ def latin_profile(text: str) -> Dict[str, object]:
         # Needs two hits here too. One shared function word ("para" in Turkish text) named Spanish
         # on the strength of the diacritics alone, which is a guess dressed as a detection.
         lang = best_lg
-    elif en and not non_english:
+    elif en and (not non_english or _english_rescued_by_words(words, diac_rate)):
         lang = "en"
     return {"language": lang, "english_hits": en, "diacritic_rate": diac_rate,
             "looks_non_english": non_english}
@@ -417,7 +455,29 @@ _JOINED = re.compile(r"[^\W_][._/\\][^\W_]")
 _LETTER_RUN = re.compile(r"[^\W\d_]{2,}")
 
 
-def _non_english_segment(state: Union[str, dict, list, None], max_chars: int = 4000):
+def _named_prose_language(segment: str):
+    """Language code for one non-code line, or None when it does not name a foreign language.
+
+    Same evidence bar as `_non_english_segment`: four words, a language `latin_profile` will name,
+    and two *different* words of that language. Acronyms and slash compounds are not words.
+    """
+    if not segment.strip() or _CODE_LINE.search(segment):
+        return None
+    prose = " ".join(tok for tok in segment.split() if not _JOINED.search(tok))
+    if any(ch.islower() for ch in prose):
+        prose = _LETTER_RUN.sub(lambda m: " " if m.group().isupper() else m.group(), prose)
+    tokens = _WORD.findall(prose)
+    if len(tokens) < 4:
+        return None
+    lang = latin_profile(prose)["language"]
+    if lang in (None, "en"):
+        return None
+    if len({w.lower() for w in tokens} & _STOP.get(lang, set())) < 2:
+        return None
+    return lang
+
+
+def _non_english_segment(state: Union[str, bytes, Mapping, list, None], max_chars: int = 4000):
     """First line or field that, read on its own, is named a non-English language, else None.
 
     Returns (language, segment). A segment needs the evidence a whole state needs -- at least four
@@ -434,28 +494,18 @@ def _non_english_segment(state: Union[str, dict, list, None], max_chars: int = 4
                 return None
             seg = seg[:max_chars - seen]
             seen += len(seg)
-            if _CODE_LINE.search(seg):
-                continue
-            prose = " ".join(tok for tok in seg.split() if not _JOINED.search(tok))
-            if any(ch.islower() for ch in prose):
-                prose = _LETTER_RUN.sub(lambda m: " " if m.group().isupper() else m.group(), prose)
-            tokens = _WORD.findall(prose)
-            if len(tokens) < 4:
-                continue
-            lang = latin_profile(prose)["language"]
-            if lang not in (None, "en") and len({w.lower() for w in tokens} & _STOP.get(lang, set())) >= 2:
+            lang = _named_prose_language(seg)
+            if lang:
                 return lang, seg.strip()
     return None
 
 
-def analyse(state: Union[str, dict, list, None]) -> Dict[str, object]:
-    """Full detection result for a state.
+def _analyse_text(text: str) -> Dict[str, object]:
+    """Detection result for one already-flattened string.
 
-    Returns `script`, `script_profile`, `language` (best effort, may be None),
-    `is_english`, `non_latin_fraction` and `mixed_segment` (the line or field that made a mostly
-    English state non-English, else None).
+    Does not look for a foreign line inside mostly-English text. `analyse` does that, because it
+    needs the original state and not only the joined window.
     """
-    text = state_text(state)
     counts = _script_counts(text)
     prof = _profile_from_counts(counts)
     script = _script_from_counts(counts)
@@ -481,25 +531,112 @@ def analyse(state: Union[str, dict, list, None]) -> Dict[str, object]:
     # such letters (including short English) still goes to the English one.
     undecided = lang is None
     english = lang == "en" or (undecided and not prof_lat["looks_non_english"])
-    # A Portuguese ticket with an English stack trace, error payload or form template reads as
-    # English as a whole, because the English part is longer -- yet the part a question is about is
-    # the customer's, and the English checkpoint cannot read it (0.97 confidence at 0.47 accuracy on
-    # `pt`). The cost is lopsided: English sent to multilingual loses a few points, the reverse loses
-    # calibration. So a state that would go to English is checked line by line and field by field.
-    mixed = None
-    leaves = _iter_text(state)
-    # a single line has no other part to be outvoted by, and was just read whole
-    if english and (len(leaves) > 1 or any("\n" in leaf for leaf in leaves)):
-        found = _non_english_segment(state)
-        if found:
-            lang, mixed = found
-            english, undecided = False, False
     return {"script": "latin", "script_profile": prof, "language": lang,
             "is_english": english, "language_undecided": undecided,
             "diacritic_rate": round(float(prof_lat["diacritic_rate"]), 4),
-            "non_latin_fraction": non_latin, "mixed_segment": mixed}
+            "non_latin_fraction": non_latin, "mixed_segment": None}
 
 
-def is_english(state: Union[str, dict, list, None]) -> bool:
+def _leaf_non_english(leaf: str) -> Optional[Dict[str, object]]:
+    """A string value that is itself not safe for the English checkpoint, else None.
+
+    A one-word name ("José") and a capitalised non-Latin name stay out: the same rules
+    `latin_profile` and `_non_latin_words` already use, so a name field cannot pull an
+    English ticket onto the multilingual checkpoint. Code lines, acronyms and slash compounds
+    stay out too, matching `_non_english_segment`, so a pasted traceback is not a message.
+    Each line is capped at 4000 characters; unlike the segment scan, a long earlier field
+    does not consume the budget of the next one (#384).
+    """
+    best_n = -1
+    best: Optional[Dict[str, object]] = None
+    for line in leaf.split("\n"):
+        # A line this short cannot be selected, so skip it before the slice, `strip`,
+        # `_CODE_LINE` and a full `_analyse_text` pass. Each branch below needs four `_WORD`
+        # tokens or NON_LATIN_MIN_LETTERS letters. `_WORD` matches maximal runs of letters and
+        # letter-like numerals, so four tokens need three separators between them: seven
+        # characters, and ten letters need ten. What makes seven safe rather than six is that
+        # every one of those counts is taken on the raw line -- `İ` lowers to two code points, so
+        # counting on `sample.lower()` would let a four-character line reach four tokens, which is
+        # why `latin_profile` replaces `İ` before lowering.
+        if len(line) < 7:
+            continue
+        sample = line[:4000]
+        if not sample.strip() or _CODE_LINE.search(sample):
+            continue
+        det = _analyse_text(sample)
+        if det["is_english"]:
+            continue
+        if det["language"] not in (None, "en"):
+            if _named_prose_language(sample) is None:
+                continue
+        elif det["script"] not in ("latin", "unknown"):
+            if not (_non_latin_words(sample) and sum(ch.isalpha() for ch in sample) >= NON_LATIN_MIN_LETTERS):
+                continue
+        elif not (det["language_undecided"] and float(det["diacritic_rate"]) >= NON_EN_DIACRITIC_RATE
+                  and len(_WORD.findall(sample)) >= 4):
+            continue
+        n_alpha = sum(ch.isalpha() for ch in sample)
+        if n_alpha > best_n:
+            best_n = n_alpha
+            best = det
+    return best
+
+
+def analyse(state: Union[str, bytes, Mapping, list, None]) -> Dict[str, object]:
+    """Full detection result for a state.
+
+    Returns `script`, `script_profile`, `language` (best effort, may be None),
+    `is_english`, `non_latin_fraction` and `mixed_segment` (the line or field that made a mostly
+    English state non-English, else None).
+
+    String values are what get read. When a state has several of them, one non-English value is
+    enough: joining every value into one window let a long English note fill the 4000 characters,
+    or outvote a short German message, and that message was then sent to the English checkpoint
+    (#384). The segment scan still stops at 4000 characters, which is what keeps a huge field
+    cheap; a value it did not reach is read on its own afterwards.
+    """
+    result = _analyse_text(state_text(state))
+    if result["script"] == "latin" and result["is_english"]:
+        # A Portuguese ticket with an English stack trace, error payload or form template reads as
+        # English as a whole, because the English part is longer -- yet the part a question is about
+        # is the customer's, and the English checkpoint cannot read it (0.97 confidence at 0.47
+        # accuracy on `pt`). The cost is lopsided: English sent to multilingual loses a few points,
+        # the reverse loses calibration. So a state that would go to English is checked line by line
+        # and field by field.
+        leaves = _iter_text(state)
+        # a single line has no other part to be outvoted by, and was just read whole
+        if len(leaves) > 1 or any("\n" in leaf for leaf in leaves):
+            found = _non_english_segment(state)
+            if found:
+                lang, mixed = found
+                result = dict(result)
+                result["language"] = lang
+                result["is_english"] = False
+                result["language_undecided"] = False
+                result["mixed_segment"] = mixed
+    # A plain string was just read whole. A structured state can still hide a message past the
+    # segment cap, or in a script `latin_profile` does not name.
+    if isinstance(state, (str, bytes, bytearray)) or state is None or not result["is_english"]:
+        return result
+    best_n = -1
+    best: Optional[Dict[str, object]] = None
+    for leaf in _iter_text(state):
+        det = _leaf_non_english(leaf)
+        if det is None:
+            continue
+        n_alpha = sum(ch.isalpha() for ch in leaf[:4000])
+        if n_alpha > best_n:
+            best_n = n_alpha
+            best = det
+    if best is None:
+        return result
+    updated = dict(result)
+    updated["language"] = best["language"]
+    updated["is_english"] = False
+    updated["language_undecided"] = best["language_undecided"]
+    return updated
+
+
+def is_english(state: Union[str, bytes, Mapping, list, None]) -> bool:
     """True when the English checkpoint can be expected to read this state."""
     return bool(analyse(state)["is_english"])
