@@ -154,6 +154,16 @@ class BatchRequest(BaseModel):
     model: Optional[str] = None
     task: Optional[str] = None
     lang: Optional[str] = None
+    # The batch shape, not a per-state control: these size and group the forward passes rather
+    # than saying what a state means. `sort_by_length` only reorders a batch that is split into
+    # more than one pass, so it needs a `batch_size` strictly between 1 and the state count.
+    batch_size: Optional[int] = Field(
+        default=None, ge=1,
+        description="states per forward pass; the default sends the whole batch in one pass")
+    sort_by_length: bool = Field(
+        default=False,
+        description="group similarly sized states in the same pass so each pads to a shorter "
+                    "maximum; needs a batch_size below the state count, never changes an answer")
 
     _v_model = field_validator("model")(classmethod(lambda cls, v: _check_model(v)))
 
@@ -361,11 +371,19 @@ def predict_batch(req: BatchRequest) -> Dict[str, Any]:
     controls = {key: value for key, value in (("model", req.model), ("task", req.task),
                                               ("lang", req.lang)) if value is not None}
     requests = [{"state": state, "questions": questions, **controls} for state in req.states]
+    # The batch shape is an argument of the batch call, not a control that travels per request: the
+    # fallback below answers one state at a time, where there is no group to size or reorder. Sent
+    # only when set, so a request that asks for neither keeps making the call it always made.
+    shape = {}
+    if req.batch_size is not None:
+        shape["batch_size"] = req.batch_size
+    if req.sort_by_length:
+        shape["sort_by_length"] = True
     try:
         # One call, not one per state: `Router.predict_batch` routes the whole batch, groups it by
         # checkpoint and shares a forward pass across states that carry the same question schema --
         # which is exactly this endpoint, since `BatchRequest` holds one `questions` map.
-        results: List[Dict[str, Any]] = list(_router().predict_batch(requests))
+        results: List[Dict[str, Any]] = list(_router().predict_batch(requests, **shape))
     except Exception:
         # The batch fails as a unit, so a single bad state would otherwise cost every other state
         # its answer. Fall back to the per-state path to keep the documented envelope: N results,

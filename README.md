@@ -227,7 +227,20 @@ laya "Where is my card" --questions intents.json     # answer your own questions
 laya                                                 # interactive mode
 ```
 
-Routing alone never downloads a checkpoint, so it returns in milliseconds. `--predict` loads the routed checkpoint, which needs network access to the Hugging Face hub the first time; if a checkpoint cannot be downloaded, the CLI says so instead of crashing. `--batch` (with or without `--predict`) sends the whole file through `Router.predict_batch` in one process, so the requests share checkpoint loads and forward passes — measured 2.6x on 20 tickets vs looping `predict` one by one, with `--batch-size N` to bound the forward pass and `--json` for JSONL output. Batch routing (`laya --batch FILE`, no `--predict`) likewise answers with `route_batch` in one pass, still without loading anything.
+Routing alone never downloads a checkpoint, so it returns in milliseconds. `--predict` loads the routed checkpoint, which needs network access to the Hugging Face hub the first time; if a checkpoint cannot be downloaded, the CLI says so instead of crashing. `--batch` (with or without `--predict`) sends the whole file through `Router.predict_batch` in one process, so the requests share checkpoint loads and forward passes — measured 2.6x on 20 tickets vs looping `predict` one by one, with `--batch-size N` to bound the forward pass, `--sort-by-length` to group similarly sized requests inside it, and `--json` for JSONL output. Batch routing (`laya --batch FILE`, no `--predict`) likewise answers with `route_batch` in one pass, still without loading anything.
+
+`--sort-by-length` reaches the length grouping `Agent.predict_batch` has done since #294, which
+until now only the library call in [Batch Mode](#batch-mode-score-many-states-in-one-forward-pass)
+could ask for. A forward pass pads every state in it to the longest one, so a two-line request
+sharing a pass with a two-paragraph one spends most of its compute on padding; grouping by length
+first puts comparable sizes together. Measured on 128 real Yelp reviews of 69-2,293 characters,
+run as `laya --batch FILE --predict --model laya --batch-size 8` with and without the flag, four
+interleaved rounds on an Apple-silicon Mac at the CLI's own device pick: 41.25 s median unsorted
+against 29.23 s sorted, a **paired median of 1.42x** (1.39-1.44x across the four pairs), with all
+128 decisions identical and still in input order. `research/` measures the same knob at 2.15x over
+10,000 synthetic multilingual tickets. It needs `--batch-size N` with 1 < N < the number of
+requests — a single pass over the whole file has no group to reorder — and the CLI says so on
+stderr rather than printing a same-speed result and leaving you to notice.
 
 `--questions` takes the same question dict the SDK takes, as JSON: either the mapping itself, or
 `{"state_key": "body", "questions": {...}}` when the question's instructions name a field other than
@@ -270,6 +283,16 @@ curl -s localhost:8000/predict -H 'content-type: application/json' -d '{
 
 `--no-preload` loads checkpoints lazily instead of all three up front; `--device cuda|cpu|mps`
 pins the device. See `python examples/server.py --help` for the rest.
+
+`/predict/batch` accepts two optional body fields that control the shape of the forward passes
+without changing any answer: `batch_size` (states per pass; omit it and the whole batch is one
+pass) and `sort_by_length` (group similarly sized states so each pass pads to a shorter maximum —
+it needs a `batch_size` below the number of states, since one pass has nothing to reorder).
+Measured on the running server: 64 real reviews of 91–2,293 characters, one choice question,
+`batch_size: 8`, three interleaved rounds on MPS — the default one-pass shape 5.35s median against
+3.04s sorted, a paired median of **1.77x** (min 1.76x), and 64/64 labels identical in input order.
+`batch_size: 8` on its own was 4.95s, so the length grouping is what earns the second factor:
+1.66x over the sized batch.
 
 ---
 

@@ -310,6 +310,110 @@ def test_evaluate_batches_a_pass_through_wrapper_positionally():
     assert report.overall["choice_accuracy"] == 1.0
 
 
+# ------------------------------------------------------- batch grouping (#294 knob)
+#
+# `Agent.predict_batch` and `Router.predict_batch` group similarly sized states inside a bounded
+# `batch_size` since #294, and `research/` reports 2.15x over 10,000 tickets from it with no answer
+# changing. `laya-evals run --batch-size` could bound a pass but not group one, so the harness that
+# exists to measure cost could not ask for the cheaper shape of the same pass.
+
+UNSENT = object()   # a value no caller can send, so a default distinguishes "absent" from False
+
+
+class GroupingRunner(RequestsRunner):
+    """A `Router`-shaped runner that has the knob and records exactly what the call carried."""
+
+    def __init__(self, by_state):
+        super().__init__(by_state)
+        self.shapes = []
+
+    def predict_batch(self, requests, batch_size=None, sort_by_length=UNSENT):
+        self.shapes.append({"batch_size": batch_size, "sort_by_length": sort_by_length})
+        return [{"model": r.get("model") or "m", "answers": self.by_state[r["state"]]}
+                for r in requests]
+
+
+def _three():
+    return Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"}),
+                    Example("s3", Q, {"intent": "b"})])
+
+
+ANSWERS3 = {"s1": {"intent": choice_answer("a")}, "s2": {"intent": choice_answer("a")},
+            "s3": {"intent": choice_answer("b")}}
+
+
+def test_grouping_reaches_a_requests_shaped_runner_when_asked():
+    runner = GroupingRunner(ANSWERS3)
+    report = evaluate(runner, _three(), evaluators=[ChoiceAccuracy()], batch_size=2,
+                      sort_by_length=True)
+    assert runner.shapes == [{"batch_size": 2, "sort_by_length": True}], runner.shapes
+    assert report.overall["choice_accuracy"] == 1.0
+
+
+def test_grouping_is_not_invented_for_a_run_that_did_not_ask():
+    """The control is dropped when unset, so an older runner sees the call it always saw."""
+    runner = GroupingRunner(ANSWERS3)
+    evaluate(runner, _three(), evaluators=[ChoiceAccuracy()], batch_size=2)
+    assert runner.shapes == [{"batch_size": 2, "sort_by_length": UNSENT}], runner.shapes
+
+
+def test_grouping_reaches_a_states_shaped_runner_too():
+    """Both batch call shapes the harness promises carry the knob; neither drops it silently."""
+    class PassThrough(StubRunner):
+        def __init__(self, by_state):
+            super().__init__(by_state)
+            self.calls = []
+
+        def predict_batch(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            return [{"model": "m", "answers": self.by_state[s]} for s in args[0]]
+
+    runner = PassThrough(ANSWERS3)
+    evaluate(runner, _three(), evaluators=[ChoiceAccuracy()], batch_size=2, sort_by_length=True)
+    assert runner.calls == [{"model": None, "batch_size": 2, "sort_by_length": True}], runner.calls
+
+
+def test_grouping_changes_the_call_not_the_score():
+    asked = GroupingRunner(ANSWERS3)
+    sorted_report = evaluate(asked, _three(), evaluators=[ChoiceAccuracy()], batch_size=2,
+                             sort_by_length=True)
+    plain = GroupingRunner(ANSWERS3)
+    unsorted_report = evaluate(plain, _three(), evaluators=[ChoiceAccuracy()], batch_size=2)
+    assert _labels(sorted_report) == _labels(unsorted_report)
+    assert asked.shapes != plain.shapes, "the knob really reached the runner"
+
+
+def test_grouping_without_a_batch_to_reorder_is_recorded_as_not_sent():
+    """A single-example chunk has nothing to group, and the report says so rather than agreeing."""
+    runner = GroupingRunner(ANSWERS3)
+    report = evaluate(runner, _three(), evaluators=[ChoiceAccuracy()], sort_by_length=True)
+    assert runner.shapes == [], "no batch call was made at all"
+    assert report.config["timing"]["sort_by_length"] is True
+    assert report.config["timing"]["sort_by_length_sent"] is False
+
+
+def test_a_runner_without_the_knob_is_scored_unsorted():
+    """`sort_by_length` is an optimisation: it must not end a run over a runner that predates it."""
+    runner = RequestsRunner(ANSWERS3)          # `predict_batch(requests, batch_size=None)`
+    report = evaluate(runner, _three(), evaluators=[ChoiceAccuracy()], batch_size=2,
+                      sort_by_length=True)
+    assert runner.batch_sizes == [2], "the run still batched"
+    assert report.overall["choice_accuracy"] == 1.0
+    assert not report.config.get("errored")
+    assert report.config["timing"]["sort_by_length_sent"] is False
+
+
+def test_a_pass_through_wrapper_is_given_the_knob():
+    """A runner that forwards `**kwargs` is a real runner behind it, so the grouping goes through."""
+    class PassThrough(StubRunner):
+        def predict_batch(self, *args, **kwargs):
+            return [{"model": "m", "answers": self.by_state[s]} for s in args[0]]
+
+    report = evaluate(PassThrough(ANSWERS3), _three(), evaluators=[ChoiceAccuracy()],
+                      batch_size=2, sort_by_length=True)
+    assert report.config["timing"]["sort_by_length_sent"] is True
+
+
 # --------------------------------------------------------------- timing (#585)
 FORWARD_MS = 100.0
 SHARED = 0.6                      # a batch of n costs SHARED * n * FORWARD_MS, as one call
@@ -774,10 +878,17 @@ def test_docs_and_the_cli_name_the_same_flags():
     taught = set(re.findall(r"(?<![\w-])(--[a-z][a-z-]*)", evals_lines))
     assert taught <= registered, "the page teaches %s, which no subcommand registers" % sorted(
         taught - registered)
+    # The other half of parity: a registered flag nobody documents is unreachable in practice. The
+    # page that teaches `--batch-size` has to teach the grouping that makes a bounded pass cheaper.
+    assert {"--batch-size", "--sort-by-length"} <= taught, \
+        "the evals page teaches the batch size but not the grouping knob"
     assert "--score-within" in quickstart, "the tolerance metric has to be reachable from the quickstart"
     metrics = page.split("## Metrics", 1)[1].split("\n## ", 1)[0]
     assert "score_within" in metrics and "--score-within" in metrics, \
         "the section that publishes the metric has to carry the flag that reaches it"
+    grouping = page.split("### Grouping the rows inside a batch", 1)[1].split("\n#", 1)[0]
+    assert "--sort-by-length" in grouping and "sort_by_length_sent" in grouping, \
+        "the subsection that explains the grouping has to name the flag and what it reports"
 
 
 # --------------------------------------------------------------- --revision pinning

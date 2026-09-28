@@ -31,9 +31,11 @@ class RouterRunner:
         return self.router.predict(state, questions, model=model)
 
     def predict_batch(self, states: Sequence[Any], questions: Dict[str, Any],
-                      model: Optional[str] = None, batch_size: Optional[int] = None) -> List[Dict[str, Any]]:
+                      model: Optional[str] = None, batch_size: Optional[int] = None,
+                      sort_by_length: bool = False) -> List[Dict[str, Any]]:
         requests = [{"state": state, "questions": questions, "model": model} for state in states]
-        return self.router.predict_batch(requests, batch_size=batch_size)
+        return self.router.predict_batch(requests, batch_size=batch_size,
+                                         sort_by_length=sort_by_length)
 
 
 class OnnxRunner:
@@ -59,10 +61,16 @@ class OnnxRunner:
         return self.agent.predict(state, questions)
 
     def predict_batch(self, states: Sequence[Any], questions: Dict[str, Any],
-                      model: Optional[str] = None, batch_size: Optional[int] = None) -> List[Dict[str, Any]]:
+                      model: Optional[str] = None, batch_size: Optional[int] = None,
+                      sort_by_length: bool = False) -> List[Dict[str, Any]]:
         self._check_model(model)
         agent_batch = getattr(self.agent, "predict_batch", None)
         if agent_batch is not None:
+            if sort_by_length:
+                # Asked for, so it has to reach the agent's own grouping. The per-state fallback
+                # below cannot honour it: there is no batch to reorder.
+                return agent_batch(list(states), questions, batch_size=batch_size,
+                                   sort_by_length=True)
             return agent_batch(list(states), questions, batch_size=batch_size)
         return [self.agent.predict(state, questions) for state in states]
 
@@ -143,6 +151,10 @@ def _build_parser() -> argparse.ArgumentParser:
                           "checkpoint's default branch; the report records the commit that answered "
                           "either way")
     run.add_argument("--batch-size", type=int, help="examples per forward pass when questions match")
+    run.add_argument("--sort-by-length", action="store_true", dest="sort_by_length",
+                     help="with --batch-size N where 1 < N < the run, group similarly sized "
+                          "examples into the same forward pass so each pads to a shorter maximum; "
+                          "scores the same answers, in the same order")
     run.add_argument("--on-error", choices=("fail", "skip"), default="fail")
     run.add_argument("--baseline", help="a baseline report JSON to compare against")
     run.add_argument("--tolerance", action="append", metavar="METRIC=VALUE",
@@ -268,7 +280,8 @@ def _cmd_run(args) -> int:
     if extra:
         config["score_within"] = [evaluator.tolerance for evaluator in extra]
     report = evals.evaluate(runner, dataset, evaluators=evals.default_evaluators() + extra,
-                            batch_size=args.batch_size, on_error=args.on_error, config=config)
+                            batch_size=args.batch_size, on_error=args.on_error, config=config,
+                            sort_by_length=args.sort_by_length)
     # Which commit answered belongs in the artifact a baseline is, and it can only be read after
     # the run: `preload=False` means no checkpoint is resident before the first row.
     # `loaded_revisions` reports the commit each resident agent came from -- the pin when there is

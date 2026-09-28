@@ -473,6 +473,80 @@ def main():
        and not any("task" in r for r in sent),
        json.dumps(sent[:1])[:200])
 
+    # --- how the batch is packed is askable ---------------------------------------------
+    #
+    # `Router.predict_batch` has taken `batch_size` and `sort_by_length` since #294, and the README
+    # teaches `router.predict_batch(requests, batch_size=8, sort_by_length=True)`. The endpoint that
+    # answers up to 64 states in one call forwarded neither, so every batch was one forward pass
+    # padded to its longest state: a caller who wanted smaller passes had no way to ask, in code or
+    # over HTTP. These drive the real request model, so a body that named the keys and had them
+    # dropped by validation fails here rather than returning a silently slower 200.
+    shape_params = set(inspect.signature(CoreRouter.predict_batch).parameters) - {"self", "requests"}
+    ok("core still takes the shape keys this endpoint forwards",
+       {"batch_size", "sort_by_length"} <= shape_params, str(sorted(shape_params)))
+
+    shaped = RecordingRouter()
+    demo.ROUTER = shaped
+    body = TestClient(demo.app, raise_server_exceptions=False).post(
+        "/predict/batch", json={"states": states, "questions": one,
+                                "batch_size": 4, "sort_by_length": True})
+    ok("a shape request is still one batch call, in order",
+       len(shaped.batch_calls) == 1 and not shaped.predict_calls
+       and body.json().get("count") == 8
+       and [r.get("state") for r in body.json()["results"]] == states,
+       "predict_batch=%d predict=%d" % (len(shaped.batch_calls), len(shaped.predict_calls)))
+    ok("batch_size and sort_by_length reach predict_batch",
+       shaped.batch_calls[0][1] == {"batch_size": 4, "sort_by_length": True},
+       str(shaped.batch_calls[0][1]))
+
+    sized = RecordingRouter()
+    demo.ROUTER = sized
+    TestClient(demo.app, raise_server_exceptions=False).post(
+        "/predict/batch", json={"states": states, "questions": one, "batch_size": 2})
+    ok("batch_size alone does not invent a sort request",
+       sized.batch_calls[0][1] == {"batch_size": 2}, str(sized.batch_calls[0][1]))
+
+    # Core documents `sort_by_length` without a split batch as a no-op, not an error; the endpoint
+    # must not be the surface that turns a valid call into a 422.
+    unsized = RecordingRouter()
+    demo.ROUTER = unsized
+    no_split = TestClient(demo.app, raise_server_exceptions=False).post(
+        "/predict/batch", json={"states": states, "questions": one, "sort_by_length": True})
+    ok("sort_by_length alone is accepted and forwarded, as core takes it",
+       no_split.status_code == 200 and unsized.batch_calls[0][1] == {"sort_by_length": True},
+       "%s %s" % (no_split.status_code, str(unsized.batch_calls[0][1])))
+
+    junk = TestClient(demo.app, raise_server_exceptions=False).post(
+        "/predict/batch", json={"states": states, "questions": one, "batch_size": 0})
+    ok("a zero-size forward pass is a 422 before any router call",
+       junk.status_code == 422, "%s %s" % (junk.status_code, str(junk.json())[:120]))
+
+    # The shape belongs to the batch call only. When a state fails, the endpoint retries per state
+    # through `Router.predict`, which takes neither key: leaking them there would turn one bad
+    # state into 8 TypeErrors and an empty batch.
+    leaked = RecordingRouter(fail_on="ticket 3")
+    demo.ROUTER = leaked
+    retried = TestClient(demo.app, raise_server_exceptions=False).post(
+        "/predict/batch", json={"states": states, "questions": one,
+                                "batch_size": 4, "sort_by_length": True})
+    ok("the per-state fallback carries no batch shape",
+       leaked.batch_calls[0][1] == {"batch_size": 4, "sort_by_length": True}
+       and len(leaked.predict_calls) == 8
+       and not any("batch_size" in kw or "sort_by_length" in kw
+                   for _, kw in leaked.predict_calls)
+       and [r for r in retried.json()["results"] if "error" in r][0]["index"] == 3,
+       str([kw for _, kw in leaked.predict_calls][:1])[:200])
+
+    legacy_shaped = LegacyRouter()
+    demo.ROUTER = legacy_shaped
+    old = TestClient(demo.app, raise_server_exceptions=False).post(
+        "/predict/batch", json={"states": states, "questions": one,
+                                "batch_size": 4, "sort_by_length": True})
+    ok("a router without predict_batch still answers a shaped request",
+       old.status_code == 200 and len(old.json()["results"]) == 8
+       and not [r for r in old.json()["results"] if "error" in r],
+       "%s %s" % (old.status_code, json.dumps(old.json())[:200]))
+
     # One state failing must not cost its neighbours their answer: the endpoint's published
     # contract is per-item errors inside a 200.
     partial = RecordingRouter(fail_on="ticket 3")

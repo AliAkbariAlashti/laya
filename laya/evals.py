@@ -345,9 +345,27 @@ def _batch_form(runner: Any) -> Optional[str]:
     return None
 
 
+def _takes_sort_by_length(runner: Any) -> bool:
+    """Whether `runner`'s batch entry point can be given the length-grouping knob.
+
+    The same signature check `_batch_form` makes, for the one optional argument this harness
+    forwards: `sort_by_length` is an optimisation, so a runner whose ``predict_batch`` predates it
+    (#294) is scored unsorted rather than raising ``TypeError`` at the first chunk of a long run.
+    A ``**kwargs`` forwarder counts, because whatever it wraps is a real runner.
+    """
+    fn = getattr(runner, "predict_batch", None)
+    if fn is None:
+        return False
+    try:
+        params = inspect.signature(fn).parameters.values()
+    except (TypeError, ValueError):
+        return False
+    return any(p.name == "sort_by_length" or p.kind is p.VAR_KEYWORD for p in params)
+
+
 def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evaluator]] = None,
              batch_size: Optional[int] = None, on_error: str = "fail",
-             config: Optional[Dict[str, Any]] = None) -> EvalReport:
+             config: Optional[Dict[str, Any]] = None, sort_by_length: bool = False) -> EvalReport:
     """Run `runner` over `dataset`, aggregating per-answer metrics overall and per slice.
 
     `runner` needs a ``predict(state, questions, model=...)`` method, and for `batch_size` above 1
@@ -356,6 +374,12 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
     `Router.predict_batch` takes -- ``predict_batch([{"state": ..., "questions": ...,
     "model": ...}, ...], batch_size=...)``. A runner that offers neither is scored one ``predict``
     at a time, which is slower but not wrong.
+
+    `sort_by_length` is forwarded to a chunked runner so similarly sized examples share a forward
+    pass and pad to a shorter maximum. It reaches the checkpoint's own batching only when the
+    runner's ``predict_batch`` takes it, and only when it is on: an unset control is not sent, so a
+    runner that predates the knob is unaffected by a run that does not ask. Nothing about the
+    scored answers changes -- the results come back in chunk order either way.
 
     `on_error` is ``"fail"`` (re-raise a runner error) or ``"skip"`` (record it and continue),
     the latter for evaluating a flaky fleet without aborting the whole run.
@@ -379,6 +403,10 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
     examples = dataset.examples
     # Only worth grouping if the runner can be handed the group in one call at all.
     batch_form = _batch_form(runner) if batch_size is not None and batch_size > 1 else None
+    # The chunk shape travels with the calls that have one: a chunk of a single example is a plain
+    # `predict`, which has no batch to reorder, and an off control is not sent at all.
+    shape = ({"sort_by_length": True}
+             if sort_by_length and batch_form and _takes_sort_by_length(runner) else {})
 
     index = 0
     while index < len(examples):
@@ -413,10 +441,11 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
                     # per-request dicts carry exactly what the positional call would pass.
                     results = runner.predict_batch(
                         [{"state": e.state, "questions": e.questions, "model": e.model}
-                         for e in chunk], batch_size=batch_size)
+                         for e in chunk], batch_size=batch_size, **shape)
                 else:
                     results = runner.predict_batch([e.state for e in chunk], chunk[0].questions,
-                                                   model=chunk[0].model, batch_size=batch_size)
+                                                   model=chunk[0].model, batch_size=batch_size,
+                                                   **shape)
             else:
                 results = [runner.predict(chunk[0].state, chunk[0].questions, model=chunk[0].model)]
         except Exception as exc:  # noqa: BLE001 -- honoured by on_error
@@ -466,6 +495,10 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
         "cost_metric": "per decision: that call divided by its own chunk size",
         "batch_size": batch_size,
         "batch_form": batch_form,
+        "sort_by_length": sort_by_length,
+        # Requested and sent are different claims: `sort_by_length` needs a chunk to reorder, so a
+        # run with no batch form asked for something this harness cannot do.
+        "sort_by_length_sent": bool(shape),
         "chunks": chunks,
         "rows_grouped": rows_grouped,
         "rows_alone": rows_alone,

@@ -45,7 +45,8 @@ short name like `english`, since there is no Router on this path (default
 `convaiinnovations/laya`). Its config and tokenizer are loaded from there. The agent serves one checkpoint, so a dataset row
 whose `model` field names a different one fails with a clear error rather than being silently
 answered by the wrong model; `--device` does not apply. `--batch-size` uses the agent's batch
-API when it has one and falls back to one call per state otherwise. The report's `config` block
+API when it has one and falls back to one call per state otherwise; `--sort-by-length` is forwarded
+to that batch API, which the per-state fallback has no group to reorder. The report's `config` block
 records the `onnx` path.
 
 Measured on `research/evals/fixture.jsonl` (12 labelled rows, English checkpoint, CPU):
@@ -116,6 +117,20 @@ record the calls issued, not the calls that returned: with `on_error=skip`, a ch
 raised still counts in `rows_grouped` and `max_chunk`, next to its entries in `config.errored`. The
 two `*_ms` metrics count only the calls that returned, so a failed call never contributes a latency
 it did not measure.
+
+### Grouping the rows inside a batch
+
+`--sort-by-length` groups similarly sized rows into the same forward pass, so each pass pads to a
+shorter maximum instead of to the longest row in it. It is the shape of the calls, not their
+answers: results come back in the same order and score identically, which is why `research/` can
+report 2.15x over 10,000 tickets with no decision changing.
+
+There has to be more than one pass to reorder, so it takes effect only with a `--batch-size N`
+below the number of rows the run groups. `config.timing` keeps the two claims apart:
+`sort_by_length` is what the command line said, `sort_by_length_sent` is what reached the runner.
+A run with no `--batch-size` asks for something that cannot happen, and says so with
+`sent: false`; a runner whose `predict_batch` predates the knob is scored unsorted rather than
+raising `TypeError` halfway through a long run.
 
 ## Slices
 

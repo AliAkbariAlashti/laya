@@ -57,8 +57,8 @@ class _FakeAgent:
 
 
 class _BatchAgent(_FakeAgent):
-    def predict_batch(self, states, questions, batch_size=None):
-        self.calls.append(("predict_batch", tuple(states), batch_size))
+    def predict_batch(self, states, questions, batch_size=None, sort_by_length=False):
+        self.calls.append(("predict_batch", tuple(states), batch_size, sort_by_length))
         return [self._answer(questions) for _ in states]
 
 
@@ -90,8 +90,27 @@ check("predict_batch/falls back to one predict per state",
 bagent = _BatchAgent("ckpt")
 out = OnnxRunner(bagent).predict_batch(["a", "b"], Q, batch_size=2)
 check("predict_batch/delegates once when the agent can batch",
-      bagent.calls, [("predict_batch", ("a", "b"), 2)])
+      bagent.calls, [("predict_batch", ("a", "b"), 2, False)])
 check("predict_batch/delegated result passes through", len(out), 2)
+
+# The #294 grouping knob: core pads each pass to its longest state, so a batch of mixed lengths
+# feeds the model mostly padding. `laya-evals run --sort-by-length` is how a scored run asks for
+# the cheaper shape of the same pass.
+grouped = _BatchAgent("ckpt")
+OnnxRunner(grouped).predict_batch(["a", "b"], Q, batch_size=2, sort_by_length=True)
+check("predict_batch/sort_by_length is forwarded to the agent that has it",
+      grouped.calls, [("predict_batch", ("a", "b"), 2, True)])
+
+untouched = _BatchAgent("ckpt")
+OnnxRunner(untouched).predict_batch(["a", "b"], Q, batch_size=2)
+check("predict_batch/an unsorted run does not invent the key",
+      untouched.calls, [("predict_batch", ("a", "b"), 2, False)])
+
+# An agent that cannot batch has no group to reorder, and asking must not break the run.
+nofile = _FakeAgent("ckpt")
+OnnxRunner(nofile).predict_batch(["a", "b", "c"], Q, batch_size=2, sort_by_length=True)
+check("predict_batch/a no-batch agent still answers when grouping is asked",
+      [c[1] for c in nofile.calls], ["a", "b", "c"])
 try:
     OnnxRunner(bagent).predict_batch(["a"], Q, model="other")
     check_true("predict_batch/foreign model raises too", False, "no exception")
@@ -138,6 +157,22 @@ try:
     rc = evals_cli.main(["run", dataset, "--onnx", "laya.onnx", "--model", "ckpt",
                          "--batch-size", "2"])
     check("cli/--batch-size runs the ONNX batch path", rc, 0)
+
+    # ... and so does the grouping knob, all the way from the flag to the agent's own call. The
+    # report is the witness: `sort_by_length_sent` is what the harness put on the wire, not what
+    # the command line said, so a flag that parsed and was dropped fails here by name.
+    grouped_path = os.path.join(tmp, "grouped.json")
+    rc = evals_cli.main(["run", dataset, "--onnx", "laya.onnx", "--model", "ckpt",
+                         "--batch-size", "2", "--sort-by-length", "--json", grouped_path])
+    check("cli/--sort-by-length scores the same dataset", rc, 0)
+    with open(grouped_path) as f:
+        grouped_report = json.load(f)
+    check("cli/--sort-by-length is sent to the runner",
+          grouped_report["config"]["timing"]["sort_by_length_sent"], True)
+    check("cli/an ungrouped run says it sent nothing",
+          report["config"]["timing"]["sort_by_length_sent"], False)
+    check("cli/grouping changes the shape of the run, not its score",
+          grouped_report["overall"]["choice_accuracy"], report["overall"]["choice_accuracy"])
 
     # a per-example model the single-checkpoint agent does not serve is an error, not a no-op
     # (no --model here: --model would authoritatively rewrite every row and mask the mismatch)
