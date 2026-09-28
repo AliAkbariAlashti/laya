@@ -97,11 +97,13 @@ def test_percentiles_use_nearest_rank():
 
     # Nearest-rank 95th percentile is the ceil(0.95 * n)-th smallest value (1-indexed).
     # `int(n * 0.95)` used to return the (0.95n + 1)-th value whenever n is a multiple of 20.
-    for n in (20, 40, 100):
+    # Expected values are written as literals (not the implementation's own formula) so a
+    # formula that is wrong in both places at once still fails.
+    for n, expected in ((20, 19), (40, 38), (100, 95), (30, 29), (50, 48)):
         values = list(range(1, n + 1))
         _, p95 = _percentiles(values)
-        assert p95 == pytest.approx((95 * n + 99) // 100), \
-            "95th percentile of 1..%d must be the nearest-rank value, got %r" % (n, p95)
+        assert p95 == pytest.approx(expected), \
+            "95th percentile of 1..%d must be the nearest-rank value %d, got %r" % (n, expected, p95)
     # A single value is its own percentile.
     assert _percentiles([7.0]) == (7.0, 7.0)
 
