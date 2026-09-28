@@ -67,6 +67,30 @@ MAX_CHOICE_OPTIONS = getattr(_laya_serve, "MAX_CHOICE_OPTIONS", 100)
 MAX_SCORE_LEVELS = getattr(_laya_serve, "MAX_SCORE_LEVELS", 32)
 MAX_TOTAL_OPTIONS = getattr(_laya_serve, "MAX_TOTAL_OPTIONS", 512)
 
+
+def _fallback_state_length(state: Any) -> int:
+    """`laya.serve._state_length` for a laya that predates it, 400 included.
+
+    The 400 is part of what it does: without it an unserializable state raises a bare `TypeError`
+    out of `_check_request_limits`, which `/predict` calls outside its own `try`, so a caller error
+    would arrive as a 500 where it used to be answered.
+    """
+    if isinstance(state, str):
+        return len(state)
+    try:
+        return len(json.dumps(state, ensure_ascii=False))
+    except (TypeError, ValueError, RecursionError):
+        raise HTTPException(status_code=400, detail="'state' must be JSON-serializable")
+
+
+# Borrowed, not restated: the state length has to be measured on the text the tokenizer sees,
+# which is `serialize_state(state)` and not `str(state)`. On states a client can send the two
+# differ by up to 2x upward (a `"` costs one character in `repr` and two in JSON) and 10x downward
+# (`repr` escapes a zero-width space to six characters and a non-BMP format character to ten, where
+# `ensure_ascii=False` writes the one character it is). See `laya.serve._state_length`. Same
+# `getattr` shape as the bounds above.
+_state_length = getattr(_laya_serve, "_state_length", _fallback_state_length)
+
 # The demo answers failures the way laya.serve does: a fixed message to the caller, the
 # traceback to this logger. Without it a 500 arrived as a bare status line in the server
 # output and the cause had to be reproduced in-process to be found at all.
@@ -268,9 +292,9 @@ def _check_request_limits(state: Any, questions: Dict[str, Any]) -> None:
 
     Laya encodes the state once per question, so cost is questions x state size,
     collated into one tensor, and a choice or score question adds one sequence per
-    option against a shared head budget. The state length is measured exactly as
-    laya.serve measures it -- `len(v)` for a string, `len(str(v))` for a dict or list
-    -- and the option counts exactly as it counts them, over `choice` and `score`
+    option against a shared head budget. The state length comes from laya.serve's own
+    `_state_length`, so the two surfaces cannot disagree about what a state measures,
+    and the option counts exactly as it counts them, over `choice` and `score`
     criteria only.
 
     Checked here rather than declared as pydantic constraints on the request models,
@@ -284,7 +308,7 @@ def _check_request_limits(state: Any, questions: Dict[str, Any]) -> None:
             status_code=413,
             detail="too many questions (%d > %d)" % (len(questions), MAX_QUESTIONS),
         )
-    size = len(state) if isinstance(state, str) else len(str(state))
+    size = _state_length(state)
     if size > MAX_STATE_CHARS:
         raise HTTPException(
             status_code=413,
@@ -3438,9 +3462,13 @@ async def gui_predict(request: Request) -> HTMLResponse:
     try:
         _check_request_limits(req.state, req.questions)
     except HTTPException as exc:
-        return _gui_error("Request too large", [str(exc.detail)],
-                          f"The server takes up to {MAX_QUESTIONS} questions and a state of up to "
-                          f"{MAX_STATE_CHARS:,} characters. Split the request or shorten the state.")
+        # Branch on the status: this check answers 400 as well as 413 now, and a size hint under
+        # the heading "Request too large" would describe the wrong problem.
+        if exc.status_code == 413:
+            return _gui_error("Request too large", [str(exc.detail)],
+                              f"The server takes up to {MAX_QUESTIONS} questions and a state of up to "
+                              f"{MAX_STATE_CHARS:,} characters. Split the request or shorten the state.")
+        return _gui_error("Bad request", [str(exc.detail)], "Fix the request and send it again.")
     questions = _questions(req.questions)
     try:
         started = time.perf_counter()

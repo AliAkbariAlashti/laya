@@ -261,10 +261,29 @@ def main():
                + [("n%d" % i, noul_crit) for i in range(30)])),
         ("noul only", "hi", {"n%d" % i: noul_crit for i in range(10)}),
         ("an ordinary request", {"body": "billed twice"}, one),
+        # A state whose `str()` and whose JSON serialization are different lengths (50000 vs 99988).
+        # This case catches the two surfaces DIVERGING -- one measuring the serialized text and the
+        # other `str(state)`. It cannot catch them being wrong together: `examples/server.py` binds
+        # `_state_length` from `laya.serve` by `getattr`, so a regression inside that helper moves
+        # both and parity stays green. Measured: regressing `_state_length` fails 0 of these parity
+        # checks and 4 of the absolute ones below. Those are the real coverage -- do not prune them
+        # as redundant.
+        ("a state whose repr is half its JSON", {"body": '"' * 49988}, one),
     ]
     for label, st, qs in parity_cases:
         s, d = serve_verdict(st, qs), demo_verdict(st, qs)
         ok("parity with laya.serve: %s" % label, s == d, "serve=%s demo=%s" % (s, d))
+
+    # Parity alone cannot see a bug both surfaces share, and `getattr` guarantees they share one:
+    # with `_state_length` measuring `str(state)` again, both agree on accepting a state that
+    # serializes to 99 988 characters and every parity check above stays green (measured: 0 of them
+    # fail, 4 of these do). So the verdict itself is asserted, not just the agreement.
+    quote_heavy = {"body": '"' * 49988}
+    assert len(str(quote_heavy)) <= MAX_STATE_CHARS, "the fixture must pass a str()-based gate"
+    assert len(json.dumps(quote_heavy, ensure_ascii=False)) > MAX_STATE_CHARS, "and fail a real one"
+    for who, verdict in (("laya.serve", serve_verdict(quote_heavy, one)),
+                         ("the demo server", demo_verdict(quote_heavy, one))):
+        ok("%s refuses a state whose JSON is twice its repr" % who, verdict == "refused", verdict)
 
     # --- the resident-checkpoint cap: derived, not copied -------------------
     # examples/server.py used to build its Router with `max_loaded=1`, a copy of a default

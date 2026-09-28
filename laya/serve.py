@@ -199,6 +199,52 @@ def _resolve_port() -> int:
     return port
 
 
+def _state_length(state: Any) -> int:
+    r"""Length of the state text that will be tokenized; 400 if it has none.
+
+    `laya.common.serialize_state(state)` is what gets tokenized -- the state itself for a string,
+    `json.dumps(state, ensure_ascii=False)` for a dict or list, which the agents then strip mask
+    tokens out of, and that can only shorten it. `MAX_STATE_CHARS` has to be measured on that
+    text, not on `str()`, which is a different length in both directions:
+
+    * `repr` quotes a value with `'` and leaves a `"` inside it one character, where JSON escapes
+      it to the two characters `\"`. A `{"body": '"' * 49988}` state has a `len(str())` of exactly
+      50000, so it passed the gate, and then serialized to 99988 -- the documented 50000-character
+      limit admitting very nearly twice what it says.
+    * `repr` renders a zero-width space as the six characters `\u200b` where `ensure_ascii=False`
+      writes the one character it is, so a state that serializes to 8344 characters -- a sixth of
+      the limit -- was refused with "state too large (50004 > 50000 chars)".
+
+    `json.dumps` inline rather than importing `serialize_state`: `laya.common` imports torch at
+    module level and `import laya.serve` must not (tests/test_lazy_import.py). The two are pinned
+    to each other in tests/test_serve.py.
+
+    The dump runs before the gate decides, so its bound is MAX_BODY_BYTES, not MAX_STATE_CHARS. At
+    the gate's own ceiling it is 0.133 ms against 0.080 ms for the `str()` it replaces, three
+    orders of magnitude under the forward pass that state then gets. On a 2 MiB body -- the largest
+    the streaming cap allows, and one this refuses -- it is 5.68 ms against 3.46 ms, on a request
+    that is rejected either way and whose `str()` upstream already walked in full. (Best of 200
+    after 20 warm-up iterations, CPython 3.12 on a 10-core arm64 laptop.) So the serialized text is
+    not worth threading through `predict()` to be encoded only once.
+    """
+    from fastapi import HTTPException
+
+    if isinstance(state, str):
+        return len(state)  # `serialize_state` returns a string state unchanged
+    try:
+        return len(json.dumps(state, ensure_ascii=False))
+    except (TypeError, ValueError, RecursionError):
+        # A state `serialize_state` cannot render is not a size problem, and the 413 this replaces
+        # reported a count nothing had measured: `str()` raises on an integer of over 4300 digits
+        # (CPython's own int-to-str guard), and the old `except` answered "state too large (50001
+        # > 50000 chars)" for a state of a few kilobytes. No HTTP request reaches that case --
+        # `json.loads` builds only JSON types and refuses that integer itself, which
+        # `_systemone_inner` already answers 400 -- but in-process callers get here, and a state
+        # `json.dumps` refuses (a set, a datetime, a circular reference) used to pass the gate on
+        # its `str()` and then fail inside `serialize_state`, reported as a 500 "inference failed".
+        raise HTTPException(status_code=400, detail="'state' must be JSON-serializable")
+
+
 def _check_request_limits(state: Any, questions: Any) -> None:
     """Reject absent or oversized inference requests before tokenization (400/413)."""
     from fastapi import HTTPException
@@ -245,10 +291,7 @@ def _check_request_limits(state: Any, questions: Any) -> None:
             detail="too many answer options across questions (%d > %d)" % (total_options, MAX_TOTAL_OPTIONS),
         )
 
-    try:
-        state_len = len(state) if isinstance(state, str) else len(str(state))
-    except Exception:
-        state_len = MAX_STATE_CHARS + 1
+    state_len = _state_length(state)
     if state_len > MAX_STATE_CHARS:
         raise HTTPException(status_code=413,
                             detail="state too large (%d > %d chars)" % (state_len, MAX_STATE_CHARS))
