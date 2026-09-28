@@ -283,6 +283,175 @@ with patch("urllib.request.build_opener") as mock_build_opener:
     check("remote/auth", req.headers.get("Authorization"), "Bearer sk-crew-key")
 
 
+# --------------------------------------------------------------- 5. Per-call decision controls
+#
+# `laya.integrations.langchain` has forwarded `max_len` / `head_max_len` and the five hook
+# arguments since #530 / #532; this surface forwarded only `model`, so a crew with more candidate
+# agents than the default head budget fits could not widen its own window. The rule now lives in
+# one module the three integrations import, and the lists below are read out of it rather than
+# written out again here -- a control added to `._controls` without reaching this file fails here.
+import inspect
+from laya.agent import Agent
+from laya.integrations import _controls
+from laya.integrations import crewai as crewai_module
+from laya.integrations import langchain as langchain_module
+from laya.integrations import llamaindex as llamaindex_module
+from laya.router import Router
+
+CONTROLS = tuple(_controls.PREDICT_CONTROLS) + tuple(_controls.HOOK_CONTROLS)
+
+
+def _params(fn):
+    return set(inspect.signature(fn).parameters)
+
+
+# The shared tuples name the arguments the shared builders accept, in both directions.
+check("controls/budget tuple names budget_kwargs",
+      set(_params(_controls.budget_kwargs)), set(_controls.PREDICT_CONTROLS))
+check("controls/hook tuple names hook_kwargs",
+      set(_params(_controls.hook_kwargs)), set(_controls.HOOK_CONTROLS))
+
+# Everything this file calls a control is an argument a real runner accepts, or a chain would fail
+# with a TypeError deep inside core instead of at the call site.
+_agent_params = _params(Agent.system_one)
+_router_params = _params(Router.predict)
+for _c in CONTROLS:
+    check_true("controls/%s accepted by Agent" % _c, _c in _agent_params)
+    check_true("controls/%s accepted by Router.predict" % _c, _c in _router_params)
+
+# Both classes and the shared executor must accept all of them. Two classes, two call sites --
+# a third of them missing is exactly the bug this section exists to keep shut.
+for cls in (LayaCrewRouter, LayaTaskGuard):
+    for _c in CONTROLS:
+        check_true("controls/%s takes %s" % (cls.__name__, _c), _c in _params(cls.__init__))
+check("controls/_execute_decision takes every control",
+      set(_params(crewai_module._execute_decision)) - {"state", "questions", "agent",
+                                                       "base_url", "api_key", "model"},
+      set(CONTROLS))
+
+# The three wrappers end at the same runner call, so they must accept the same controls.
+for _mod in (langchain_module, llamaindex_module):
+    check("controls/%s agrees with crewai" % _mod.__name__.rsplit(".", 1)[-1],
+          set(_params(_mod._execute_decision)), set(_params(crewai_module._execute_decision)))
+
+
+class RecordingAgent:
+    """A runner that keeps the kwargs of every call, the way a chain would have to be debugged."""
+
+    device = "cpu"
+
+    def __init__(self):
+        self.calls = []
+
+    def predict(self, state, questions, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "answers": {
+                "delegation": {"choice": "agent_0", "confidence": 0.9, "answer_confidence": 0.9},
+                "injection_risk": {"type": "noul", "noul": 0.1, "confidence": 0.9},
+            },
+            "routing": {"model": "english", "repo": None, "reason": "explicit model"},
+        }
+
+
+ALL_CONTROLS = {"max_len": 1024, "head_max_len": 512, "hooks": ["H"], "on_predict_start": "S",
+                "on_predict_end": "E", "hooks_raise": True, "hooks_timeout": 0.5}
+
+
+def _kwargs(build, run):
+    """Run one decision on a fresh surface, or report the surface's own refusal.
+
+    The broad except is deliberate: a wrapper that cannot even be built or that drops an attribute
+    has to show up as a named mismatch, not as a traceback that hides every later check.
+    """
+    agent = RecordingAgent()
+    try:
+        run(build(agent))
+    except Exception as exc:
+        return "%s: %s" % (type(exc).__name__, exc)
+    return agent.calls[0]
+
+
+def crew_call(**controls):
+    return _kwargs(lambda agent: LayaCrewRouter(agent=agent, **controls),
+                   lambda surface: surface.route("Analyze Q3 sales", agents))
+
+
+def guard_call(**controls):
+    return _kwargs(lambda agent: LayaTaskGuard(agent=agent, **controls),
+                   lambda surface: surface.screen("Summarize this report"))
+
+
+for label, call in (("router", crew_call), ("guard", guard_call)):
+    check("controls/%s with nothing set sends nothing" % label, call(), {})
+    check("controls/%s forwards all seven" % label, call(**ALL_CONTROLS), ALL_CONTROLS)
+    check("controls/%s forwards one budget alone" % label, call(head_max_len=256),
+          {"head_max_len": 256})
+    # 0 and [] are decisions, not absences: truthiness tests here would drop them.
+    check("controls/%s keeps falsy values" % label,
+          call(head_max_len=0, hooks=[], hooks_raise=False),
+          {"head_max_len": 0, "hooks": [], "hooks_raise": False})
+    check("controls/%s alongside model" % label,
+          call(model="laya-multilingual", max_len=1024),
+          {"model": "laya-multilingual", "max_len": 1024})
+
+# The caller's own hook objects have to arrive, not a copy or a re-wrapped stand-in. Read with
+# `.get()` so a surface that drops them reports a named failure instead of a KeyError that hides
+# the rest of the run.
+_sentinel_hooks = [RecordingAgent()]
+_ident_agent = RecordingAgent()
+LayaCrewRouter(agent=_ident_agent, hooks=_sentinel_hooks).route("Analyze Q3 sales", agents)
+_seen_hooks = _ident_agent.calls[0].get("hooks")
+check_true("controls/forwards the caller's objects",
+           _seen_hooks is _sentinel_hooks and _seen_hooks[0] is _sentinel_hooks[0], repr(_seen_hooks))
+
+
+# --------------------------------------------------------------- 5b. Budgets on a remote node
+def remote_body(controls):
+    """POST through the real urllib path with the opener mocked, and return the JSON body sent."""
+    with patch("urllib.request.build_opener") as mock_build_opener:
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = DummyHTTPResponse(remote_response)
+        mock_build_opener.return_value = mock_opener
+        LayaCrewRouter(base_url="http://localhost:8000", **controls).route(
+            "Analyze codebase", agents)
+        return json.loads(mock_opener.open.call_args[0][0].data)
+
+
+check("controls/remote body carries both budgets",
+      {k: v for k, v in remote_body({"max_len": 1024, "head_max_len": 384}).items()
+       if k in _controls.PREDICT_CONTROLS},
+      {"max_len": 1024, "head_max_len": 384})
+check("controls/remote body omits unset budgets",
+      [k for k in remote_body({}) if k in _controls.PREDICT_CONTROLS], [])
+check("controls/remote body keeps a zero",
+      remote_body({"head_max_len": 0}).get("head_max_len"), 0)
+
+# A hook is a Python callable that runs inside `predict`; a serve node cannot receive one. Saying
+# so beats reporting success after never calling it.
+for _c, _sample in (("hooks", [object()]), ("on_predict_start", object()),
+                    ("on_predict_end", object()), ("hooks_raise", False),
+                    ("hooks_timeout", 0.5)):
+    try:
+        LayaCrewRouter(base_url="http://localhost:8000", **{_c: _sample}).route(
+            "Analyze codebase", agents)
+        check_true("controls/remote refuses %s" % _c, False, "no error raised")
+    except ValueError as exc:
+        check_true("controls/remote refuses %s" % _c, True)
+        check_true("controls/remote %s names itself" % _c, _c in str(exc))
+        check_true("controls/remote %s names the endpoint" % _c, "laya-serve" in str(exc))
+    except Exception as exc:
+        check_true("controls/remote refuses %s" % _c, False, type(exc).__name__)
+
+try:
+    LayaTaskGuard(base_url="http://localhost:8000", hooks=[object()]).screen("hello")
+    check_true("controls/guard remote refuses hooks", False, "no error raised")
+except ValueError as exc:
+    check_true("controls/guard remote refuses hooks", "hooks" in str(exc))
+except Exception as exc:
+    check_true("controls/guard remote refuses hooks", False, type(exc).__name__)
+
+
 # --------------------------------------------------------------- Results Summary
 print(f"PASS: {len(PASS)}")
 print(f"FAIL: {len(FAIL)}")

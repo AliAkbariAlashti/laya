@@ -393,6 +393,164 @@ with patch("urllib.request.build_opener") as mock_build_opener:
     check("remote/auth", req.headers.get("Authorization"), "Bearer sk-test-token")
 
 
+# --------------------------------------------------------------- 6. Per-call decision controls
+#
+# `laya.integrations.langchain` has forwarded `max_len` / `head_max_len` and the five hook
+# arguments since #530 / #532; this surface forwarded only `model`, so a RAG pipeline choosing
+# between more tools than the default head budget fits could not widen its own window. The rule
+# now lives in one module the three integrations import, and the lists below are read out of it
+# rather than written out again here -- a control added to `._controls` without reaching this file
+# fails here. Three classes, three `_execute_decision` call sites, so every surface is driven.
+import inspect
+from laya.agent import Agent
+from laya.integrations import _controls
+from laya.integrations import crewai as crewai_module
+from laya.integrations import langchain as langchain_module
+from laya.integrations import llamaindex as llamaindex_module
+from laya.router import Router
+
+CONTROLS = tuple(_controls.PREDICT_CONTROLS) + tuple(_controls.HOOK_CONTROLS)
+
+
+def _params(fn):
+    return set(inspect.signature(fn).parameters)
+
+
+check("controls/budget tuple names budget_kwargs",
+      set(_params(_controls.budget_kwargs)), set(_controls.PREDICT_CONTROLS))
+check("controls/hook tuple names hook_kwargs",
+      set(_params(_controls.hook_kwargs)), set(_controls.HOOK_CONTROLS))
+
+# Everything called a control here is an argument a real runner accepts, or a selector would fail
+# with a TypeError deep inside core instead of at the call site.
+_agent_params = _params(Agent.system_one)
+_router_params = _params(Router.predict)
+for _c in CONTROLS:
+    check_true("controls/%s accepted by Agent" % _c, _c in _agent_params)
+    check_true("controls/%s accepted by Router.predict" % _c, _c in _router_params)
+
+for cls in (LayaSingleSelector, LayaMultiSelector, LayaQueryRouter):
+    for _c in CONTROLS:
+        check_true("controls/%s takes %s" % (cls.__name__, _c), _c in _params(cls.__init__))
+check("controls/_execute_decision takes every control",
+      set(_params(llamaindex_module._execute_decision)) - {"state", "questions", "agent",
+                                                           "base_url", "api_key", "model"},
+      set(CONTROLS))
+
+# The three wrappers end at the same runner call, so they must accept the same controls.
+for _mod in (langchain_module, crewai_module):
+    check("controls/%s agrees with llamaindex" % _mod.__name__.rsplit(".", 1)[-1],
+          set(_params(_mod._execute_decision)),
+          set(_params(llamaindex_module._execute_decision)))
+
+
+class RecordingAgent:
+    """A runner that keeps the kwargs of every call, the way a pipeline would have to be debugged."""
+
+    device = "cpu"
+
+    def __init__(self):
+        self.calls = []
+
+    def predict(self, state, questions, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "answers": {
+                "selector": {"choice": "choice_0", "confidence": 0.9, "answer_confidence": 0.9,
+                             "probabilities": {"choice_0": 0.9, "choice_1": 0.4}},
+                "route": {"choice": "sql", "confidence": 0.9, "answer_confidence": 0.9},
+            },
+            "routing": {"model": "english", "repo": None, "reason": "explicit model"},
+        }
+
+
+ALL_CONTROLS = {"max_len": 1024, "head_max_len": 512, "hooks": ["H"], "on_predict_start": "S",
+                "on_predict_end": "E", "hooks_raise": True, "hooks_timeout": 0.5}
+
+# One entry per class that can take a decision here: (label, class, constructor extras, one call).
+SURFACES = [
+    ("single", LayaSingleSelector, {},
+     lambda s: s.select(tools, "Run a query on the SQL table")),
+    ("multi", LayaMultiSelector, {},
+     lambda s: s.select(tools, "Run a query on the SQL table")),
+    ("query_router", LayaQueryRouter, {"query_engines": engines},
+     lambda s: s.route("Run a query on the SQL table")),
+]
+
+HOOK_SAMPLES = (("hooks", [object()]), ("on_predict_start", object()),
+                ("on_predict_end", object()), ("hooks_raise", False), ("hooks_timeout", 0.5))
+
+
+def local_kwargs(cls, extra, run, **controls):
+    """Run one decision on a fresh surface, or report the surface's own refusal.
+
+    The broad except is deliberate: a wrapper that cannot even be built or that drops an attribute
+    has to show up as a named mismatch, not as a traceback that hides every later check.
+    """
+    agent = RecordingAgent()
+    try:
+        run(cls(agent=agent, **dict(extra, **controls)))
+    except Exception as exc:
+        return "%s: %s" % (type(exc).__name__, exc)
+    return agent.calls[0]
+
+
+def remote_body(cls, extra, run, **controls):
+    """POST through the real urllib path with the opener mocked, and return the JSON body sent."""
+    with patch("urllib.request.build_opener") as mock_build_opener:
+        mock_opener = MagicMock()
+        mock_opener.open.return_value = DummyHTTPResponse(remote_response)
+        mock_build_opener.return_value = mock_opener
+        run(cls(base_url="http://localhost:8000", **dict(extra, **controls)))
+        return json.loads(mock_opener.open.call_args[0][0].data)
+
+
+for _label, _cls, _extra, _run in SURFACES:
+    check("controls/%s with nothing set sends nothing" % _label,
+          local_kwargs(_cls, _extra, _run), {})
+    check("controls/%s forwards all seven" % _label,
+          local_kwargs(_cls, _extra, _run, **ALL_CONTROLS), ALL_CONTROLS)
+    check("controls/%s forwards one budget alone" % _label,
+          local_kwargs(_cls, _extra, _run, head_max_len=256), {"head_max_len": 256})
+    # 0 and [] are decisions, not absences: truthiness tests here would drop them.
+    check("controls/%s keeps falsy values" % _label,
+          local_kwargs(_cls, _extra, _run, head_max_len=0, hooks=[], hooks_raise=False),
+          {"head_max_len": 0, "hooks": [], "hooks_raise": False})
+    check("controls/%s alongside model" % _label,
+          local_kwargs(_cls, _extra, _run, model="laya-multilingual", max_len=1024),
+          {"model": "laya-multilingual", "max_len": 1024})
+    check("controls/%s remote body carries both budgets" % _label,
+          {k: v for k, v in remote_body(_cls, _extra, _run, max_len=1024,
+                                        head_max_len=384).items()
+           if k in _controls.PREDICT_CONTROLS},
+          {"max_len": 1024, "head_max_len": 384})
+    check("controls/%s remote body omits unset budgets" % _label,
+          [k for k in remote_body(_cls, _extra, _run) if k in _controls.PREDICT_CONTROLS], [])
+    check("controls/%s remote body keeps a zero" % _label,
+          remote_body(_cls, _extra, _run, head_max_len=0).get("head_max_len"), 0)
+    # A hook is a Python callable that runs inside `predict`; a serve node cannot receive one.
+    for _c, _sample in HOOK_SAMPLES:
+        try:
+            remote_body(_cls, _extra, _run, **{_c: _sample})
+            check_true("controls/%s remote refuses %s" % (_label, _c), False, "no error raised")
+        except ValueError as exc:
+            check_true("controls/%s remote refuses %s" % (_label, _c),
+                       _c in str(exc) and "laya-serve" in str(exc))
+        except Exception as exc:
+            check_true("controls/%s remote refuses %s" % (_label, _c), False, type(exc).__name__)
+
+# The caller's own hook objects have to arrive, not a copy or a re-wrapped stand-in. Read with
+# `.get()` so a surface that drops them reports a named failure instead of a KeyError that hides
+# the rest of the run.
+_sentinel_hooks = [RecordingAgent()]
+_ident_agent = RecordingAgent()
+LayaSingleSelector(agent=_ident_agent, hooks=_sentinel_hooks).select(
+    tools, "Run a query on the SQL table")
+_seen_hooks = _ident_agent.calls[0].get("hooks")
+check_true("controls/forwards the caller's objects",
+           _seen_hooks is _sentinel_hooks and _seen_hooks[0] is _sentinel_hooks[0], repr(_seen_hooks))
+
+
 # --------------------------------------------------------------- Results Summary
 print(f"PASS: {len(PASS)}")
 print(f"FAIL: {len(FAIL)}")

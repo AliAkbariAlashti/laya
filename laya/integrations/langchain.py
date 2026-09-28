@@ -26,6 +26,13 @@ except ImportError:
     RunnableSerializable = object  # type: ignore
     RunnableConfig = Any  # type: ignore
 
+# The per-call control rules live in `._controls` because the CrewAI and LlamaIndex wrappers end
+# at the same `predict` call and the same laya-serve body; keeping the rule in three places is how
+# two of them ended up forwarding only `model`.
+from ._controls import budget_kwargs as _budget_kwargs, hook_kwargs as _hook_kwargs
+from ._controls import predict_kwargs as _predict_kwargs
+from ._controls import reject_remote_hooks as _reject_remote_hooks
+
 
 class LayaGuardrailError(ValueError):
     """Raised when an input violates a Laya guardrail policy."""
@@ -156,48 +163,6 @@ def _get_default_router():
     return _DEFAULT_ROUTER
 
 
-def _predict_kwargs(model: Optional[str] = None, max_len: Optional[int] = None,
-                    head_max_len: Optional[int] = None) -> Dict[str, Any]:
-    """The per-request overrides a local runner accepts, with the unset ones omitted."""
-    kwargs: Dict[str, Any] = {}
-    if model:
-        kwargs["model"] = model
-    if max_len is not None:
-        kwargs["max_len"] = max_len
-    if head_max_len is not None:
-        kwargs["head_max_len"] = head_max_len
-    return kwargs
-
-
-def _reject_remote_hooks(hook_kwargs: Dict[str, Any], base_url: Optional[str]) -> None:
-    """Refuse hooks on a remote node rather than dropping them silently.
-
-    A hook is a Python callable that runs inside `predict` -- it can cache a decision, gate one or
-    rewrite its state. `laya-serve` has no way to receive or run one, so a node with a `base_url`
-    and hooks configured would report success while never calling them.
-    """
-    if base_url and hook_kwargs:
-        raise ValueError(
-            "%s run in the local runner and cannot be sent to a laya-serve endpoint; "
-            "install them where serve runs, or drop them" % ", ".join(sorted(hook_kwargs))
-        )
-
-
-def _hook_kwargs(hooks: Optional[Any] = None, on_predict_start: Optional[Any] = None,
-                 on_predict_end: Optional[Any] = None, hooks_raise: Optional[bool] = None,
-                 hooks_timeout: Optional[float] = None) -> Dict[str, Any]:
-    """The per-call hook overrides, with the unset ones omitted.
-
-    Core reads `None` as "inherit whatever the runner was built with", so an unset hook has to be
-    absent rather than passed as `None`. Note the `is not None` tests: `hooks=[]` means "no hooks
-    for this call", and `hooks_raise=False` means "keep deciding after a hook fails" -- both are
-    decisions a caller made, not absences.
-    """
-    given = {"hooks": hooks, "on_predict_start": on_predict_start, "on_predict_end": on_predict_end,
-             "hooks_raise": hooks_raise, "hooks_timeout": hooks_timeout}
-    return {k: v for k, v in given.items() if v is not None}
-
-
 def _execute_decision(
     state: Any,
     questions: Dict[str, Any],
@@ -216,9 +181,7 @@ def _execute_decision(
     hook_kwargs = _hook_kwargs(hooks, on_predict_start, on_predict_end, hooks_raise, hooks_timeout)
     if base_url:
         _reject_remote_hooks(hook_kwargs, base_url)
-        # Only what was set, so a stand-in `_call_remote` without the budget keywords still works.
-        budget = {k: v for k, v in (("max_len", max_len), ("head_max_len", head_max_len))
-                  if v is not None}
+        budget = _budget_kwargs(max_len, head_max_len)
         return _call_remote(base_url, state, questions, api_key=api_key, model=model, **budget)
     runner = agent if agent is not None else _get_default_router()
     kwargs = _predict_kwargs(model, max_len, head_max_len)
