@@ -204,6 +204,21 @@ def _print_deltas(deltas: Dict[str, Dict[str, Any]]) -> None:
               % (metric, delta["baseline"], delta["value"], delta["diff"], delta["tolerance"]))
 
 
+def _comparability_failure(report: evals.EvalReport, baseline: Dict[str, Any]) -> Optional[str]:
+    """The refusal to compare two runs that are not the same measurement, as one failure line.
+
+    The metric gate answers "did the numbers move"; it cannot answer "were these the same
+    numbers", because `EvalReport.compare` reads `overall` and only `overall`. So a baseline
+    recorded against one dataset passes a candidate scored on another, with identical
+    arithmetic. The gate still prints its deltas -- the reviewer wants to see both facts -- but
+    an incomparable pair is not a pass.
+    """
+    ok, reasons = report.comparable_to(baseline)
+    if ok:
+        return None
+    return "baseline is not comparable: " + "; ".join(reasons)
+
+
 def _cmd_validate(args) -> int:
     dataset = evals.Dataset.from_jsonl(args.dataset)
     questions = sorted({qid for example in dataset.examples for qid in example.questions})
@@ -262,7 +277,12 @@ def _cmd_run(args) -> int:
             # download.
             raise EvalError(str(exc)) from exc
         runner = RouterRunner(router)
-    config = {"dataset": args.dataset, "model": args.model, "device": args.device}
+    config = {"dataset": args.dataset, "model": args.model, "device": args.device,
+              # The path above is the name, not the data. Hashing the bytes here is what makes
+              # a committed baseline reviewable: the dataset can be edited in place, moved or
+              # refetched under the same name, and a reviewer comparing two reports needs the
+              # report -- not a file mtime -- to say so.
+              "dataset_sha256": evals.file_fingerprint(args.dataset)}
     if args.onnx:
         config["onnx"] = args.onnx
     if extra:
@@ -286,14 +306,25 @@ def _cmd_run(args) -> int:
         mins[key] = args.min_accuracy
     if args.max_ece is not None:
         maxs["ece"] = args.max_ece
+    tolerances = _parse_pairs(args.tolerance)
+    # The gate this run actually applied, recorded with the numbers it produced. A baseline whose
+    # numbers came from a different gate is a different claim, and `docs/staged-adoption.md`
+    # asks for exactly this alongside the checkpoint version and the evaluation set.
+    report.config = dict(report.config,
+                         thresholds={"min": mins, "max": maxs, "baseline_tolerance": tolerances})
 
     failures = _check_thresholds(report.overall, mins, maxs)
     if args.baseline:
         baseline = _load_report(args.baseline)
-        ok, deltas = report.compare(baseline, _parse_pairs(args.tolerance))
+        ok, deltas = report.compare(baseline, tolerances)
         _print_deltas(deltas)
         if not ok:
             failures.append("baseline comparison failed")
+        # Checked after the deltas are printed, so a reviewer sees what moved as well as why the
+        # two runs are not the same experiment.
+        refusal = _comparability_failure(report, baseline)
+        if refusal:
+            failures.append(refusal)
 
     for name in sorted(report.overall):
         print("%-18s %.4f" % (name, report.overall[name]))
@@ -322,7 +353,13 @@ def _cmd_compare(args) -> int:
     baseline = _load_report(args.baseline)
     ok, deltas = report.compare(baseline, _parse_pairs(args.tolerance))
     _print_deltas(deltas)
-    return 0 if ok else 1
+    # `compare` is the offline re-check of a report a reviewer already read, so the same
+    # comparability refusal has to apply here: a saved report that cannot say which experiment
+    # it came from must not pass a gate either.
+    refusal = _comparability_failure(report, baseline)
+    if refusal:
+        print("FAIL: " + refusal, file=sys.stderr)
+    return 0 if ok and not refusal else 1
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

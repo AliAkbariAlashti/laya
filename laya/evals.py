@@ -10,9 +10,18 @@ checkpoint in tests.
 The report is deterministic for a fixed runner: the same dataset produces the same numbers, and
 ``EvalReport.compare`` turns a baseline into a pass/fail with the per-metric deltas, which is what
 the CI gate consumes.
+
+`compare` reads ``overall`` and nothing else, so a run that says nothing about *what it measured*
+makes a gate that can only compare arithmetic. Every report therefore carries a run identity in
+``config`` -- ``schema``, ``questions_sha256``, ``laya_version`` and (from the CLI)
+``dataset_sha256`` and the ``thresholds`` actually applied -- and
+``EvalReport.comparable_to`` refuses a comparison between two runs that are not the same
+measurement. The identity is deliberately free of anything time-bearing, so a report stays
+byte-reproducible for a fixed runner.
 """
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import statistics
@@ -21,6 +30,34 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
+
+#: The shape of the report this module writes, so a consumer can refuse one it cannot read.
+#: ``research/evals/act_head_eval.py`` publishes a report under its own tag off this prefix.
+REPORT_SCHEMA = "laya-evals-report/1"
+
+#: The keys that decide whether two reports are the same measurement. A key missing
+#: on either side is unknown rather than a conflict, so a baseline committed before these existed
+#: keeps comparing exactly as it did. ``schema`` is also read at the top level, which is where
+#: ``research/evals/act_head_eval.py`` puts its own tag.
+_IDENTITY_KEYS = ("schema", "dataset_sha256", "questions_sha256")
+
+_IDENTITY_LABELS = {
+    "schema": "report schema",
+    "dataset_sha256": "dataset bytes",
+    "questions_sha256": "question schema",
+}
+
+
+def _identity_of(document: Any) -> Dict[str, Any]:
+    """Pull the identity keys out of a report, from ``config`` or from the top level."""
+    if not isinstance(document, dict):
+        return {}
+    config = document.get("config")
+    found = dict(config) if isinstance(config, dict) else {}
+    for key in _IDENTITY_KEYS:
+        if found.get(key) is None and document.get(key) is not None:
+            found[key] = document[key]
+    return found
 
 
 class EvalError(ValueError):
@@ -86,6 +123,80 @@ class Dataset:
         if not examples:
             raise EvalError("%s contains no examples" % path)
         return cls(examples)
+
+
+def _canonical(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+                      default=str)
+
+
+def questions_fingerprint(dataset: "Dataset") -> str:
+    """A stable hash of *what was asked*, over every question in `dataset`.
+
+    This is the question-schema identity `docs/staged-adoption.md` asks an operator to record
+    with the policy, and the part of the run identity a report can compute for itself: the
+    dataset file hash is the CLI's, but the questions are parsed here.
+
+    It is a function of the decision space, not of the rows, so scoring more states on the same
+    questions stays comparable to a baseline. A `choice` option label lives in `criteria` and so
+    counts as a different question -- which is the case that matters, since
+    `research/eval/metamorphic.py` exists because renaming a label flips answers. Free-text
+    `instructions` are excluded: rewording them changes the prompt, not the decision space, and
+    a baseline should survive a copy edit.
+    """
+    schemas = set()
+    for example in dataset.examples:
+        for qid, question in example.questions.items():
+            body = question if isinstance(question, dict) else {}
+            schemas.add(_canonical({"qid": qid, "type": body.get("type"),
+                                    "criteria": body.get("criteria")}))
+    digest = hashlib.sha256()
+    for schema in sorted(schemas):
+        digest.update(schema.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def file_fingerprint(path: str) -> str:
+    """The sha256 of a file's bytes -- the dataset identity, where the path is only a name.
+
+    `config.dataset` is the path as typed, and two datasets share a path across a rebase, a CI
+    cache or a colleague's checkout. Raises `EvalError` when the file cannot be read, so a report
+    never carries a hash of something other than the bytes that were parsed.
+    """
+    digest = hashlib.sha256()
+    try:
+        with open(path, "rb") as handle:
+            for block in iter(lambda: handle.read(65536), b""):
+                digest.update(block)
+    except OSError as exc:
+        raise EvalError("%s cannot be read for a fingerprint: %s" % (path, exc)) from exc
+    return digest.hexdigest()
+
+
+def _library_version() -> Optional[str]:
+    """`laya.__version__`, read lazily so this module stays importable on its own.
+
+    `laya/__init__.py` defines the string at import time, so this is a module lookup rather
+    than a load of anything torch-backed -- but it is imported inside the call to keep
+    `laya.evals` free of an import cycle, and a failure here must not fail a run that has
+    already scored every row.
+    """
+    try:
+        import laya
+    except Exception:  # pragma: no cover - identity only
+        return None
+    return getattr(laya, "__version__", None)
+
+
+def _run_identity(dataset: "Dataset") -> Dict[str, Any]:
+    """The `config` keys this module can fill in on its own, with no knowledge of the CLI."""
+    identity: Dict[str, Any] = {"schema": REPORT_SCHEMA,
+                                "questions_sha256": questions_fingerprint(dataset)}
+    version = _library_version()
+    if version is not None:
+        identity["laya_version"] = version
+    return identity
 
 
 # --------------------------------------------------------------------------- evaluators
@@ -239,6 +350,34 @@ class EvalReport:
                          if m in self.slices[dimension][value] else "" for m in metrics]
                 lines.append("| %s | %s |" % (value, " | ".join(cells)))
         return "\n".join(lines) + "\n"
+
+    def comparable_to(self, baseline: Dict[str, Any]) -> Tuple[bool, List[str]]:
+        """Is `baseline` the same measurement as this report? Returns (ok, reasons).
+
+        `compare` reads `overall` and only `overall`, so two reports of different datasets,
+        different question schemas or different report shapes produce identical arithmetic and
+        an identical pass. That is the failure `docs/staged-adoption.md` runs at: a gate that
+        cannot tell which experiment produced a number cannot support a promotion decision.
+
+        A key absent on either side is *unknown*, not a conflict, so every baseline committed
+        before the identity existed -- including the scheduled gate's
+        `research/results/eval_english_51_languages.json`, which comes from `research/eval/` and
+        has no `config.schema` -- keeps comparing exactly as it did. Only a key present on both
+        sides with different values refuses the comparison, and each reason names the key and
+        both values so the failure is actionable from the console alone.
+
+        `laya_version` and `thresholds` are recorded in `config` but deliberately not compared
+        here: a patch release must not invalidate a committed baseline.
+        """
+        other = _identity_of(baseline)
+        reasons: List[str] = []
+        for key in _IDENTITY_KEYS:
+            here, there = self.config.get(key), other.get(key)
+            if here is None or there is None or here == there:
+                continue
+            reasons.append("%s (%s): baseline is %s, this run is %s"
+                           % (key, _IDENTITY_LABELS[key], there, here))
+        return (not reasons), reasons
 
     def compare(self, baseline: Dict[str, Any], tolerances: Optional[Dict[str, float]] = None,
                 ) -> Tuple[bool, Dict[str, Dict[str, float]]]:
@@ -461,6 +600,10 @@ def evaluate(runner: Any, dataset: Dataset, evaluators: Optional[Sequence[Evalua
         report.overall["latency_p50_ms"], report.overall["latency_p95_ms"] = _percentiles(waits)
         (report.overall["cost_per_decision_p50_ms"],
          report.overall["cost_per_decision_p95_ms"]) = _percentiles(shares)
+    # The run identity, stamped here rather than left to the caller: everything below is
+    # computable from `dataset`, so a programmatic `evaluate` is as identifiable as a CLI run.
+    # The CLI adds `dataset_sha256` and `thresholds`, which need the file path and the gate.
+    report.config = dict(report.config, **_run_identity(dataset))
     report.config = dict(report.config, timing={
         "latency_metric": "per request: the wall time of the call that returned it, unsplit",
         "cost_metric": "per decision: that call divided by its own chunk size",

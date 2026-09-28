@@ -124,6 +124,34 @@ metrics per slice value, so a regression in one language or one question is visi
 reading the aggregate. The `model` slice holds the checkpoint that answered each row: the
 `Router`'s own choice per request, or the runner's `model` for a runner that does not route.
 
+## Run identity
+
+`run` records what it measured in the report's `config` block, so the artifact a reviewer reads
+is reviewable on its own:
+
+| key | meaning |
+|---|---|
+| `schema` | the report shape, `laya-evals-report/1`, so a consumer can refuse one it cannot read |
+| `dataset` | the path as typed -- a name, not a hash |
+| `dataset_sha256` | the sha256 of the dataset bytes that were parsed |
+| `questions_sha256` | a fingerprint of the question schema: every question's id, type and `criteria`, over the whole dataset |
+| `laya_version` | the `laya` that computed the numbers |
+| `thresholds` | the gate this run applied: `min`, `max` and `baseline_tolerance` |
+| `revisions` | the commit each checkpoint that answered was loaded from (see [below](#baseline-and-ci-gate)) |
+
+`dataset` is a path, and a path is not an identity: a dataset can be edited in place, moved, or
+refetched under the same name, and a CI cache can hand two runs the same filename and different
+bytes. `questions_sha256` covers what was *asked* rather than how many rows there were, so scoring
+more states on the same questions stays comparable to a baseline, while renaming a `choice` option
+label does not -- `criteria` is the decision space, and the metamorphic checks in
+`research/eval/metamorphic.py` exist because a label rename flips answers. `instructions` is
+excluded on purpose: rewording prose changes the prompt, not the question being asked.
+
+Nothing time-bearing is recorded, so a report is still byte-reproducible for a fixed runner.
+
+`REPORT_SCHEMA`, `questions_fingerprint(dataset)` and `file_fingerprint(path)` are public, so a
+caller driving `laya.evals.evaluate` directly gets the same identity a CLI run does.
+
 ## Baseline and CI gate
 
 - Keep the dataset, a baseline report (`--json` output you have reviewed), and the tolerances
@@ -132,6 +160,21 @@ reading the aggregate. The `model` slice holds the checkpoint that answered each
 - `laya-evals run ... --baseline baseline.json --tolerance ...` exits non-zero on drift, so it
   drops into CI unchanged. `laya.evals.EvalReport.compare` and `assert_regression` expose the
   same logic for tests.
+
+The metric gate answers "did the numbers move". It cannot answer "were these the same numbers",
+because `compare` reads `overall` and only `overall` -- so a baseline recorded against one dataset
+would pass a candidate scored on another, with identical arithmetic. `EvalReport.comparable_to`
+closes that: it compares `schema`, `dataset_sha256` and `questions_sha256`, and `run --baseline`
+and `compare` still print every delta, then fail with a non-zero exit naming the key and both
+values:
+
+```text
+FAIL: baseline is not comparable: dataset_sha256 (dataset bytes): baseline is <sha>, this run is <sha>
+```
+
+A key missing on either side is *unknown*, not a conflict, so every report written before the
+identity existed keeps comparing exactly as it did. That includes the scheduled gate's baseline
+below, which comes from `research/eval/` and has no `config.schema` at all.
 
 Two CI surfaces use this:
 

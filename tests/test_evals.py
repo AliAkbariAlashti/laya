@@ -7,6 +7,8 @@ import re
 
 import pytest
 
+import laya
+from laya import evals
 from laya.evals import (
     ChoiceAccuracy,
     Dataset,
@@ -586,6 +588,141 @@ def test_default_evaluators_cover_the_three_types():
     assert {"choice_accuracy", "noul_accuracy", "score_mae", "mean_confidence"} <= names
 
 
+# ------------------------------------------------------- run identity / comparability
+def _identified(**config):
+    return EvalReport(config={"schema": evals.REPORT_SCHEMA, **config},
+                      overall={"choice_accuracy": 0.8})
+
+
+def test_evaluate_records_what_it_measured():
+    """`config` is the artifact a reviewer reads, so it has to say which run produced it.
+
+    `config.dataset` is the path as typed. Two datasets share a path across a rebase, a CI
+    cache or a colleague's checkout, and `docs/evals.md` tells the reviewer to commit the
+    dataset and the baseline together and read the result as a diff -- which is only reviewable
+    if the report says which bytes were scored.
+    """
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "b"})])
+    report = evaluate(StubRunner({"s1": {"intent": choice_answer("a")},
+                                  "s2": {"intent": choice_answer("a")}}), dataset)
+    config = report.config
+    assert config["schema"] == evals.REPORT_SCHEMA
+    assert config["laya_version"] == laya.__version__
+    assert len(config["questions_sha256"]) == 64, "the question schema is part of the identity"
+
+    # Determinism: the identity must carry nothing time-bearing, or a re-run of the same dataset
+    # stops producing the same report and the artifact a reviewer diffs becomes noise. The
+    # `*_ms` metrics are wall clock and always differ; only the config block is asserted here.
+    again = evaluate(StubRunner({"s1": {"intent": choice_answer("a")},
+                                 "s2": {"intent": choice_answer("a")}}), dataset)
+    assert {k: v for k, v in config.items() if k != "timing"} == \
+           {k: v for k, v in again.config.items() if k != "timing"}
+
+
+def test_questions_fingerprint_follows_the_question_not_the_row():
+    """The fingerprint covers the question schema, so it is a function of what was asked.
+
+    A run that scores a different dataset must not collide with a baseline, and a run that
+    scores the same questions on more rows must still be comparable to it. Renaming a `choice`
+    label is a different question, not a different row: `research/eval/metamorphic.py` exists
+    because option order and label rename flip answers.
+    """
+    base = Dataset([Example("s1", Q, {"intent": "a"})])
+    more_rows = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"})])
+    assert evals.questions_fingerprint(base) == evals.questions_fingerprint(more_rows)
+
+    renamed = Dataset([Example("s1", {"intent": {"type": "choice", "instructions": "?",
+                                                 "criteria": {"a": "x", "c": "y"}}},
+                               {"intent": "a"})])
+    assert evals.questions_fingerprint(renamed) != evals.questions_fingerprint(base)
+
+    retyped = Dataset([Example("s1", {"flag": {"type": "noul", "instructions": "?"}},
+                               {"flag": True})])
+    assert evals.questions_fingerprint(retyped) != evals.questions_fingerprint(base)
+
+
+def test_comparable_to_refuses_two_different_runs():
+    """`compare` reads `overall` only, so without this a gate passes two different experiments.
+
+    Both reports score 0.8, so the arithmetic is identical -- but they are not the same
+    measurement, and a promotion decision made on that is unfalsifiable. Every field
+    `docs/staged-adoption.md` tells the operator to record with the policy has to be able to
+    stop the comparison.
+    """
+    baseline = _identified(dataset_sha256="a" * 64, questions_sha256="q" * 64)
+    same = _identified(dataset_sha256="a" * 64, questions_sha256="q" * 64)
+    ok, reasons = same.comparable_to(baseline.to_json())
+    assert ok and reasons == [], reasons
+
+    for field, other in (("schema", "laya-evals-report/act-head-eval/1"),
+                         ("dataset_sha256", "b" * 64),
+                         ("questions_sha256", "z" * 64)):
+        candidate = _identified(dataset_sha256="a" * 64, questions_sha256="q" * 64)
+        candidate.config[field] = other
+        ok, reasons = candidate.comparable_to(baseline.to_json())
+        assert not ok, field
+        # The key is named, so the failure is greppable against the `config` a reviewer reads.
+        assert any(field in reason for reason in reasons), (field, reasons)
+
+    # The reason names both values, or a reviewer still has to open two files to act on it.
+    swapped = _identified(dataset_sha256="c" * 64, questions_sha256="q" * 64)
+    ok, reasons = swapped.comparable_to(baseline.to_json())
+    assert "c" * 64 in " ".join(reasons) and "a" * 64 in " ".join(reasons)
+
+
+def test_comparable_to_ignores_what_it_cannot_see():
+    """A field missing on one side is unknown, not a conflict.
+
+    Every baseline committed before this existed -- including the scheduled gate's
+    `research/results/eval_english_51_languages.json`, which comes from `research/eval/` and
+    has no `config.schema` at all -- has to keep comparing exactly as it did.
+    """
+    legacy = {"overall": {"choice_accuracy": 0.8}, "config": {"dataset": "old.jsonl"}}
+    report = _identified(dataset_sha256="a" * 64, questions_sha256="q" * 64)
+    ok, reasons = report.comparable_to(legacy)
+    assert ok and reasons == [], reasons
+    assert report.compare(legacy, {"choice_accuracy": 0.0})[0], "the metric gate still runs"
+
+    # Two reports that both predate the identity fields are as comparable as they ever were.
+    ok, reasons = EvalReport(config={"dataset": "a.jsonl"}).comparable_to(legacy)
+    assert ok and reasons == [], reasons
+
+    # A bare metric dict is a baseline `compare` already accepts, so it stays acceptable here.
+    ok, reasons = report.comparable_to({"choice_accuracy": 0.8})
+    assert ok and reasons == [], reasons
+
+
+def test_a_comparing_report_does_not_read_a_shape_it_does_not_know():
+    # `research/evals/act_head_eval.py` publishes a report under its own schema tag. A consumer
+    # that cannot read it must be told, not left to compare a different metric space.
+    foreign = {"schema": "laya-evals-report/act-head-eval/1",
+               "overall": {"choice_accuracy": 0.8}, "cases": [], "slices": {}}
+    ok, reasons = _identified(dataset_sha256="a" * 64).comparable_to(foreign)
+    assert not ok and any("act-head-eval" in reason for reason in reasons), reasons
+
+
+def test_docs_document_the_run_identity_and_the_refusal():
+    """The docs table is derived against the code, not transcribed, so it cannot drift.
+
+    `docs/evals.md` is what an operator reads before deciding what to record with a policy, so
+    every key the report actually writes has to appear there.
+    """
+    from pathlib import Path
+
+    page = (Path(__file__).resolve().parent.parent / "docs" / "evals.md").read_text(encoding="utf-8")
+    dataset = Dataset([Example("s1", Q, {"intent": "a"})])
+    report = evaluate(StubRunner({"s1": {"intent": choice_answer("a")}}), dataset)
+    for key in report.config:
+        if key != "timing":
+            assert "`%s`" % key in page, key
+    # The keys the CLI adds, and the programmatic entry points, are part of the same contract.
+    for key in ("dataset_sha256", "thresholds", "revisions"):
+        assert "`%s`" % key in page, key
+    for name in ("REPORT_SCHEMA", "questions_fingerprint", "file_fingerprint", "comparable_to"):
+        assert name in page, name
+    assert "not comparable" in page, "the refusal the gate prints is documented"
+
+
 # --------------------------------------------------------------- CLI
 def _write_dataset(tmp_path, rows):
     path = tmp_path / "dataset.jsonl"
@@ -633,6 +770,97 @@ def test_cli_rejects_a_malformed_tolerance():
 
     with pytest.raises(EvalError):
         evals_cli._parse_pairs(["choice_accuracy"])
+
+
+def test_cli_run_records_the_run_identity(monkeypatch, tmp_path):
+    """The `--json` artifact is what a reviewer reads, so it has to say which run produced it.
+
+    `docs/evals.md` tells the reviewer to commit the dataset and a reviewed baseline together and
+    read the result as a diff. That only works if the report carries the dataset's bytes and the
+    question schema, not just the path, and if it records the gate the numbers came out of.
+    """
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    out = tmp_path / "report.json"
+    assert evals_cli.main(["run", dataset, "--min-accuracy", "0.5", "--max-ece", "0.9",
+                           "--tolerance", "choice_accuracy=0.02", "--json", str(out)]) == 0
+    config = json.loads(out.read_text(encoding="utf-8"))["config"]
+    assert config["schema"] == evals.REPORT_SCHEMA
+    assert config["laya_version"] == laya.__version__
+    assert config["dataset"] == dataset, "the path stays a name; the hash carries the bytes"
+    assert config["dataset_sha256"] == evals.file_fingerprint(dataset)
+    assert config["questions_sha256"] == evals.questions_fingerprint(evals.Dataset.from_jsonl(dataset))
+    assert config["thresholds"]["min"] == {"choice_accuracy": 0.5}
+    assert config["thresholds"]["max"] == {"ece": 0.9}
+    assert config["thresholds"]["baseline_tolerance"] == {"choice_accuracy": 0.02}
+
+
+def test_cli_run_refuses_a_baseline_from_a_different_dataset(monkeypatch, tmp_path, capsys):
+    """The gate that a promotion decision rests on: two different runs cannot pass as one.
+
+    Both runs score the same rows with the same stub, so every metric matches and the baseline
+    comparison passes. But the baseline was recorded against different bytes, so the number being
+    promoted was never measured on the data the gate claims to have validated. A pass here is
+    arithmetic, not evidence.
+    """
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    original = _write_dataset(tmp_path, RUN_ROWS)
+    baseline_out = tmp_path / "baseline.json"
+    assert evals_cli.main(["run", original, "--json", str(baseline_out)]) == 0
+    capsys.readouterr()
+
+    # The same file name, one extra row: exactly what an edited dataset looks like in a diff.
+    edited = tmp_path / "edited.jsonl"
+    edited.write_text("\n".join(json.dumps(row) for row in RUN_ROWS)
+                      + "\n" + json.dumps(RUN_ROWS[0]), encoding="utf-8")
+    assert evals_cli.main(["run", str(edited), "--baseline", str(baseline_out),
+                           "--tolerance", "choice_accuracy=0.05"]) == 1
+    err = capsys.readouterr().err
+    assert "baseline is not comparable" in err
+    assert "dataset_sha256" in err, "the failure names the key a reviewer can check"
+
+
+def test_cli_run_still_accepts_a_baseline_with_no_identity(monkeypatch, tmp_path, capsys):
+    """Every baseline committed before the identity existed keeps passing exactly as it did.
+
+    The scheduled gate compares against `research/results/eval_english_51_languages.json`, which
+    comes from `research/eval/` and has no `config.schema`. A key missing on one side is unknown,
+    not a conflict -- otherwise this change would break the repo's own CI on its first run.
+    """
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"config": {"dataset": "somewhere/else.jsonl"},
+                                  "overall": {"choice_accuracy": 1.0}}), encoding="utf-8")
+    assert evals_cli.main(["run", dataset, "--baseline", str(legacy),
+                           "--tolerance", "choice_accuracy=0.05"]) == 0
+    assert "not comparable" not in capsys.readouterr().err
+
+
+def test_cli_compare_refuses_two_different_runs(tmp_path, capsys):
+    from laya import evals_cli
+
+    report = {"config": {"schema": evals.REPORT_SCHEMA, "dataset_sha256": "a" * 64,
+                         "questions_sha256": "q" * 64},
+              "overall": {"choice_accuracy": 0.8}, "cases": [], "slices": {}}
+    baseline = {"config": {"schema": evals.REPORT_SCHEMA, "dataset_sha256": "b" * 64,
+                           "questions_sha256": "q" * 64},
+                "overall": {"choice_accuracy": 0.8}, "cases": [], "slices": {}}
+    (tmp_path / "r.json").write_text(json.dumps(report), encoding="utf-8")
+    (tmp_path / "b.json").write_text(json.dumps(baseline), encoding="utf-8")
+    # Identical `overall`, and the default tolerance is an exact match, so the metric gate passes.
+    assert evals_cli.main(["compare", str(tmp_path / "r.json"),
+                           "--baseline", str(tmp_path / "b.json")]) == 1
+    captured = capsys.readouterr()
+    assert "baseline is not comparable" in captured.err and "dataset_sha256" in captured.err
+    # The deltas are still printed, so the reviewer sees what moved as well as why it is not a pass.
+    assert "diff=" in captured.out and "choice_accuracy" in captured.out
 
 
 # ------------------------------------------------------------------ CLI run
