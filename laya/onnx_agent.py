@@ -416,7 +416,9 @@ class ONNXAgent(HookRegistry):
             hooks_timeout: Override the agent's `hooks_timeout` for this call.
 
         Returns a single result dict, the same shape as `system_one`, with `usage["windows"]`
-        added.
+        added. Across several windows the truncation keys are summed or carried the same way as
+        in `Agent.predict_long`: `truncated` is a window count and `truncated_questions` is the
+        last window's list.
         """
         from .agent import _start_evidence, _with_start_probe
         from .hooks import aggregate_usage

@@ -1172,6 +1172,13 @@ class Agent(HookRegistry):
         the `N` a start hook rewrote them to), and `0` when a start hook answered the document, or
         left no states to score, before any window was read -- on either path, so a cached answer
         never reads as a window the model read.
+
+        Across several windows the truncation keys are combined like every other `usage` field:
+        `truncated`, `state_tokens` and `state_tokens_dropped` are summed (so `truncated` is the
+        number of windows that were cut, and the token counts include the overlap), and
+        `truncated_questions` is the last window's list. A window is cut when it is larger than
+        the room a question's head leaves, from a `window` above the default or a start hook that
+        narrows `max_len` / `head_max_len`. Test `usage["truncated"] > 0` here, not `is True`.
         """
         if aggregate != "auto":
             raise ValueError("predict_long: only aggregate='auto' is supported")
