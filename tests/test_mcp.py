@@ -89,12 +89,22 @@ def test_device():
         else:
             os.environ["LAYA_DEVICE"] = old
     ok("device/fallback", resolve_device(None) in ("cuda", "mps", "xpu", "cpu"))
-    # laya.serve contract: LAYA_DEVICE goes verbatim to torch; the label is lowercased.
+    # laya.serve contract: LAYA_DEVICE is normalised to what torch's device parser accepts --
+    # the device type is lower-cased, the optional index is left alone -- and the same string is
+    # both handed to torch and reported by `resolve_device`.
     old_dev = os.environ.get("LAYA_DEVICE")
     try:
         os.environ["LAYA_DEVICE"] = "cuda:1"
-        ok("device/env_raw_for_torch", env_device() == "cuda:1")
+        ok("device/env_for_torch", env_device() == "cuda:1")
         ok("device/env_label", resolve_device() == "cuda:1")
+        # torch's parser is case-sensitive, so the type is normalised rather than passed through.
+        os.environ["LAYA_DEVICE"] = "CUDA"
+        ok("device/env_upper_type_lowercased", env_device() == "cuda")
+        ok("device/env_upper_matches_label", env_device() == resolve_device())
+        os.environ["LAYA_DEVICE"] = "CUDA:0"
+        ok("device/env_upper_index_kept", env_device() == "cuda:0")
+        os.environ["LAYA_DEVICE"] = "  CPU  "
+        ok("device/env_padded_upper_lowercased", env_device() == "cpu")
         os.environ["LAYA_DEVICE"] = "   "
         ok("device/env_blank_none", env_device() is None)
     finally:
