@@ -626,6 +626,11 @@ def test_questions_fingerprint_follows_the_question_not_the_row():
     scores the same questions on more rows must still be comparable to it. Renaming a `choice`
     label is a different question, not a different row: `research/eval/metamorphic.py` exists
     because option order and label rename flip answers.
+
+    The scope of the last claim is the fingerprint, not the gate. `dataset_sha256` is compared
+    too, and adding a row changes the file's bytes, so through `laya-evals run` a longer dataset
+    is correctly refused. The fingerprint being row-independent is what lets a programmatic
+    caller see that the *questions* did not change.
     """
     base = Dataset([Example("s1", Q, {"intent": "a"})])
     more_rows = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"})])
@@ -639,6 +644,108 @@ def test_questions_fingerprint_follows_the_question_not_the_row():
     retyped = Dataset([Example("s1", {"flag": {"type": "noul", "instructions": "?"}},
                                {"flag": True})])
     assert evals.questions_fingerprint(retyped) != evals.questions_fingerprint(base)
+
+
+def test_questions_fingerprint_covers_the_instructions():
+    """`instructions` is the prompt. Excluding it made the fingerprint say "same question" for
+    two questions the model answers differently.
+
+    `laya/common.py:158-159` renders `"%s question: %s" % (q["type"], instructions)` into the
+    tokenized head, `laya/agent.py:633-634` makes the field mandatory ("add the text the model
+    should answer"), and Laya's own identity key for sharing forward passes
+    (`Router._question_schema`, `laya/router.py:141`) hashes the whole questions dict,
+    instructions included -- as does this module's own batch grouping at `laya/evals.py:529`.
+    `tests/test_router_batch.py:543` pins that rewording alone moves a row to its own batch group.
+    Leaving it out made the one field this contract exists to protect the one field it ignored.
+    """
+    judged = Dataset([Example("s1", {"verdict": {"type": "choice", "instructions": "Judge whether a refund is justified",
+                                                "criteria": {"yes": "approved", "no": "denied"}}},
+                               {"verdict": "yes"})])
+    conservative = Dataset([Example("s1", {"verdict": {"type": "choice", "instructions": "Be conservative and only approve explicit refund requests",
+                                                      "criteria": {"yes": "approved", "no": "denied"}}},
+                                 {"verdict": "yes"})])
+    assert evals.questions_fingerprint(judged) != evals.questions_fingerprint(conservative)
+
+    # Same wording, different question id, is still a different question.
+    renamed_id = Dataset([Example("s1", {"decision": judged.examples[0].questions["verdict"]},
+                                  {"decision": "yes"})])
+    assert evals.questions_fingerprint(renamed_id) != evals.questions_fingerprint(judged)
+
+    # Whitespace is not decoration: it is tokenized. `common.py:158` strips only the tokenizer's
+    # mask token, and this module has no tokenizer to know what that is, so nothing else is
+    # normalized away.
+    spaced = Dataset([Example("s1", {"verdict": dict(judged.examples[0].questions["verdict"],
+                                                     instructions="Judge whether a refund is justified ")},
+                              {"verdict": "yes"})])
+    assert evals.questions_fingerprint(spaced) != evals.questions_fingerprint(judged)
+
+
+def test_questions_fingerprint_normalizes_instructions_the_way_the_engine_does():
+    """Two questions that render the same text are the same question, whatever their JSON shape.
+
+    `Agent._to_internal` (`laya/agent.py:736-748`) turns a non-string `instructions` into
+    `json.dumps(ins, ensure_ascii=False)` before tokenizing, and `tests/test_criteria.py:229-251`
+    pins why: the default `ensure_ascii=True` escaped non-ASCII to literal `\\uXXXX` and a German
+    question answered noul=0.1652 as a dict against 0.2650 as the identical plain string. The
+    fingerprint has to mirror that step, or it hashes the input's JSON shape instead of the text
+    the model reads.
+    """
+    criteria = {"yes": "approved", "no": "denied"}
+    as_object = Dataset([Example("s1", {"verdict": {"type": "choice",
+                                                    "instructions": {"task": "Bittet der Kunde um eine Rückerstattung?"},
+                                                    "criteria": criteria}},
+                               {"verdict": "yes"})])
+    as_text = Dataset([Example("s1", {"verdict": {"type": "choice",
+                                                  "instructions": '{"task": "Bittet der Kunde um eine Rückerstattung?"}',
+                                                  "criteria": criteria}},
+                               {"verdict": "yes"})])
+    assert evals.questions_fingerprint(as_object) == evals.questions_fingerprint(as_text)
+
+
+def test_a_reworded_question_cannot_pass_the_gate():
+    """The end-to-end contract: a different question is not a baseline drift, it is a new run.
+
+    Reproduces the hole the fingerprint's exclusion opened. `evaluate(runner, Dataset(...))` has
+    no dataset file to hash, so `questions_sha256` is the only identity a programmatic run has --
+    and it used to be blind to the one field that decides the answer. The metric gate is a
+    separate, tolerance-dependent safety net; this is the check that does not depend on having
+    guessed the right tolerance.
+    """
+    criteria = {"yes": "approved", "no": "denied"}
+
+    def twenty(instr):
+        q = {"verdict": {"type": "choice", "instructions": instr, "criteria": criteria}}
+        return Dataset([Example("s%d" % i, q, {"verdict": "yes"}) for i in range(20)])
+
+    class OneRowFlips:
+        """The answer depends on the instruction on exactly one state, so the metric delta can
+        sit inside a realistic tolerance while the question asked is a different one."""
+        def predict(self, state, questions, model=None):
+            reworded = "conservative" in questions["verdict"]["instructions"]
+            label = "no" if (reworded and state == "s19") else "yes"
+            return {"model": "stub", "answers": {"verdict": {
+                "type": "choice", "choice": label,
+                "probabilities": {label: 0.9}, "confidence": 0.9}}}
+
+    baseline = evaluate(OneRowFlips(), twenty("Judge whether a refund is justified"),
+                        evaluators=[ChoiceAccuracy()])
+    candidate = evaluate(OneRowFlips(), twenty("Be conservative and only approve explicit refunds"),
+                        evaluators=[ChoiceAccuracy()])
+    assert candidate.overall["choice_accuracy"] == pytest.approx(0.95)
+
+    ok, reasons = candidate.comparable_to(baseline.to_json())
+    assert not ok, "a reworded question is a different experiment, not an identical one"
+    assert any("questions_sha256" in reason for reason in reasons), reasons
+
+    # And the same question over more rows is still the same experiment, which is the property
+    # that would be lost if the fingerprint were simply "the whole dataset".
+    def same_question(rows):
+        q = {"verdict": {"type": "choice", "instructions": "Judge whether a refund is justified",
+                         "criteria": criteria}}
+        return Dataset([Example("s%d" % i, q, {"verdict": "yes"}) for i in range(rows)])
+
+    longer = evaluate(OneRowFlips(), same_question(25), evaluators=[ChoiceAccuracy()])
+    assert longer.comparable_to(baseline.to_json())[0], "more rows is not a different question"
 
 
 def test_comparable_to_refuses_two_different_runs():

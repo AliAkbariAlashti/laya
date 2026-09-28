@@ -134,18 +134,35 @@ is reviewable on its own:
 | `schema` | the report shape, `laya-evals-report/1`, so a consumer can refuse one it cannot read |
 | `dataset` | the path as typed -- a name, not a hash |
 | `dataset_sha256` | the sha256 of the dataset bytes that were parsed |
-| `questions_sha256` | a fingerprint of the question schema: every question's id, type and `criteria`, over the whole dataset |
+| `questions_sha256` | a fingerprint of the question schema: every question's id, type, `instructions` and `criteria`, over the whole dataset |
 | `laya_version` | the `laya` that computed the numbers |
 | `thresholds` | the gate this run applied: `min`, `max` and `baseline_tolerance` |
 | `revisions` | the commit each checkpoint that answered was loaded from (see [below](#baseline-and-ci-gate)) |
 
 `dataset` is a path, and a path is not an identity: a dataset can be edited in place, moved, or
 refetched under the same name, and a CI cache can hand two runs the same filename and different
-bytes. `questions_sha256` covers what was *asked* rather than how many rows there were, so scoring
-more states on the same questions stays comparable to a baseline, while renaming a `choice` option
-label does not -- `criteria` is the decision space, and the metamorphic checks in
-`research/eval/metamorphic.py` exist because a label rename flips answers. `instructions` is
-excluded on purpose: rewording prose changes the prompt, not the question being asked.
+bytes. `questions_sha256` covers what was *asked* rather than how many rows there were, so adding
+states to an unchanged question set leaves the fingerprint alone -- `dataset_sha256` still moves,
+and adding a row is a change to the data, not to the question.
+
+It covers `instructions` too, because the instruction text is the prompt. `build_sequence` renders
+`"<type> question: <instructions>"` into the tokenized head, `Agent` refuses a question without one
+("add the text the model should answer"), and Laya's own question identity already counts it:
+`Router._question_schema` and this harness's batch grouping both key on the whole questions dict,
+and `tests/test_router_batch.py` pins that rewording `instructions` alone moves a row into its own
+batch group. So does a reworded instruction still compare equal to a baseline? No -- and that is
+the point. "Judge whether a refund is justified" and "Be conservative and only approve explicit
+refund requests" ask different questions, and the metric gate can only notice when the difference
+happens to move a number further than the tolerance you named. Naming a `choice` option is the
+same argument: `criteria` is the decision space, and the metamorphic checks in
+`research/eval/metamorphic.py` exist because renaming a label flips answers.
+
+Nothing about the instruction text is normalized except the one step the engine itself applies: a
+non-string `instructions` is hashed as `json.dumps(ins, ensure_ascii=False)`, matching
+`Agent._to_internal`. So whitespace and wording both count, and a rewording that a human considers
+a copy edit is treated as a new experiment. That is the honest default -- the alternative is a
+similarity heuristic standing between a run and its baseline, and no evaluation system in common
+use has one.
 
 Nothing time-bearing is recorded, so a report is still byte-reproducible for a fixed runner.
 

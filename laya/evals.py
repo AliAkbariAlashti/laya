@@ -130,6 +130,25 @@ def _canonical(value: Any) -> str:
                       default=str)
 
 
+def _as_tokenized_instructions(body: Dict[str, Any]) -> Any:
+    """`instructions` exactly as `Agent._to_internal` (`laya/agent.py:736-748`) hands it over.
+
+    A non-string becomes ``json.dumps(ins, ensure_ascii=False)``, and that step is not cosmetic:
+    ``tests/test_criteria.py:229-251`` pins that the default ``ensure_ascii=True`` escaped
+    non-ASCII to literal ``\\uXXXX``, the tokenizer read it as escape text, and one German
+    question answered noul=0.1652 as a dict against 0.2650 as the identical plain string. So the
+    fingerprint normalizes the same way, or it hashes the input's JSON shape instead of the text
+    the model reads.
+
+    Not mirrored: the tokenizer's mask-token strip in `common.build_sequence`, which needs
+    `tok.mask_token` and would mean guessing which tokenizer a run loads. Instructions carrying
+    a mask token therefore hash apart even though they render alike -- a false refusal, which is
+    the safe direction to be wrong in.
+    """
+    ins = body.get("instructions")
+    return ins if isinstance(ins, str) else json.dumps(ins, ensure_ascii=False)
+
+
 def questions_fingerprint(dataset: "Dataset") -> str:
     """A stable hash of *what was asked*, over every question in `dataset`.
 
@@ -137,18 +156,27 @@ def questions_fingerprint(dataset: "Dataset") -> str:
     with the policy, and the part of the run identity a report can compute for itself: the
     dataset file hash is the CLI's, but the questions are parsed here.
 
+    It covers every field the answer depends on, which is the same rule `examples/hooks/cache.py`
+    states for a cache key ("has to cover everything the answer depends on") and the same one
+    Laya already applies to its own question identity: `Router._question_schema`
+    (`laya/router.py:141`) and this module's batch grouping (`laya/evals.py`) both hash the whole
+    questions dict. `tests/test_router_batch.py:543` pins that rewording `instructions` alone
+    moves a row into its own batch group.
+
     It is a function of the decision space, not of the rows, so scoring more states on the same
-    questions stays comparable to a baseline. A `choice` option label lives in `criteria` and so
-    counts as a different question -- which is the case that matters, since
-    `research/eval/metamorphic.py` exists because renaming a label flips answers. Free-text
-    `instructions` are excluded: rewording them changes the prompt, not the decision space, and
-    a baseline should survive a copy edit.
+    questions leaves it unchanged.
+
+    `criteria` is hashed raw, without `Agent._to_internal`'s list-to-dict and lowercase-key
+    rewrites. That is deliberate and asymmetric: two `noul` questions that render alike but are
+    written differently would then be refused, which is the safe direction to be wrong in.
+    Normalizing them would widen the change past what the identity needs.
     """
     schemas = set()
     for example in dataset.examples:
         for qid, question in example.questions.items():
             body = question if isinstance(question, dict) else {}
             schemas.add(_canonical({"qid": qid, "type": body.get("type"),
+                                    "instructions": _as_tokenized_instructions(body),
                                     "criteria": body.get("criteria")}))
     digest = hashlib.sha256()
     for schema in sorted(schemas):
