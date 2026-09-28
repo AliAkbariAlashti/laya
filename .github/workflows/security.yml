@@ -56,34 +56,73 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install pip-audit
-      - name: Audit declared dependencies
+      - name: Audit shipped dependencies (core + [serve], blocking)
         run: |
           # Audit what the package DECLARES, not a local install. Installing torch from the
           # PyTorch CPU index yields a local version (2.14.0+cpu) that does not exist on PyPI,
           # so pip-audit cannot resolve it and --strict fails the job on that alone.
           #
-          # Every declared name, not just [project.dependencies]: the extras are what an
-          # install actually pulls in. `Dockerfile` ends with `pip install ".[serve]"`, so
-          # fastapi/uvicorn/python-multipart and their transitive closure ship in the image,
-          # and an advisory in any of them would be invisible to a core-only audit. Read the
-          # tables rather than transcribing a list, so an extra added later is audited by the
-          # commit that adds it and not by a follow-up that forgets.
-          python - <<'PY' > requirements-audit.txt
+          # The blocking scope is what the package and the image actually ship: [project.dependencies]
+          # plus the [serve] extra -- the Dockerfile ends with `pip install ".[serve]"`, so fastapi,
+          # uvicorn and python-multipart and their transitive closure run inside the published image,
+          # and an advisory in any of them has to fail every PR. Read the tables rather than
+          # transcribing a list, so an extra added later is audited by the commit that adds it.
+          #
+          # The remaining extras (langchain, crewai, llamaindex, ...) are audited separately, see
+          # the next step: a finding there is still reported, but it does not fail unrelated PRs.
+          python - <<'PY' > requirements-audit-core.txt
           import tomllib
           with open("pyproject.toml", "rb") as fh:
               project = tomllib.load(fh)["project"]
           specs = list(project.get("dependencies", []))
-          for extra in project.get("optional-dependencies", {}).values():
-              specs.extend(extra)
+          specs.extend(project.get("optional-dependencies", {}).get("serve", []))
           seen = set()
-          for spec in specs:          # `langchain` and `langgraph` repeat two of these
+          for spec in specs:
               if spec not in seen:
                   seen.add(spec)
                   print(spec)
           PY
-          cat requirements-audit.txt
-          echo "auditing $(wc -l < requirements-audit.txt) declared names: the core plus every extra"
-          pip-audit --strict --desc -r requirements-audit.txt
+          cat requirements-audit-core.txt
+          echo "strictly auditing $(wc -l < requirements-audit-core.txt) shipped names: the core plus [serve]"
+          pip-audit --strict --desc -r requirements-audit-core.txt
+
+      - name: Audit optional-integration dependencies (findings advisory, failures blocking)
+        # The integration extras pull transitives that ship nowhere: no laya surface runs a Chroma
+        # server or calls nltk's model save/load, and crewai pins json-repair below the patched
+        # release (#645). Those advisories still deserve eyes, so they are reported here as an
+        # annotation, but they must not turn every PR red -- a gate that is always red teaches
+        # everyone to skim past it, including the day one of these packages ships a fix (#646).
+        #
+        # Only FINDINGS are advisory. pip-audit exits non-zero both for findings and for a broken
+        # audit -- a specifier it cannot resolve, a resolver or tool crash -- and its report always
+        # carries the findings count. So a failure WITH a report is advisory; a failure WITHOUT one
+        # is the audit itself breaking, and that still fails the job exactly as it did before.
+        run: |
+          python - <<'PY' > requirements-audit-extras.txt
+          import tomllib
+          with open("pyproject.toml", "rb") as fh:
+              project = tomllib.load(fh)["project"]
+          seen = set()
+          for extra, specs in project.get("optional-dependencies", {}).items():
+              if extra == "serve":
+                  continue          # already in the blocking audit above
+              for spec in specs:
+                  if spec not in seen:          # `langchain` and `langgraph` repeat two of these
+                      seen.add(spec)
+                      print(spec)
+          PY
+          cat requirements-audit-extras.txt
+          echo "advisorially auditing $(wc -l < requirements-audit-extras.txt) optional-integration names"
+          # `set -e` is on: capture the exit code without tripping it, then decide below.
+          pip-audit --strict --desc -r requirements-audit-extras.txt > pip-audit-extras.log 2>&1 && code=0 || code=$?
+          cat pip-audit-extras.log
+          if [ "$code" -ne 0 ] && ! grep -q "known vulnerabilities" pip-audit-extras.log; then
+            echo "::error::the extras audit itself failed (exit $code) -- resolver or tooling error, still blocking"
+            exit "$code"
+          fi
+          if [ "$code" -ne 0 ]; then
+            echo "::warning::advisories in optional-integration dependencies -- visible here, not blocking PRs (see #645/#646)"
+          fi
 
   codeql:
     name: CodeQL
