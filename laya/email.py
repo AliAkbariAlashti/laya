@@ -52,13 +52,21 @@ _HEADER_NEXT = re.compile(r"^\s*(Enviad[oa]( em| el)?:\s|Sent:\s|(Data|Fecha|Dat
 # `Thanks, żaneta` read as a name and the line counted as a sign-off. The tail is matched
 # structurally instead, and each token's first letter is judged by category below -- the same
 # rule as the TS port's `\p{Lu}\p{Lt}\p{Lo}`. Combining marks ride along with the letter before
-# them (`Jose\u0301` is `José`), as `\p{M}` allows in the port.
+# them (`Jose\u0301` is `José`), as `\p{M}` allows in the port. `re` has no `\p{M}` either, and a
+# class cannot list those ranges any more than it could list the lowercase ones, so the marks
+# are dropped before the tail is matched: they never separate tokens, and the letter each one
+# rides on is what the rule asks about.
 _SIGNOFF_HEAD = re.compile(
     r"^\s*(?i:best|kind|warmest|warm|many thanks|thanks|thank you|regards|cheers|sincerely)"
     r"(?i:\s+(?:and|&)\s+regards|\s+(?:regards|wishes|again|in advance|a lot|so much|very much))?"
 )
-_SIGNOFF_TAIL = re.compile(r"^[\s,;:!.]*(?:[^\W\d_][\w\u0300-\u036f'-]*[\s,.]*){0,3}$")
-_SIGNOFF_TOKEN = re.compile(r"[^\W\d_][\w\u0300-\u036f'-]*")
+_SIGNOFF_TAIL = re.compile(r"^[\s,;:!.]*(?:[^\W\d_][\w'-]*[\s,.]*){0,3}$")
+_SIGNOFF_TOKEN = re.compile(r"[^\W\d_][\w'-]*")
+
+
+def _drop_marks(text: str) -> str:
+    """Remove combining marks, the `Mn`/`Mc`/`Me` categories the port spells `\\p{M}`."""
+    return "".join(ch for ch in text if not unicodedata.category(ch).startswith("M"))
 
 
 def _is_english_signoff(line: str) -> bool:
@@ -66,7 +74,7 @@ def _is_english_signoff(line: str) -> bool:
     m = _SIGNOFF_HEAD.match(line)
     if m is None:
         return False
-    tail = line[m.end():]
+    tail = _drop_marks(line[m.end():])
     if _SIGNOFF_TAIL.match(tail) is None:
         return False
     return all(unicodedata.category(token[0]) in ("Lu", "Lt", "Lo")
