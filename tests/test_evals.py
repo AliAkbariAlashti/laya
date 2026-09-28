@@ -92,6 +92,20 @@ def test_ece_on_known_inputs():
     assert ece([], []) is None
 
 
+def test_percentiles_use_nearest_rank():
+    from laya.evals import _percentiles
+
+    # Nearest-rank 95th percentile is the ceil(0.95 * n)-th smallest value (1-indexed).
+    # `int(n * 0.95)` used to return the (0.95n + 1)-th value whenever n is a multiple of 20.
+    for n in (20, 40, 100):
+        values = list(range(1, n + 1))
+        _, p95 = _percentiles(values)
+        assert p95 == pytest.approx((95 * n + 99) // 100), \
+            "95th percentile of 1..%d must be the nearest-rank value, got %r" % (n, p95)
+    # A single value is its own percentile.
+    assert _percentiles([7.0]) == (7.0, 7.0)
+
+
 # --------------------------------------------------------------- dataset
 def test_dataset_from_jsonl(tmp_path):
     path = tmp_path / "d.jsonl"
