@@ -67,6 +67,10 @@ NQ = 2
 QUESTIONS = {"a": {"type": "noul", "instructions": "?"}, "b": {"type": "noul", "instructions": "?"}}
 
 
+# `_encode_state` items carry the state truncation counts that `predict_batch` reports in `usage` (#174)
+NO_STATE_STATS = {"state_tokens": 0, "state_tokens_used": 0, "state_tokens_dropped": 0, "truncated": False}
+
+
 def make_fake():
     fake = _agent.Agent.__new__(_agent.Agent)
     fake.tok = type("Tok", (), {"pad_token_id": 0})()
@@ -75,7 +79,7 @@ def make_fake():
 
     def _encode_state(state, ids, internal):
         # one 3-token, 2-marker item per question; content is irrelevant to the mapping test
-        return [{"ids": [1, 2, 3], "markers": [0, 1], "qtype": 2} for _ in ids]
+        return [{"ids": [1, 2, 3], "markers": [0, 1], "qtype": 2, "state_stats": NO_STATE_STATS} for _ in ids]
 
     def _forward(b):
         n = b["input_ids"].shape[0]
@@ -105,7 +109,8 @@ def make_length_fake():
         fake.encoded.append(state)
         limit = overrides.get("max_len", 100)
         # Question rows have different lengths; sorting must use the longest.
-        return [{"ids": [state["id"] + 1] * min(limit, size), "markers": [0, 1], "qtype": 2}
+        return [{"ids": [state["id"] + 1] * min(limit, size), "markers": [0, 1], "qtype": 2,
+                 "state_stats": NO_STATE_STATS}
                 for size in (3, state["length"])]
 
     def forward(batch):

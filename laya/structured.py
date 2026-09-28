@@ -43,7 +43,7 @@ class DecisionResult:
     confidence: Dict[str, float]
     probabilities: Dict[str, Dict[str, Any]]
     answers: Dict[str, Any]
-    usage: Optional[Dict[str, int]] = None
+    usage: Optional[Dict[str, Any]] = None
     routing: Optional[Dict[str, Any]] = None
 
 

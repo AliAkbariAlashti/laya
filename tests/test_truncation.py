@@ -42,8 +42,10 @@ class StubTok:
     sep_token_id = 3
     pad_token_id = 0
 
-    def __call__(self, text, add_special_tokens=True):
-        return {"input_ids": [10 + (len(w) % 50) for w in text.split()]}
+    def __call__(self, text, add_special_tokens=True, truncation=False, max_length=None):
+        ids = [10 + (len(w) % 50) for w in text.split()]
+        # build_sequence caps each option at the tokenizer (truncation=True, max_length=48)
+        return {"input_ids": ids[:max_length] if truncation and max_length is not None else ids}
 
 
 TOK = StubTok()
@@ -150,7 +152,7 @@ import inspect  # noqa: E402
 
 from laya import agent as _agent  # noqa: E402
 
-_src = inspect.getsource(_agent.Agent.system_one)
+_src = inspect.getsource(_agent.Agent._encode_state) + inspect.getsource(_agent.Agent.predict_batch)
 check_true("usage/asks build_sequence for the stats", "return_truncation_stats=True" in _src)
 check_true("usage/publishes the flag", '"truncated": dropped > 0' in _src)
 check_true("usage/publishes the dropped count", '"state_tokens_dropped": dropped' in _src)

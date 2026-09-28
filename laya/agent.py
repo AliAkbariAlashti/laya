@@ -774,12 +774,13 @@ class Agent(HookRegistry):
         items = []
         for qid in ids:
             q = internal[qid]
-            seq, markers, stats = build_sequence(self.tok, state, q, max_len, head_max_len,
-                                                 truncate_left=truncate_left, state_ids=state_ids,
-                                                 return_stats=True)
+            seq, markers, stats, state_stats = build_sequence(self.tok, state, q, max_len, head_max_len,
+                                                              truncate_left=truncate_left, state_ids=state_ids,
+                                                              return_stats=True, return_truncation_stats=True)
             if len(markers) != len(render_options(q)):
                 raise ValueError("question %r options exceed head_max_len=%d" % (qid, head_max_len))
-            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]], "options": stats})
+            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]], "options": stats,
+                          "state_stats": state_stats})
         return items
 
     def _amp_enabled_for(self, rows: int) -> bool:
@@ -1047,7 +1048,21 @@ class Agent(HookRegistry):
                                     n_tokens = int(att[row:row + nrows].sum())
                                     answers = self._decode_answers(logits, act, items, ids, internal, row,
                                                                   **({"lang": lang} if lang else {}))
-                                    usage = {"input_tokens": n_tokens, "output_tokens": 0}
+                                    # Truncation is a token budget that moves with max_len, head_max_len
+                                    # and each question's head, so only build_sequence knows it (#174).
+                                    stats = [item["state_stats"] for item in items]
+                                    dropped = max(s["state_tokens_dropped"] for s in stats)
+                                    usage = {
+                                        "input_tokens": n_tokens,
+                                        "output_tokens": 0,
+                                        "state_tokens": stats[0]["state_tokens"],
+                                        # worst case: the questions share one state, not one head budget
+                                        "state_tokens_dropped": dropped,
+                                        "truncated": dropped > 0,
+                                        "truncated_questions": [
+                                            qid for qid, s in zip(ids, stats) if s["truncated"]
+                                        ],
+                                    }
                                     # Only when a question actually lost options to the head
                                     # budget: an answer chosen from 42 distinguishable spans of
                                     # 58 has a ceiling the caller cannot otherwise see, and a
@@ -1312,6 +1327,11 @@ class Agent(HookRegistry):
             `tokens_per_option` -- because an answer chosen among 42 distinguishable spans of
             58 has a ceiling that is the budget's and not the model's. Questions whose options
             all survive are absent, so a request that collapses nothing is unchanged.
+
+            `usage` also reports whether the state fit: `truncated`, `state_tokens`,
+            `state_tokens_dropped`, and `truncated_questions` (the questions whose head left
+            too little room). A caller that cares whether the answer saw the whole state should
+            read `usage["truncated"]` rather than estimate from the length of what it sent.
 
         To score many states at once, see `predict_batch`, which shares forward passes across them.
         """

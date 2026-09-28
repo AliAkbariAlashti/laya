@@ -295,6 +295,7 @@ for label, cls in (("LayaRouter", LayaRouter), ("LayaGuardrail", LayaGuardrail),
 from laya.common import build_sequence, collapsed_options  # noqa: E402
 
 check_param("build_sequence", build_sequence, "return_stats", False)
+check_param("build_sequence", build_sequence, "return_truncation_stats", False)
 check("collapsed_options/nothing collapsed is empty",
       collapsed_options(["q"], [{"options": {"options": 3, "options_distinct": 3,
                                              "tokens_per_option": None}}]), {})
