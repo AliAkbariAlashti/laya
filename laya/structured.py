@@ -20,7 +20,7 @@ from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .confidence import check_min_confidence, flag_low_confidence
+from .confidence import calibrated_confidence, check_min_confidence, flag_low_confidence
 
 MAX_PROPERTIES = 32
 MAX_OPTIONS = 32
@@ -37,6 +37,13 @@ class DecisionResult:
 
     `values` is the schema-shaped output. `confidence` and `probabilities` are keyed by field,
     and `answers` is Laya's raw answer per field.
+
+    `answer_confidence` is the calibrated max(p) confidence per field -- the quantity temperature
+    scaling fits, the reported ECE measures, and the `min_confidence` gate is defined against --
+    under its own name. `confidence` keeps the normalized-entropy value it has always had, because
+    that is not a calibrated quantity and a caller filtering this artifact to decide what to
+    escalate has to be able to tell the two apart. A field that reported no usable calibrated
+    confidence maps to `None`, which is distinct from a reported `0.0`.
     """
 
     values: Dict[str, Any]
@@ -45,6 +52,9 @@ class DecisionResult:
     answers: Dict[str, Any]
     usage: Optional[Dict[str, int]] = None
     routing: Optional[Dict[str, Any]] = None
+    # Appended with a default so every existing construction of this dataclass keeps working, and
+    # the first six fields keep their positions.
+    answer_confidence: Dict[str, Optional[float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -232,9 +242,13 @@ def answer_to_pydantic(model: Any, answers: Dict[str, Any]) -> Any:
 
 def _details(values: Dict[str, Any], answers: Dict[str, Any], result: Dict[str, Any]) -> DecisionResult:
     confidence: Dict[str, float] = {}
+    answer_confidence: Dict[str, Optional[float]] = {}
     probabilities: Dict[str, Dict[str, Any]] = {}
     for name, answer in answers.items():
         confidence[name] = float(answer.get("confidence", 0.0))
+        # Read through the module that owns the definition, so this and the `min_confidence` gate
+        # cannot disagree about what "calibrated" means.
+        answer_confidence[name] = calibrated_confidence(answer)
         if answer.get("type") == "noul":
             p = float(answer.get("noul", 0.0))
             probabilities[name] = {"false": round(1.0 - p, 4), "true": round(p, 4)}
@@ -247,6 +261,7 @@ def _details(values: Dict[str, Any], answers: Dict[str, Any], result: Dict[str, 
         answers=dict(answers),
         usage=result.get("usage"),
         routing=result.get("routing"),
+        answer_confidence=answer_confidence,
     )
 
 

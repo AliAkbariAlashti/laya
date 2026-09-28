@@ -146,19 +146,32 @@ with per-field confidence, probabilities, the raw answers, and the usage and rou
 
 ```python
 result = agent.decide(state, schema=Ticket, return_details=True)
-result.values["department"]        # "billing"
-result.confidence["department"]    # 0.94
-result.probabilities["department"] # {"billing": 0.94, "support": 0.06, "sales": 0.0}
-result.usage                       # {"input_tokens": 42, "output_tokens": 0}
-result.routing                     # the Router decision, when a Router answered
+result.values["department"]          # "billing"
+result.answer_confidence["department"] # 0.94  calibrated max(p): gate on this one
+result.confidence["department"]      # 0.71  normalized entropy, which depends on label count
+result.probabilities["department"]   # {"billing": 0.94, "support": 0.06, "sales": 0.0}
+result.usage                         # {"input_tokens": 42, "output_tokens": 0}
+result.routing                       # the Router decision, when a Router answered
 ```
 
-You can gate on it, for example escalate a field whose confidence is below a threshold:
+`confidence` and `answer_confidence` are different quantities, and the names follow the definitions.
+`answer_confidence` is the calibrated `max(p)`: it is what temperature scaling fits, what the
+reported ECE measures, and what `min_confidence` is defined against. `confidence` is normalized
+entropy, which depends on how many options the question had -- `tests/test_confidence.py` pins that
+a two-option distribution comes back as 0.90 on a `noul` and 0.53 on an equivalent `choice` -- so it
+does not compare against a threshold, and it is not what the calibration figures describe. A field
+that reported no usable `answer_confidence` maps to `None`, which is not the same as a reported `0.0`.
+
+Gate on the calibrated one:
 
 ```python
-if result.confidence["department"] < 0.6:
+if result.answer_confidence["department"] < 0.6:
     result.values["department"] = "human-review"
 ```
+
+Both numbers are reported because both are sometimes what you want: `confidence` answers "how
+concentrated is this distribution", `answer_confidence` answers "how much should I trust this
+answer", and only the second is comparable across question shapes.
 
 ## How it maps internally
 

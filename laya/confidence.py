@@ -4,7 +4,40 @@ Pure Python: safe to import without PyTorch so that Router and structured
 decisions stay lightweight and free of torch import overhead.
 """
 import math
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
+
+
+def calibrated_confidence(answer: Dict[str, Any]) -> Optional[float]:
+    """The calibrated `answer_confidence` of `answer`, or None if it did not report one.
+
+    `answer_confidence` is the calibrated max(p) quantity: it is what temperature scaling fits,
+    what the reported ECE measures, and what the `min_confidence` gate is defined against (#361).
+    `confidence`, by contrast, is normalized entropy on a scale that depends on the number of
+    options -- `common.confidence_from_probs` calls it "not calibrated", and #394 is an open issue
+    saying a confidence threshold does not transfer across option counts. So this deliberately
+    does **not** fall back to `confidence`: reporting the entropy number under the calibrated name
+    would be worse than reporting nothing, because the name is what a caller filters on.
+
+    A `bool` is not a confidence and a NaN is not a decision, so both give None rather than 0.0.
+    """
+    conf = answer.get("answer_confidence")
+    if isinstance(conf, (int, float)) and not isinstance(conf, bool) and math.isfinite(conf):
+        return float(conf)
+    return None
+
+
+def _gate_confidence(answer: Dict[str, Any]) -> Optional[float]:
+    """The number the abstention gate compares against `min_confidence`, or None if there is none.
+
+    The calibrated `answer_confidence` first, falling back to the entropy `confidence` so an
+    answer that carries only the older field is still gated rather than silently passed.
+    """
+    conf = calibrated_confidence(answer)
+    if conf is None:
+        conf = answer.get("confidence")
+        if isinstance(conf, (int, float)) and not isinstance(conf, bool) and math.isfinite(conf):
+            return float(conf)
+    return conf
 
 
 def check_min_confidence(v: Any) -> float:
@@ -33,8 +66,6 @@ def flag_low_confidence(results: List[Dict[str, Any]], min_confidence: float) ->
         for a in answers.values():
             if not isinstance(a, dict):
                 continue
-            conf = a.get("answer_confidence")
-            if conf is None:
-                conf = a.get("confidence")
-            if isinstance(conf, (int, float)) and not isinstance(conf, bool) and math.isfinite(conf) and conf < min_confidence:
+            conf = _gate_confidence(a)
+            if conf is not None and conf < min_confidence:
                 a["low_confidence"] = True
