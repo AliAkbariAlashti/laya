@@ -1,10 +1,18 @@
 import { describe, expect, it } from "vitest";
-import { cleanEmailBody } from "../src/email.js";
+import { cleanEmailBody, emailState } from "../src/email.js";
 import { triageQuestions, guardQuestions } from "../src/presets.js";
 describe("email+presets", () => {
   it("cuts quoted history", () => {
     const out = cleanEmailBody("Refund please\n\nOn Mon, Bob wrote:\nold text");
     expect(out).toContain("Refund please"); expect(out).not.toContain("old text");
+  });
+  it("emailState passes maxChars to the body budget, as Python does (#589)", () => {
+    const body = "word ".repeat(1000) + "please wire the money today";
+    expect(emailState("s", body).body).toHaveLength(3000);
+    const long = emailState("s", body, null, true, {}, 8000);
+    expect(long.body).toContain("wire the money");
+    expect(long).not.toHaveProperty("max_chars");
+    expect(emailState("s", body, null, false, {}, 10).body).toBe(body);
   });
   it("triage preset has 5 questions", () => {
     expect(Object.keys(triageQuestions()).sort()).toEqual(
