@@ -746,12 +746,16 @@ def test_shortlist():
        repr(out["routing"]))
     ok("shortlist/passthrough_latency", isinstance(out["latency_ms"], float))
 
-    # Default k comes from laya.shortlist (20): a 3-option choice passes through.
+    # Default k comes from laya.shortlist: a choice smaller than it passes through.
+    # Read from the library rather than copied, so raising DEFAULT_SHORTLIST_K cannot
+    # make this assert a stale value against a tool layer that moved correctly.
+    from laya.shortlist import DEFAULT_SHORTLIST_K
+
     router = ShortlistRouter({"english": ShortlistAgent()})
     three = {"dept": {"type": "choice", "instructions": "pick",
                       "criteria": {"a": "A", "b": "B", "c": "C"}}}
     out = laya_shortlist(STATE, three, model="english", router=router, embed_fn=_raising_embed)
-    ok("shortlist/default_k_passthrough", out["shortlist"]["dept"]["k"] == 20
+    ok("shortlist/default_k_passthrough", out["shortlist"]["dept"]["k"] == DEFAULT_SHORTLIST_K
        and out["shortlist"]["dept"]["passthrough"] is True, repr(out["shortlist"]))
 
     # Shortlist path: 5 options with k=2 -> predict sees exactly the kept labels.
@@ -1859,6 +1863,37 @@ def test_server_registration():
             ok("server/desc_%s_requests" % t.name, "non-empty array" in desc)
 
 
+def test_server_shortlist_k_default():
+    """The shortlist tool's advertised `k` default must be `laya.shortlist`'s.
+
+    `laya/mcp/server.py` registers the tool with `k: int = 20` written out as a literal,
+    because the module stays importable without numpy -- `laya.shortlist` imports numpy at
+    module level, so deriving the default from it would put numpy on the MCP server's import
+    path. The literal is therefore necessary, and necessary hand-copies get a drift gate.
+
+    Nothing guarded the copy: with `DEFAULT_SHORTLIST_K = 32` the tool layer, which resolves it,
+    moved, and the MCP surface stayed on 20 with no test reporting the divergence. So both
+    surfaces a client can observe -- the Python signature FastMCP registers and the `tools/list`
+    schema it advertises -- are read against the library constant rather than against 20.
+    """
+    import inspect
+
+    from laya.mcp import server as server_mod
+    from laya.shortlist import DEFAULT_SHORTLIST_K
+
+    params = inspect.signature(server_mod.laya_shortlist_tool).parameters
+    ok("server/shortlist_k_default", params["k"].default == DEFAULT_SHORTLIST_K,
+       "signature=%r library=%r" % (params["k"].default, DEFAULT_SHORTLIST_K))
+
+    by_name = {t.name: t for t in asyncio.run(mcp_server.list_tools())}
+    schema = by_name["laya_shortlist"].input_schema \
+        if hasattr(by_name["laya_shortlist"], "input_schema") \
+        else by_name["laya_shortlist"].inputSchema
+    advertised = schema.get("properties", {}).get("k", {}).get("default", "<absent>")
+    ok("schema/shortlist_k_default", advertised == DEFAULT_SHORTLIST_K,
+       "schema=%r library=%r" % (advertised, DEFAULT_SHORTLIST_K))
+
+
 test_device()
 test_real_device()
 test_private_contract()
@@ -1887,6 +1922,7 @@ test_timeout_removed()
 test_models_from_env()
 test_auto_task_env()
 test_server_registration()
+test_server_shortlist_k_default()
 
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
