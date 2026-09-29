@@ -1169,3 +1169,12 @@ def test_a_deeply_nested_state_is_not_a_recursion_error():
         res = client.post("/v1/systemone", content=body,
                           headers={"content-type": "application/json"})
         assert res.status_code == 200, (depth, res.status_code, res.text)
+def test_inference_timing_headers_absent_on_error():
+    """Inference timing headers must not be attached to error responses."""
+    router = FakeRouter()
+    client = TestClient(create_app(router=router))
+    res = client.post("/v1/systemone", json={"state": "missing questions"})
+    assert res.status_code == 400
+    assert "Server-Timing" not in res.headers
+    assert "X-Inference-Time-Ms" not in res.headers
+
