@@ -66,6 +66,7 @@ _KNOWN_MODELS = {"english", "multilingual", "typed-decisions"}
 # the single-worker pool means one large request would also starve /health.
 MAX_QUESTIONS = 64
 MAX_STATE_CHARS = 50000
+MAX_BATCH_STATES = 64
 MAX_BODY_BYTES = 2 * 1024 * 1024
 # HTTP-only amplification guard; the library keeps its head_max_len-aware budget.
 MAX_CHOICE_OPTIONS = 100
@@ -254,6 +255,21 @@ def _check_request_limits(state: Any, questions: Any) -> None:
                             detail="state too large (%d > %d chars)" % (state_len, MAX_STATE_CHARS))
 
 
+def _check_batch_limits(states: Any, questions: Any) -> None:
+    """Validate batch states and questions before inference (400/413)."""
+    from fastapi import HTTPException
+
+    if not isinstance(states, list) or len(states) == 0:
+        raise HTTPException(status_code=400, detail="'states' must be a non-empty list")
+    if len(states) > MAX_BATCH_STATES:
+        raise HTTPException(
+            status_code=413,
+            detail="too many states in batch (%d > %d)" % (len(states), MAX_BATCH_STATES),
+        )
+    for state in states:
+        _check_request_limits(state, questions)
+
+
 async def _read_body_capped(request: Any) -> bytes:
     """Read the request body, refusing to buffer more than ``MAX_BODY_BYTES``.
 
@@ -278,6 +294,23 @@ async def _read_body_capped(request: Any) -> bytes:
             raise HTTPException(status_code=413, detail="request body too large")
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+async def _read_json_body(request: Any) -> Any:
+    """Read the request body and decode JSON, enforcing size caps and parse error guards."""
+    from fastapi import HTTPException
+
+    if request.headers.get("content-length"):
+        try:
+            if int(request.headers["content-length"]) > MAX_BODY_BYTES:
+                raise HTTPException(status_code=413, detail="request body too large")
+        except ValueError:
+            pass
+    raw = await _read_body_capped(request)
+    try:
+        return json.loads(raw)
+    except (ValueError, RecursionError):
+        raise HTTPException(status_code=400, detail="request body must be valid JSON")
 
 
 def _apply_thread_limit():
@@ -422,10 +455,9 @@ def create_app(router: Optional[Any] = None):
             "cpu_fallbacks": fallbacks,
         }
 
-    @app.post("/v1/systemone")
-    async def systemone(request: Request, authorization: Optional[str] = Header(default=None)):
-        nonlocal gate, admission
-        _check_auth(authorization)
+    @asynccontextmanager
+    async def _admit():
+        nonlocal admission
         if admission is None:
             admission = asyncio.Semaphore(max_concurrent)
         if admission.locked():
@@ -437,30 +469,19 @@ def create_app(router: Optional[Any] = None):
                                 headers={"Retry-After": "1"})
         await admission.acquire()
         try:
-            return await _systemone_inner(request)
+            yield
         finally:
             admission.release()
 
+    @app.post("/v1/systemone")
+    async def systemone(request: Request, authorization: Optional[str] = Header(default=None)):
+        _check_auth(authorization)
+        async with _admit():
+            return await _systemone_inner(request)
+
     async def _systemone_inner(request: Request):
         nonlocal gate
-        # A declared length over the cap is rejected before anything is read; the
-        # streaming cap below is what actually enforces it, for bodies that declare
-        # no length or understate it.
-        if request.headers.get("content-length"):
-            try:
-                if int(request.headers["content-length"]) > MAX_BODY_BYTES:
-                    raise HTTPException(status_code=413, detail="request body too large")
-            except ValueError:
-                pass
-        raw = await _read_body_capped(request)
-        try:
-            # A client can cause ValueError (JSONDecodeError for malformed/empty/truncated
-            # bodies, UnicodeDecodeError for invalid UTF-8) or RecursionError (deeply nested
-            # arrays/objects). A broader catch would also swallow ClientDisconnect and
-            # Starlette's own stream errors, reporting a transport or server fault as the client's.
-            body = json.loads(raw)
-        except (ValueError, RecursionError):
-            raise HTTPException(status_code=400, detail="request body must be valid JSON")
+        body = await _read_json_body(request)
         if not isinstance(body, dict) or "questions" not in body:
             raise HTTPException(status_code=400, detail="request body must be an object with a 'questions' field")
         state = body.get("state")
@@ -513,6 +534,61 @@ def create_app(router: Optional[Any] = None):
             # value cannot forge log entries (py/log-injection) if that ever stops holding.
             _log.exception("inference failed for model=%s",
                            str(model).replace("\n", "\\n").replace("\r", "\\r"))
+            raise HTTPException(status_code=500, detail="inference failed")
+
+    @app.post("/v1/systemone/batch")
+    async def systemone_batch(request: Request, authorization: Optional[str] = Header(default=None)):
+        _check_auth(authorization)
+        async with _admit():
+            return await _systemone_batch_inner(request)
+
+    async def _systemone_batch_inner(request: Request):
+        nonlocal gate
+        body = await _read_json_body(request)
+        if not isinstance(body, dict) or "questions" not in body or "states" not in body:
+            raise HTTPException(
+                status_code=400,
+                detail="request body must be an object with 'states' and 'questions' fields",
+            )
+        states = body["states"]
+        questions = body["questions"]
+        _check_batch_limits(states, questions)
+        model = _resolve_model(body.get("model"))
+        if gate is None:
+            gate = asyncio.Lock()
+        try:
+            async with gate:
+                loop = asyncio.get_running_loop()
+
+                def _do_batch():
+                    if hasattr(router, "predict_batch"):
+                        reqs = [{"state": s, "questions": questions, "model": model} for s in states]
+                        results = router.predict_batch(reqs)
+                    else:
+                        results = [router.predict(s, questions, model=model) for s in states]
+                    total_tokens = sum(r.get("usage", {}).get("input_tokens", 0) for r in results)
+                    return {
+                        "results": results,
+                        "total_usage": {"input_tokens": total_tokens, "output_tokens": 0},
+                    }
+
+                t0 = time.perf_counter()
+                batch_res = await loop.run_in_executor(pool, _do_batch)
+                infer_ms = (time.perf_counter() - t0) * 1000.0
+                from fastapi.responses import JSONResponse
+                return JSONResponse(
+                    content=batch_res,
+                    headers={
+                        "Server-Timing": f"inference;dur={infer_ms:.2f}",
+                        "X-Inference-Time-Ms": f"{infer_ms:.2f}"
+                    }
+                )
+        except HTTPException:
+            raise
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=str(e))
+        except Exception:  # noqa: BLE001
+            _log.exception("batch inference failed")
             raise HTTPException(status_code=500, detail="inference failed")
 
     return app
