@@ -418,7 +418,7 @@ class ONNXAgent(HookRegistry):
         Returns a single result dict, the same shape as `system_one`, with `usage["windows"]`
         added. Across several windows the truncation keys are summed or carried the same way as
         in `Agent.predict_long`: `truncated` is a window count and `truncated_questions` is the
-        last window's list.
+        last window's list, so `truncated` can be above 0 while the list is empty.
         """
         from .agent import _start_evidence, _with_start_probe
         from .hooks import aggregate_usage
