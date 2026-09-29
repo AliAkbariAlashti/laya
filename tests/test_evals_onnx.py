@@ -147,7 +147,9 @@ try:
         row["model"] = "some-other-checkpoint"
         f.write(json.dumps(row) + "\n")
     rc = evals_cli.main(["run", mismatch, "--onnx", "laya.onnx"])
-    check("cli/foreign per-example model exits 1", rc, 1)
+    # Asking for a different checkpoint than the ONNX export serves is a caller mistake, so
+    # exit 2 (docs/evals.md:28), not the 1 a quality failure uses.
+    check("cli/foreign per-example model exits 2", rc, 2)
 finally:
     onnx_agent_module.ONNXAgent = _real_onnx_agent
 
