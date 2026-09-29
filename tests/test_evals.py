@@ -7,6 +7,8 @@ import re
 
 import pytest
 
+import laya
+from laya import evals
 from laya.evals import (
     ChoiceAccuracy,
     Dataset,
@@ -602,6 +604,248 @@ def test_default_evaluators_cover_the_three_types():
     assert {"choice_accuracy", "noul_accuracy", "score_mae", "mean_confidence"} <= names
 
 
+# ------------------------------------------------------- run identity / comparability
+def _identified(**config):
+    return EvalReport(config={"schema": evals.REPORT_SCHEMA, **config},
+                      overall={"choice_accuracy": 0.8})
+
+
+def test_evaluate_records_what_it_measured():
+    """`config` is the artifact a reviewer reads, so it has to say which run produced it.
+
+    `config.dataset` is the path as typed. Two datasets share a path across a rebase, a CI
+    cache or a colleague's checkout, and `docs/evals.md` tells the reviewer to commit the
+    dataset and the baseline together and read the result as a diff -- which is only reviewable
+    if the report says which bytes were scored.
+    """
+    dataset = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "b"})])
+    report = evaluate(StubRunner({"s1": {"intent": choice_answer("a")},
+                                  "s2": {"intent": choice_answer("a")}}), dataset)
+    config = report.config
+    assert config["schema"] == evals.REPORT_SCHEMA
+    assert config["laya_version"] == laya.__version__
+    assert len(config["questions_sha256"]) == 64, "the question schema is part of the identity"
+
+    # Determinism: the identity must carry nothing time-bearing, or a re-run of the same dataset
+    # stops producing the same report and the artifact a reviewer diffs becomes noise. The
+    # `*_ms` metrics are wall clock and always differ; only the config block is asserted here.
+    again = evaluate(StubRunner({"s1": {"intent": choice_answer("a")},
+                                 "s2": {"intent": choice_answer("a")}}), dataset)
+    assert {k: v for k, v in config.items() if k != "timing"} == \
+           {k: v for k, v in again.config.items() if k != "timing"}
+
+
+def test_questions_fingerprint_follows_the_question_not_the_row():
+    """The fingerprint covers the question schema, so it is a function of what was asked.
+
+    A run that scores a different dataset must not collide with a baseline, and a run that
+    scores the same questions on more rows must still be comparable to it. Renaming a `choice`
+    label is a different question, not a different row: `research/eval/metamorphic.py` exists
+    because option order and label rename flip answers.
+
+    The scope of the last claim is the fingerprint, not the gate. `dataset_sha256` is compared
+    too, and adding a row changes the file's bytes, so through `laya-evals run` a longer dataset
+    is correctly refused. The fingerprint being row-independent is what lets a programmatic
+    caller see that the *questions* did not change.
+    """
+    base = Dataset([Example("s1", Q, {"intent": "a"})])
+    more_rows = Dataset([Example("s1", Q, {"intent": "a"}), Example("s2", Q, {"intent": "a"})])
+    assert evals.questions_fingerprint(base) == evals.questions_fingerprint(more_rows)
+
+    renamed = Dataset([Example("s1", {"intent": {"type": "choice", "instructions": "?",
+                                                 "criteria": {"a": "x", "c": "y"}}},
+                               {"intent": "a"})])
+    assert evals.questions_fingerprint(renamed) != evals.questions_fingerprint(base)
+
+    retyped = Dataset([Example("s1", {"flag": {"type": "noul", "instructions": "?"}},
+                               {"flag": True})])
+    assert evals.questions_fingerprint(retyped) != evals.questions_fingerprint(base)
+
+
+def test_questions_fingerprint_covers_the_instructions():
+    """`instructions` is the prompt. Excluding it made the fingerprint say "same question" for
+    two questions the model answers differently.
+
+    `laya/common.py:158-159` renders `"%s question: %s" % (q["type"], instructions)` into the
+    tokenized head, `laya/agent.py:633-634` makes the field mandatory ("add the text the model
+    should answer"), and Laya's own identity key for sharing forward passes
+    (`Router._question_schema`, `laya/router.py:141`) hashes the whole questions dict,
+    instructions included -- as does this module's own batch grouping at `laya/evals.py:529`.
+    `tests/test_router_batch.py:543` pins that rewording alone moves a row to its own batch group.
+    Leaving it out made the one field this contract exists to protect the one field it ignored.
+    """
+    judged = Dataset([Example("s1", {"verdict": {"type": "choice", "instructions": "Judge whether a refund is justified",
+                                                "criteria": {"yes": "approved", "no": "denied"}}},
+                               {"verdict": "yes"})])
+    conservative = Dataset([Example("s1", {"verdict": {"type": "choice", "instructions": "Be conservative and only approve explicit refund requests",
+                                                      "criteria": {"yes": "approved", "no": "denied"}}},
+                                 {"verdict": "yes"})])
+    assert evals.questions_fingerprint(judged) != evals.questions_fingerprint(conservative)
+
+    # Same wording, different question id, is still a different question.
+    renamed_id = Dataset([Example("s1", {"decision": judged.examples[0].questions["verdict"]},
+                                  {"decision": "yes"})])
+    assert evals.questions_fingerprint(renamed_id) != evals.questions_fingerprint(judged)
+
+    # Whitespace is not decoration: it is tokenized. `common.py:158` strips only the tokenizer's
+    # mask token, and this module has no tokenizer to know what that is, so nothing else is
+    # normalized away.
+    spaced = Dataset([Example("s1", {"verdict": dict(judged.examples[0].questions["verdict"],
+                                                     instructions="Judge whether a refund is justified ")},
+                              {"verdict": "yes"})])
+    assert evals.questions_fingerprint(spaced) != evals.questions_fingerprint(judged)
+
+
+def test_questions_fingerprint_normalizes_instructions_the_way_the_engine_does():
+    """Two questions that render the same text are the same question, whatever their JSON shape.
+
+    `Agent._to_internal` (`laya/agent.py:736-748`) turns a non-string `instructions` into
+    `json.dumps(ins, ensure_ascii=False)` before tokenizing, and `tests/test_criteria.py:229-251`
+    pins why: the default `ensure_ascii=True` escaped non-ASCII to literal `\\uXXXX` and a German
+    question answered noul=0.1652 as a dict against 0.2650 as the identical plain string. The
+    fingerprint has to mirror that step, or it hashes the input's JSON shape instead of the text
+    the model reads.
+    """
+    criteria = {"yes": "approved", "no": "denied"}
+    as_object = Dataset([Example("s1", {"verdict": {"type": "choice",
+                                                    "instructions": {"task": "Bittet der Kunde um eine Rückerstattung?"},
+                                                    "criteria": criteria}},
+                               {"verdict": "yes"})])
+    as_text = Dataset([Example("s1", {"verdict": {"type": "choice",
+                                                  "instructions": '{"task": "Bittet der Kunde um eine Rückerstattung?"}',
+                                                  "criteria": criteria}},
+                               {"verdict": "yes"})])
+    assert evals.questions_fingerprint(as_object) == evals.questions_fingerprint(as_text)
+
+
+def test_a_reworded_question_cannot_pass_the_gate():
+    """The end-to-end contract: a different question is not a baseline drift, it is a new run.
+
+    Reproduces the hole the fingerprint's exclusion opened. `evaluate(runner, Dataset(...))` has
+    no dataset file to hash, so `questions_sha256` is the only identity a programmatic run has --
+    and it used to be blind to the one field that decides the answer. The metric gate is a
+    separate, tolerance-dependent safety net; this is the check that does not depend on having
+    guessed the right tolerance.
+    """
+    criteria = {"yes": "approved", "no": "denied"}
+
+    def twenty(instr):
+        q = {"verdict": {"type": "choice", "instructions": instr, "criteria": criteria}}
+        return Dataset([Example("s%d" % i, q, {"verdict": "yes"}) for i in range(20)])
+
+    class OneRowFlips:
+        """The answer depends on the instruction on exactly one state, so the metric delta can
+        sit inside a realistic tolerance while the question asked is a different one."""
+        def predict(self, state, questions, model=None):
+            reworded = "conservative" in questions["verdict"]["instructions"]
+            label = "no" if (reworded and state == "s19") else "yes"
+            return {"model": "stub", "answers": {"verdict": {
+                "type": "choice", "choice": label,
+                "probabilities": {label: 0.9}, "confidence": 0.9}}}
+
+    baseline = evaluate(OneRowFlips(), twenty("Judge whether a refund is justified"),
+                        evaluators=[ChoiceAccuracy()])
+    candidate = evaluate(OneRowFlips(), twenty("Be conservative and only approve explicit refunds"),
+                        evaluators=[ChoiceAccuracy()])
+    assert candidate.overall["choice_accuracy"] == pytest.approx(0.95)
+
+    ok, reasons = candidate.comparable_to(baseline.to_json())
+    assert not ok, "a reworded question is a different experiment, not an identical one"
+    assert any("questions_sha256" in reason for reason in reasons), reasons
+
+    # And the same question over more rows is still the same experiment, which is the property
+    # that would be lost if the fingerprint were simply "the whole dataset".
+    def same_question(rows):
+        q = {"verdict": {"type": "choice", "instructions": "Judge whether a refund is justified",
+                         "criteria": criteria}}
+        return Dataset([Example("s%d" % i, q, {"verdict": "yes"}) for i in range(rows)])
+
+    longer = evaluate(OneRowFlips(), same_question(25), evaluators=[ChoiceAccuracy()])
+    assert longer.comparable_to(baseline.to_json())[0], "more rows is not a different question"
+
+
+def test_comparable_to_refuses_two_different_runs():
+    """`compare` reads `overall` only, so without this a gate passes two different experiments.
+
+    Both reports score 0.8, so the arithmetic is identical -- but they are not the same
+    measurement, and a promotion decision made on that is unfalsifiable. Every field
+    `docs/staged-adoption.md` tells the operator to record with the policy has to be able to
+    stop the comparison.
+    """
+    baseline = _identified(dataset_sha256="a" * 64, questions_sha256="q" * 64)
+    same = _identified(dataset_sha256="a" * 64, questions_sha256="q" * 64)
+    ok, reasons = same.comparable_to(baseline.to_json())
+    assert ok and reasons == [], reasons
+
+    for field, other in (("schema", "laya-evals-report/act-head-eval/1"),
+                         ("dataset_sha256", "b" * 64),
+                         ("questions_sha256", "z" * 64)):
+        candidate = _identified(dataset_sha256="a" * 64, questions_sha256="q" * 64)
+        candidate.config[field] = other
+        ok, reasons = candidate.comparable_to(baseline.to_json())
+        assert not ok, field
+        # The key is named, so the failure is greppable against the `config` a reviewer reads.
+        assert any(field in reason for reason in reasons), (field, reasons)
+
+    # The reason names both values, or a reviewer still has to open two files to act on it.
+    swapped = _identified(dataset_sha256="c" * 64, questions_sha256="q" * 64)
+    ok, reasons = swapped.comparable_to(baseline.to_json())
+    assert "c" * 64 in " ".join(reasons) and "a" * 64 in " ".join(reasons)
+
+
+def test_comparable_to_ignores_what_it_cannot_see():
+    """A field missing on one side is unknown, not a conflict.
+
+    Every baseline committed before this existed -- including the scheduled gate's
+    `research/results/eval_english_51_languages.json`, which comes from `research/eval/` and
+    has no `config.schema` at all -- has to keep comparing exactly as it did.
+    """
+    legacy = {"overall": {"choice_accuracy": 0.8}, "config": {"dataset": "old.jsonl"}}
+    report = _identified(dataset_sha256="a" * 64, questions_sha256="q" * 64)
+    ok, reasons = report.comparable_to(legacy)
+    assert ok and reasons == [], reasons
+    assert report.compare(legacy, {"choice_accuracy": 0.0})[0], "the metric gate still runs"
+
+    # Two reports that both predate the identity fields are as comparable as they ever were.
+    ok, reasons = EvalReport(config={"dataset": "a.jsonl"}).comparable_to(legacy)
+    assert ok and reasons == [], reasons
+
+    # A bare metric dict is a baseline `compare` already accepts, so it stays acceptable here.
+    ok, reasons = report.comparable_to({"choice_accuracy": 0.8})
+    assert ok and reasons == [], reasons
+
+
+def test_a_comparing_report_does_not_read_a_shape_it_does_not_know():
+    # `research/evals/act_head_eval.py` publishes a report under its own schema tag. A consumer
+    # that cannot read it must be told, not left to compare a different metric space.
+    foreign = {"schema": "laya-evals-report/act-head-eval/1",
+               "overall": {"choice_accuracy": 0.8}, "cases": [], "slices": {}}
+    ok, reasons = _identified(dataset_sha256="a" * 64).comparable_to(foreign)
+    assert not ok and any("act-head-eval" in reason for reason in reasons), reasons
+
+
+def test_docs_document_the_run_identity_and_the_refusal():
+    """The docs table is derived against the code, not transcribed, so it cannot drift.
+
+    `docs/evals.md` is what an operator reads before deciding what to record with a policy, so
+    every key the report actually writes has to appear there.
+    """
+    from pathlib import Path
+
+    page = (Path(__file__).resolve().parent.parent / "docs" / "evals.md").read_text(encoding="utf-8")
+    dataset = Dataset([Example("s1", Q, {"intent": "a"})])
+    report = evaluate(StubRunner({"s1": {"intent": choice_answer("a")}}), dataset)
+    for key in report.config:
+        if key != "timing":
+            assert "`%s`" % key in page, key
+    # The keys the CLI adds, and the programmatic entry points, are part of the same contract.
+    for key in ("dataset_sha256", "thresholds", "revisions"):
+        assert "`%s`" % key in page, key
+    for name in ("REPORT_SCHEMA", "questions_fingerprint", "file_fingerprint", "comparable_to"):
+        assert name in page, name
+    assert "not comparable" in page, "the refusal the gate prints is documented"
+
+
 # --------------------------------------------------------------- CLI
 def _write_dataset(tmp_path, rows):
     path = tmp_path / "dataset.jsonl"
@@ -701,6 +945,175 @@ def test_cli_rejects_a_malformed_tolerance():
 
     with pytest.raises(EvalError):
         evals_cli._parse_pairs(["choice_accuracy"])
+
+
+def test_cli_run_records_the_run_identity(monkeypatch, tmp_path):
+    """The `--json` artifact is what a reviewer reads, so it has to say which run produced it.
+
+    `docs/evals.md` tells the reviewer to commit the dataset and a reviewed baseline together and
+    read the result as a diff. That only works if the report carries the dataset's bytes and the
+    question schema, not just the path, and if it records the gate the numbers came out of.
+    """
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    out = tmp_path / "report.json"
+    assert evals_cli.main(["run", dataset, "--min-accuracy", "0.5", "--max-ece", "0.9",
+                           "--tolerance", "choice_accuracy=0.02", "--json", str(out)]) == 0
+    config = json.loads(out.read_text(encoding="utf-8"))["config"]
+    assert config["schema"] == evals.REPORT_SCHEMA
+    assert config["laya_version"] == laya.__version__
+    assert config["dataset"] == dataset, "the path stays a name; the hash carries the bytes"
+    assert config["dataset_sha256"] == evals.file_fingerprint(dataset)
+    assert config["questions_sha256"] == evals.questions_fingerprint(evals.Dataset.from_jsonl(dataset))
+    assert config["thresholds"]["min"] == {"choice_accuracy": 0.5}
+    assert config["thresholds"]["max"] == {"ece": 0.9}
+    assert config["thresholds"]["baseline_tolerance"] == {"choice_accuracy": 0.02}
+
+
+def test_cli_run_refuses_a_baseline_from_a_different_dataset(monkeypatch, tmp_path, capsys):
+    """The gate that a promotion decision rests on: two different runs cannot pass as one.
+
+    Both runs score the same rows with the same stub, so every metric matches and the baseline
+    comparison passes. But the baseline was recorded against different bytes, so the number being
+    promoted was never measured on the data the gate claims to have validated. A pass here is
+    arithmetic, not evidence.
+    """
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    original = _write_dataset(tmp_path, RUN_ROWS)
+    baseline_out = tmp_path / "baseline.json"
+    assert evals_cli.main(["run", original, "--json", str(baseline_out)]) == 0
+    capsys.readouterr()
+
+    # The same file name, one extra row: exactly what an edited dataset looks like in a diff.
+    edited = tmp_path / "edited.jsonl"
+    edited.write_text("\n".join(json.dumps(row) for row in RUN_ROWS)
+                      + "\n" + json.dumps(RUN_ROWS[0]), encoding="utf-8")
+    assert evals_cli.main(["run", str(edited), "--baseline", str(baseline_out),
+                           "--tolerance", "choice_accuracy=0.05"]) == 1
+    err = capsys.readouterr().err
+    assert "baseline is not comparable" in err
+    assert "dataset_sha256" in err, "the failure names the key a reviewer can check"
+
+
+def test_cli_run_still_accepts_a_baseline_with_no_identity(monkeypatch, tmp_path, capsys):
+    """Every baseline committed before the identity existed keeps passing exactly as it did.
+
+    The scheduled gate compares against `research/results/eval_english_51_languages.json`, which
+    comes from `research/eval/` and has no `config.schema`. A key missing on one side is unknown,
+    not a conflict -- otherwise this change would break the repo's own CI on its first run.
+    """
+    from laya import evals_cli
+
+    _patch_router(monkeypatch)
+    dataset = _write_dataset(tmp_path, RUN_ROWS)
+    legacy = tmp_path / "legacy.json"
+    legacy.write_text(json.dumps({"config": {"dataset": "somewhere/else.jsonl"},
+                                  "overall": {"choice_accuracy": 1.0}}), encoding="utf-8")
+    assert evals_cli.main(["run", dataset, "--baseline", str(legacy),
+                           "--tolerance", "choice_accuracy=0.05"]) == 0
+    assert "not comparable" not in capsys.readouterr().err
+
+
+def test_cli_compare_refuses_two_different_runs(tmp_path, capsys):
+    from laya import evals_cli
+
+    report = {"config": {"schema": evals.REPORT_SCHEMA, "dataset_sha256": "a" * 64,
+                         "questions_sha256": "q" * 64},
+              "overall": {"choice_accuracy": 0.8}, "cases": [], "slices": {}}
+    baseline = {"config": {"schema": evals.REPORT_SCHEMA, "dataset_sha256": "b" * 64,
+                           "questions_sha256": "q" * 64},
+                "overall": {"choice_accuracy": 0.8}, "cases": [], "slices": {}}
+    (tmp_path / "r.json").write_text(json.dumps(report), encoding="utf-8")
+    (tmp_path / "b.json").write_text(json.dumps(baseline), encoding="utf-8")
+    # Identical `overall`, and the default tolerance is an exact match, so the metric gate passes.
+    assert evals_cli.main(["compare", str(tmp_path / "r.json"),
+                           "--baseline", str(tmp_path / "b.json")]) == 1
+    captured = capsys.readouterr()
+    assert "baseline is not comparable" in captured.err and "dataset_sha256" in captured.err
+    # The deltas are still printed, so the reviewer sees what moved as well as why it is not a pass.
+    assert "diff=" in captured.out and "choice_accuracy" in captured.out
+
+
+def test_questions_fingerprint_covers_labels():
+    """`labels` decides the option text, so it belongs in the key.
+
+    The same argument `test_questions_fingerprint_covers_the_instructions` makes for
+    `instructions`. `labels` is validated (`laya/agent.py:722-726` -> `_resolve_noul_labels`),
+    carried into the internal question (`laya/agent.py:748-749`), and resolved into the option
+    text the model actually reads (`laya/common.py:92`). Two question sets differing only in
+    `labels` therefore ask the model different things, and hashing them alike let the gate pass
+    a comparison it exists to refuse.
+    """
+    def with_labels(labels):
+        q = {"verdict": {"type": "noul", "instructions": "Is this a refund?"}}
+        if labels is not None:
+            q["verdict"]["labels"] = labels
+        return Dataset([Example("s", q, {"verdict": "true"})])
+
+    default = evals.questions_fingerprint(with_labels(None))
+    custom = evals.questions_fingerprint(with_labels(
+        {"false": "denied: no money was requested",
+         "true": "approved: the customer asked for money back"}))
+    assert custom != default, "a change in `labels` left the fingerprint unchanged"
+    # And the change is real: these are not two spellings of one thing.
+    from laya.common import _resolve_noul_labels
+    assert _resolve_noul_labels() != _resolve_noul_labels(
+        {"false": "denied: no money was requested",
+         "true": "approved: the customer asked for money back"})
+
+
+def test_questions_fingerprint_keeps_criteria_order():
+    """A choice question's criteria order is positional, so two orders are two questions.
+
+    `examples/hooks/cache.py:22-25` states the rule and `Router._question_schema`
+    (`laya/router.py:141`) applies it with `sort_keys=False`. Worth pinning here for the dict
+    form: `json.dumps(sort_keys=True)` reorders *dict keys* and leaves *lists* alone, so a
+    list-valued `criteria` -- the shape a dataset row has -- was already safe. The flag only
+    mattered for a dict-valued one, where folding is the wrong direction to be wrong in.
+    """
+    def with_criteria(criteria):
+        q = {"pick": {"type": "choice", "instructions": "Pick one", "criteria": criteria}}
+        return Dataset([Example("s", q, {"pick": "a"})])
+
+    assert evals.questions_fingerprint(with_criteria(["alpha", "beta"])) != \
+        evals.questions_fingerprint(with_criteria(["beta", "alpha"]))
+    assert evals.questions_fingerprint(with_criteria({"a": "alpha", "b": "beta"})) != \
+        evals.questions_fingerprint(with_criteria({"b": "beta", "a": "alpha"}))
+
+
+def test_a_top_level_schema_on_the_candidate_still_refuses(tmp_path, capsys):
+    """The identity fallback is two-sided.
+
+    `_identity_of` reads a report's identity from `config` *or* the top level, and its own comment
+    says why: `research/evals/act_head_eval.py` puts `schema` there. But `comparable_to` applied
+    it to the baseline only -- the candidate's identity came from `self.config`, and
+    `laya/evals_cli.py` had already dropped a top-level `schema` when it built the `EvalReport`.
+    So the *same* disagreement was refused when the candidate stated it in `config` and passed
+    when it stated it at the top level.
+    """
+    from laya import evals_cli
+
+    def write(name, doc):
+        (tmp_path / name).write_text(json.dumps(doc), encoding="utf-8")
+        return str(tmp_path / name)
+
+    shared = {"overall": {"choice_accuracy": 0.8}, "cases": [], "slices": {}}
+    baseline = write("b.json", dict(shared, schema="act-head-eval/2"))
+
+    # Same mismatch, candidate states it in `config` -- refused.
+    assert evals_cli.main(["compare", write("in_config.json", dict(
+        shared, config={"schema": "act-head-eval/1"})), "--baseline", baseline]) == 1
+    capsys.readouterr()
+
+    # Candidate states it at the top level -- must refuse too, not pass.
+    assert evals_cli.main(["compare", write("top_level.json", dict(
+        shared, schema="act-head-eval/1")), "--baseline", baseline]) == 1
+    err = capsys.readouterr().err
+    assert "schema" in err
 
 
 # ------------------------------------------------------------------ CLI run

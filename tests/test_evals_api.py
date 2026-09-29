@@ -39,8 +39,15 @@ check("default evaluator names",
 check_true("ScoreWithin names its tolerance", evals.ScoreWithin(0.25).name == "score_within_0.25")
 
 # --------------------------------------------------------------- exports / callables
-for name in ("Dataset", "Example", "EvalError", "EvalReport", "evaluate", "ece", "assert_regression"):
+for name in ("Dataset", "Example", "EvalError", "EvalReport", "evaluate", "ece", "assert_regression",
+             "REPORT_SCHEMA", "questions_fingerprint", "file_fingerprint"):
     check_true("laya.evals.%s exists" % name, hasattr(evals, name))
+
+check("REPORT_SCHEMA", evals.REPORT_SCHEMA, "laya-evals-report/1")
+check_true("EvalReport.comparable_to is part of the report contract",
+           callable(getattr(evals.EvalReport, "comparable_to", None)))
+check("EvalReport fields are unchanged", [f.name for f in dataclasses.fields(evals.EvalReport)],
+      ["config", "overall", "slices", "cases"])
 
 # --------------------------------------------------------------- torch stays out of import
 probe = subprocess.run(
