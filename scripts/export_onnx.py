@@ -50,18 +50,17 @@ def export_to_onnx(model_id_or_path: str, output_path: str):
     agent = Agent(model_id_or_path, compile=False, device="cpu")
     
     print("Creating dummy input tensors...")
-    # 1. Dummy tensors for tracing
-    # (batch_size=1, seq_len=16)
-    dummy_input_ids = torch.randint(0, 100, (1, 16), dtype=torch.long)
-    dummy_attention_mask = torch.ones((1, 16), dtype=torch.long)
-    
-    # (batch_size=1, num_markers=2)
-    dummy_marker_pos = torch.tensor([[1, 5]], dtype=torch.long)
-    dummy_marker_mask = torch.tensor([[True, True]], dtype=torch.bool)
-    
-    # (batch_size=1)
-    dummy_qtype = torch.tensor([0], dtype=torch.long)
-    
+    # 1. Dummy tensors for tracing. torch.export specialises any dimension that is 1 (or equal
+    # to another) at trace time, so a batch-1 dummy baked batch=1 into the decision head's
+    # attention: the export ran at batch 1 and failed at batch >= 2 (#695). Batch, sequence and
+    # marker counts are therefore all > 1 and pairwise different. laya-ts's exporter does the same.
+    batch, seq_len, num_markers = 2, 17, 3
+    dummy_input_ids = torch.randint(0, 100, (batch, seq_len), dtype=torch.long)
+    dummy_attention_mask = torch.ones((batch, seq_len), dtype=torch.long)
+    dummy_marker_pos = torch.tensor([[1, 5, 9]] * batch, dtype=torch.long)
+    dummy_marker_mask = torch.ones((batch, num_markers), dtype=torch.bool)
+    dummy_qtype = torch.zeros(batch, dtype=torch.long)
+
     inputs = (
         dummy_input_ids,
         dummy_attention_mask,
@@ -70,16 +69,19 @@ def export_to_onnx(model_id_or_path: str, output_path: str):
         dummy_qtype,
     )
 
-    # 2. Define dynamic axes so the model can accept variable batch sizes and sequence lengths
-    dynamic_axes = {
-        "input_ids": {0: "batch_size", 1: "seq_len"},
-        "attention_mask": {0: "batch_size", 1: "seq_len"},
-        "marker_pos": {0: "batch_size", 1: "num_markers"},
-        "marker_mask": {0: "batch_size", 1: "num_markers"},
-        "qtype": {0: "batch_size"},
-        "logits": {0: "batch_size", 1: "num_markers"},
-        "act_logits": {0: "batch_size"},
-    }
+    # 2. Dynamic dimensions, declared as torch.export Dims (what the dynamo exporter reads;
+    # `dynamic_axes` is only converted to these with a deprecation warning). The outputs follow
+    # from the inputs, so `act_logits` is (batch_size, 2) instead of a static (1, 2).
+    batch_dim = torch.export.Dim("batch_size")
+    seq_dim = torch.export.Dim("seq_len")
+    marker_dim = torch.export.Dim("num_markers")
+    dynamic_shapes = (
+        {0: batch_dim, 1: seq_dim},
+        {0: batch_dim, 1: seq_dim},
+        {0: batch_dim, 1: marker_dim},
+        {0: batch_dim, 1: marker_dim},
+        {0: batch_dim},
+    )
 
     input_names = [
         "input_ids",
@@ -110,7 +112,7 @@ def export_to_onnx(model_id_or_path: str, output_path: str):
         do_constant_folding=True,
         input_names=input_names,
         output_names=output_names,
-        dynamic_axes=dynamic_axes,
+        dynamic_shapes=dynamic_shapes,
     )
     
     print(f"Successfully exported ONNX model to: {output_path}")

@@ -2,6 +2,7 @@ import os
 import sys
 import tempfile
 import numpy as np
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -88,4 +89,35 @@ def test_onnx_numerical_parity():
             atol=1e-3, rtol=1e-3,
         )
         
+        # 8. The act head: its output was a static (1, 2) when the export traced at batch 1
+        # (#695), and nothing above reads it.
+        for qid in questions:
+            np.testing.assert_allclose(
+                res_pt["answers"][qid]["action"]["act_probability"],
+                res_onnx["answers"][qid]["action"]["act_probability"],
+                atol=5e-3,
+            )
+
+        # 9. The graph itself at batch 1 and 3 with a padded row, against the PyTorch model.
+        # ONNXAgent collates one row per question, so the predict() above already ran at batch 3;
+        # this pins the shapes and a padded key mask without any laya collation in the loop.
+        for batch in (1, 3):
+            rng = np.random.default_rng(batch)
+            seq_len = 53
+            feed = {
+                "input_ids": rng.integers(5, 1000, (batch, seq_len)),
+                "attention_mask": np.ones((batch, seq_len), dtype=np.int64),
+                "marker_pos": np.tile(np.array([[3, 9, 14, 20, 30]]), (batch, 1)),
+                "marker_mask": np.ones((batch, 5), dtype=bool),
+                "qtype": np.arange(batch, dtype=np.int64) % 3,
+            }
+            feed["attention_mask"][0, 40:] = 0
+            logits, act_logits = agent_onnx.session.run(["logits", "act_logits"], feed)
+            assert logits.shape == (batch, 5) and act_logits.shape == (batch, 2), (logits.shape, act_logits.shape)
+            with torch.no_grad():
+                ref = agent_pt.model(*[torch.from_numpy(feed[n]) for n in
+                                       ("input_ids", "attention_mask", "marker_pos", "marker_mask", "qtype")])
+            np.testing.assert_allclose(logits, ref[0].numpy(), atol=1e-3)
+            np.testing.assert_allclose(act_logits, ref[1].numpy(), atol=1e-2)
+
         print("ONNX numerical parity test passed for all 3 question types!")
