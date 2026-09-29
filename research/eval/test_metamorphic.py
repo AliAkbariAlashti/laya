@@ -293,6 +293,329 @@ class SelectivePredictionTests(unittest.TestCase):
         self.assertEqual((sp["n_labelled"], sp["n_wrong"]), (2, 0))
         self.assertIsNone(sp["auroc"]["confidence"])
         self.assertEqual(sp["accuracy_at_coverage"]["confidence"]["0.5"], 1)
+class CharTok:
+    """One id per character, so option spans are predictable without model weights."""
+
+    cls_token_id = 2
+    sep_token_id = 3
+    mask_token = "[MASK]"
+    mask_token_id = 1
+
+    def __call__(self, text, add_special_tokens=False, truncation=False, max_length=None):
+        ids = [10 + (ord(char) % 90) for char in text]
+        return {"input_ids": ids[:max_length] if truncation and max_length is not None else ids}
+
+
+class DriftingTok(CharTok):
+    """A truncating tokenizer whose capped output is not a slice of the uncapped one."""
+
+    def __call__(self, text, add_special_tokens=False, truncation=False, max_length=None):
+        result = super().__call__(text, add_special_tokens, truncation, max_length)
+        if truncation and max_length is not None and len(text) > max_length:
+            result["input_ids"][-1] = 99
+        return result
+
+
+class DroppingTok(CharTok):
+    """One id per character, but the tokenizer discards "~", so some prefixes
+    encode to the same span as their shorter neighbours."""
+
+    def __call__(self, text, add_special_tokens=False, truncation=False, max_length=None):
+        ids = [ord(char) for char in text if char != "~"]
+        return {"input_ids": ids[:max_length] if truncation and max_length is not None else ids}
+
+
+def lamp_case(labels, descriptions, instructions="Choose the lamp command."):
+    return ({"utterance": "the room is dark"},
+            {"intent": {"type": "choice", "instructions": instructions,
+                        "criteria": dict(zip(labels, descriptions))}})
+
+
+def uniform_scorer(cases):
+    return [[1.0 / len(q["intent"]["criteria"])] * len(q["intent"]["criteria"]) for _, q in cases]
+
+
+def tight_case():
+    """Labels that share a four-character prefix, so a tight budget merges their spans."""
+    return lamp_case(["iot_hue_light%d" % i for i in range(8)],
+                     ["turn off lamp %d" % i for i in range(8)])
+
+
+class BudgetTests(unittest.TestCase):
+    def test_roomy_case_is_not_budget_confounded(self):
+        case = m.MetamorphicCase(*lamp_case(
+            ["billing", "technical", "sales"],
+            ["payment issues", "software help", "new purchases"]))
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=192)
+        result = m.evaluate([case.as_pair()], uniform_scorer, budget=probe)
+        variants = result["cases"][0]["variants"]
+        for variant in variants:
+            self.assertEqual(variant["budget"]["distinct_spans"], 3)
+            self.assertIsNone(variant["budget"]["tokens_per_option"])
+        self.assertEqual(variants[2]["budget"]["retained_descriptions"],
+                         ["payment issues", "software help", "new purchases"])
+        self.assertIs(variants[2]["budget_comparison"]["budget_confounded"], False)
+        self.assertEqual(variants[2]["budget_comparison"]["reasons"], [{"code": "clean"}])
+        self.assertEqual(result["report"]["budget"]["label_rename"],
+                         {"n": 1, "clean": 1, "confounded": 0, "unknown": 0, "confounded_rate": 0.0})
+        self.assertEqual(result["report"]["budget"]["overall"]["n"], 2)
+
+    def test_tight_budget_exposes_collapsed_spans_and_content(self):
+        # At head_max_len=64 the per-option re-cap keeps four characters, so the baseline
+        # labels collapse to "iot_" and the renamed option keeps "t" of its description
+        # instead (#543/#569).
+        case = m.MetamorphicCase(*tight_case())
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=64)
+        result = m.evaluate([case.as_pair()], uniform_scorer, budget=probe)
+        variants = result["cases"][0]["variants"]
+        baseline, rename = variants[0], variants[2]
+        self.assertEqual(baseline["budget"]["distinct_spans"], 1)
+        self.assertEqual(baseline["budget"]["retained_text"], ["iot_"] * 8)
+        self.assertEqual(baseline["budget"]["retained_descriptions"], [""] * 8)
+        self.assertEqual(rename["budget"]["distinct_spans"], 8)
+        self.assertEqual(rename["budget"]["retained_text"], ["%s: t" % label for label in "ABCDEFGH"])
+        self.assertEqual(rename["budget"]["retained_descriptions"], ["t"] * 8)
+        comparison = rename["budget_comparison"]
+        self.assertIs(comparison["budget_confounded"], True)
+        self.assertEqual([reason["code"] for reason in comparison["reasons"]],
+                         ["distinct_spans", "collision_partition", "retained_description"])
+        self.assertEqual(comparison["reasons"][-1]["slots"], list(range(8)))
+        # Permuting the same collapsing options still moves every key/value pair together.
+        self.assertIs(variants[1]["budget_comparison"]["budget_confounded"], False)
+        self.assertEqual(result["report"]["budget"]["label_rename"],
+                         {"n": 1, "clean": 0, "confounded": 1, "unknown": 0, "confounded_rate": 1.0})
+        self.assertEqual(result["report"]["budget"]["overall"]["confounded_rate"], 0.5)
+
+    def test_permutation_alone_is_never_information_loss(self):
+        case = m.MetamorphicCase(*lamp_case(["o%03d" % i for i in range(28)],
+                                            ["description %d" % i for i in range(28)]))
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=184)
+        permuted = m.permute_options(case, seed=7)
+        result = m.evaluate_variants(None, case, [permuted], score=uniform_scorer, budget=probe)
+        self.assertEqual(result.baseline["budget"]["distinct_spans"], 28)
+        self.assertEqual(result.variants[0]["budget"]["distinct_spans"], 28)
+        self.assertEqual(result.variants[0]["budget_comparison"]["reasons"], [{"code": "clean"}])
+
+    def test_both_sides_collapse_differently(self):
+        # Equal collision counts, different collided slots: a count-only diagnostic
+        # would call this clean, so the partition comparison has to catch it.
+        case = m.MetamorphicCase(*lamp_case(
+            ["aaaa1", "aaaa2", "cccc", "dddd"], ["one", "two", "three", "four"]))
+        labels = ["bbbb", "aaaa3", "aaaa4", "dddd"]
+        variant_case = m.MetamorphicCase(*lamp_case(labels, ["one", "two", "three", "four"]))
+        mapping = dict(zip(case.option_keys, labels))
+        variant = m.MetamorphicVariant("label_rename", variant_case, mapping)
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=38)
+        result = m.evaluate_variants(None, case, [variant], score=uniform_scorer, budget=probe)
+        baseline, variant_record = result.baseline, result.variants[0]
+        self.assertEqual(baseline["budget"]["distinct_spans"], 3)
+        self.assertEqual(variant_record["budget"]["distinct_spans"], 3)
+        self.assertEqual(baseline["budget"]["span_classes"], [0, 0, 1, 2])
+        self.assertEqual(variant_record["budget"]["span_classes"], [0, 1, 1, 2])
+        comparison = variant_record["budget_comparison"]
+        self.assertIs(comparison["budget_confounded"], True)
+        self.assertEqual([reason["code"] for reason in comparison["reasons"]],
+                         ["collision_partition"])
+
+    def test_only_the_variant_collapses(self):
+        # The mirror of the tight case: the reverse direction, where the baseline
+        # labels stay distinct and the longer renamed labels push the differing
+        # character past the re-cap, has to be reported the same way.
+        baseline_case = m.MetamorphicCase(*lamp_case(["a", "b", "c", "d"], ["turn off lamp"] * 4))
+        variant_case = m.MetamorphicCase(*lamp_case(
+            ["iot_hue_light%d" % i for i in range(4)], ["turn off lamp"] * 4))
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=40)
+        baseline = probe.measure(*baseline_case.as_pair())
+        variant = probe.measure(*variant_case.as_pair())
+        self.assertEqual(baseline["retained_text"], ["%s: t" % label for label in "abcd"])
+        self.assertEqual(baseline["distinct_spans"], 4)
+        self.assertEqual(variant["retained_text"], ["iot_"] * 4)
+        self.assertEqual(variant["distinct_spans"], 1)
+        comparison = m.compare_budgets(baseline, variant, [0, 1, 2, 3], kind="label_rename")
+        self.assertIs(comparison["budget_confounded"], True)
+        self.assertEqual([reason["code"] for reason in comparison["reasons"]],
+                         ["distinct_spans", "collision_partition", "retained_description"])
+
+    def test_non_involutive_permutation_keeps_descriptions_aligned(self):
+        # canonical A B C presented B C A: [1, 2, 0] is a 3-cycle, not its own inverse,
+        # so indexing the variant by it scrambles the slots instead of restoring them.
+        case = m.MetamorphicCase(*lamp_case(
+            ["A", "B", "C"], ["alpha description", "beta description", "gamma description"]))
+        variant = m.MetamorphicVariant(
+            "option_order",
+            m.MetamorphicCase(*lamp_case(["B", "C", "A"],
+                                         ["beta description", "gamma description", "alpha description"])),
+            {"A": "A", "B": "B", "C": "C"})
+        self.assertEqual(variant.as_record()["canonical_indices"], [1, 2, 0])
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=192)
+        result = m.evaluate_variants(None, case, [variant], score=uniform_scorer, budget=probe)
+        record = result.variants[0]
+        self.assertEqual(record["budget"]["retained_descriptions"],
+                         ["beta description", "gamma description", "alpha description"])
+        self.assertIs(record["budget_comparison"]["budget_confounded"], False)
+        self.assertEqual(record["budget_comparison"]["reasons"], [{"code": "clean"}])
+
+    def test_non_involutive_permutation_keeps_collapsed_partitions_aligned(self):
+        # The same 3-cycle with labels that collide under the re-cap: the span classes
+        # have to be restored to canonical order before the partitions are compared.
+        case = m.MetamorphicCase(*lamp_case(
+            ["aaaa1", "aaaa2", "cccc"], ["one", "two", "three"]))
+        variant = m.MetamorphicVariant(
+            "option_order",
+            m.MetamorphicCase(*lamp_case(["aaaa2", "cccc", "aaaa1"], ["two", "three", "one"])),
+            {"aaaa1": "aaaa1", "aaaa2": "aaaa2", "cccc": "cccc"})
+        self.assertEqual(variant.as_record()["canonical_indices"], [1, 2, 0])
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=35)
+        result = m.evaluate_variants(None, case, [variant], score=uniform_scorer, budget=probe)
+        self.assertEqual(result.baseline["budget"]["span_classes"], [0, 0, 1])
+        record = result.variants[0]
+        self.assertEqual(record["budget"]["span_classes"], [0, 1, 0])
+        self.assertIs(record["budget_comparison"]["budget_confounded"], False)
+        self.assertEqual(record["budget_comparison"]["reasons"], [{"code": "clean"}])
+
+    def test_ambiguous_prefix_attribution_is_unknown(self):
+        # DroppingTok discards "~", so "aaaa: b" and "aaaa: b~" encode to the same span:
+        # which characters the model kept is undecidable, and neither may be asserted.
+        case = m.MetamorphicCase(*lamp_case(["aaaa", "cccc"], ["b~zzz", "d~zzz"]))
+        probe = m.BudgetProbe(DroppingTok(), max_len=512, head_max_len=34)
+        result = m.evaluate([case.as_pair()], uniform_scorer, budget=probe)
+        variants = result["cases"][0]["variants"]
+        self.assertTrue(variants[0]["budget"]["truncated"])
+        self.assertEqual(variants[0]["budget"]["retained_text"], [None, None])
+        self.assertEqual(variants[1]["budget"]["retained_text"], [None, None])
+        for variant in variants[1:]:
+            comparison = variant["budget_comparison"]
+            self.assertIsNone(comparison["budget_confounded"])
+            self.assertEqual(comparison["reasons"],
+                             [{"code": "unverified_retained_text", "slots": [0, 1]}])
+
+    def test_attribution_requires_a_globally_unique_witness(self):
+        # Two prefixes encode to the same span 15 characters apart, and the length
+        # profile dips back to the span's length only at the second one: a search
+        # bounded to the neighbourhood of the bisection point sees a single witness
+        # and would attribute the span to it.
+        text, kept = "x" * 40, [9, 9]
+        table = {size: [1] for size in range(5)}
+        table.update({size: [0, 0, 0] for size in range(5, 40)})
+        table[5], table[20] = list(kept), list(kept)
+        table[40] = kept + [0, 0]
+
+        def encode(part):
+            return table[len(part)]
+
+        self.assertEqual(encode(text[:5]), kept)
+        self.assertEqual(encode(text[:20]), kept)
+        self.assertIsNone(m._retained_prefix(encode, text, kept, encode(text)))
+
+    def test_overlong_options_are_not_attributed(self):
+        # Above the documented length bound the prefix search is skipped rather than
+        # guessed, even though the unique witness here would be trivially findable.
+        text = "y" * (m._ATTRIBUTION_LIMIT + 1)
+
+        def encode(part):
+            return [7] * len(part)
+
+        self.assertIsNone(m._retained_prefix(encode, text, [7], encode(text)))
+
+    def test_renaming_without_descriptions_is_unknown_not_clean(self):
+        # Descriptions may legitimately be absent; then the label is the only semantic
+        # content, and renaming it makes the experiment meaningless, not clean.
+        case = m.MetamorphicCase(*lamp_case(["billing", "technical", "sales"], [None, None, None]))
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=192)
+        result = m.evaluate([case.as_pair()], uniform_scorer, budget=probe)
+        variants = result["cases"][0]["variants"]
+        baseline, renamed = variants[0], variants[2]
+        self.assertEqual(baseline["budget"]["description_present"], [False] * 3)
+        self.assertEqual(baseline["budget"]["retained_descriptions"], [""] * 3)
+        self.assertEqual(renamed["presented_options"], ["A", "B", "C"])
+        comparison = renamed["budget_comparison"]
+        self.assertIsNone(comparison["budget_confounded"])
+        self.assertEqual(comparison["reasons"],
+                         [{"code": "missing_semantic_description", "slots": [0, 1, 2]}])
+        self.assertEqual(comparison["retained_descriptions"],
+                         {"baseline": [""] * 3, "variant": [""] * 3})
+        # The model observation is untouched: the stub sees the same distribution.
+        self.assertTrue(renamed["comparison"]["semantic_agreement"])
+        self.assertEqual(renamed["probabilities"], [1 / 3] * 3)
+        # Permuting label-only options moves every key/value pair together and stays valid.
+        self.assertIs(variants[1]["budget_comparison"]["budget_confounded"], False)
+        self.assertEqual(result["report"]["budget"]["label_rename"],
+                         {"n": 1, "clean": 0, "confounded": 0, "unknown": 1, "confounded_rate": None})
+
+    def test_blank_descriptions_are_missing_too(self):
+        for blank in ("", "   ", "\t"):
+            with self.subTest(description=repr(blank)):
+                case = m.MetamorphicCase(*lamp_case(["billing", "technical"], [blank, "software help"]))
+                probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=192)
+                result = m.evaluate([case.as_pair()], uniform_scorer, budget=probe)
+                comparison = result["cases"][0]["variants"][2]["budget_comparison"]
+                self.assertIsNone(comparison["budget_confounded"])
+                self.assertEqual(comparison["reasons"],
+                                 [{"code": "missing_semantic_description", "slots": [0]}])
+
+    def test_structured_descriptions_are_not_missing(self):
+        case = m.MetamorphicCase(*lamp_case(
+            ["billing", "technical", "sales"],
+            [{"description": ["payment issues"]}, 0, False]))
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=192)
+        result = m.evaluate([case.as_pair()], uniform_scorer, budget=probe)
+        renamed = result["cases"][0]["variants"][2]
+        self.assertEqual(renamed["budget"]["description_present"], [True, True, True])
+        self.assertIs(renamed["budget_comparison"]["budget_confounded"], False)
+        self.assertEqual(renamed["budget_comparison"]["reasons"], [{"code": "clean"}])
+
+    def test_description_presence_classification(self):
+        for value, expected in ((None, False), ("", False), ("   ", False), ("\t", False),
+                                ("payment issues", True), ("  padded  ", True),
+                                (0, True), (False, True), ({}, True), ([], True)):
+            with self.subTest(value=value):
+                self.assertIs(m._description_present(value), expected)
+
+    def test_unverifiable_rendering_stays_conservative(self):
+        # Two long options whose spans the tokenizer cap cuts mid-option: the probe cannot
+        # attribute the surviving span to a character boundary, so it reports unknown.
+        case = m.MetamorphicCase(*lamp_case(["alpha", "beta"],
+                                            ["description " * 8, "description " * 8]))
+        probe = m.BudgetProbe(DriftingTok(), max_len=512, head_max_len=192)
+        result = m.evaluate([case.as_pair()], uniform_scorer, budget=probe)
+        for variant in result["cases"][0]["variants"]:
+            self.assertTrue(variant["budget"]["truncated"])
+            self.assertIsNone(variant["budget"]["retained_text"][0])
+        for variant in result["cases"][0]["variants"][1:]:
+            comparison = variant["budget_comparison"]
+            self.assertIsNone(comparison["budget_confounded"])
+            self.assertEqual(comparison["reasons"][0]["code"], "unverified_retained_text")
+        self.assertEqual(result["report"]["budget"]["overall"],
+                         {"n": 2, "clean": 0, "confounded": 0, "unknown": 2, "confounded_rate": None})
+
+    def test_broken_tokenizer_is_reported_not_raised(self):
+        case = m.MetamorphicCase(*CASE)
+        probe = m.BudgetProbe(object(), max_len=512, head_max_len=192)
+        result = m.evaluate([case.as_pair()], semantic_scorer, budget=probe)
+        comparison = result["cases"][0]["variants"][1]["budget_comparison"]
+        self.assertIsNone(comparison["budget_confounded"])
+        self.assertEqual(comparison["reasons"][0]["code"], "measurement_error")
+        self.assertIsNone(result["report"]["budget"]["overall"]["confounded_rate"])
+
+    def test_without_a_probe_nothing_changes(self):
+        case = m.MetamorphicCase(*CASE)
+        result = m.evaluate([case.as_pair()], semantic_scorer)
+        self.assertNotIn("budget", result["report"])
+        for variant in result["cases"][0]["variants"]:
+            self.assertNotIn("budget", variant)
+            self.assertNotIn("budget_comparison", variant)
+
+    def test_probe_is_deterministic_and_serialisable(self):
+        case = m.MetamorphicCase(*tight_case())
+        first = m.evaluate([case.as_pair()], uniform_scorer,
+                           budget=m.BudgetProbe(CharTok(), max_len=512, head_max_len=64))
+        second = m.evaluate([case.as_pair()], uniform_scorer,
+                            budget=m.BudgetProbe(CharTok(), max_len=512, head_max_len=64))
+        self.assertEqual(first, second)
+        self.assertEqual(json.loads(json.dumps(first, allow_nan=False)), first)
+        probe = m.BudgetProbe(CharTok(), max_len=512, head_max_len=64)
+        self.assertEqual(probe.measure(*case.as_pair()), probe.measure(*case.as_pair()))
+        self.assertEqual(probe.measure(*case.as_pair()), m.BudgetProbe(CharTok(), 512, 64).measure(*case.as_pair()))
 
 
 if __name__ == "__main__":
