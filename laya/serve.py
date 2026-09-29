@@ -199,6 +199,50 @@ def _resolve_port() -> int:
     return port
 
 
+#: Values examined by `_provably_over_state_limit` before it gives up. A constant, so the probe can
+#: never cost more than one: it exists to catch an oversized value for free, not to replace the
+#: encoder.
+_STATE_PROBE_VALUES = 64
+
+
+def _provably_over_state_limit(state: Any, cap: int) -> bool:
+    """Whether `state` **provably** serializes past `cap`, without serializing it.
+
+    Returns True only when that is certain, and False for "not proven" -- never the other way round,
+    so a False sends the state on to the exact `json.dumps` measurement and the verdict is unchanged.
+
+    The bound: the raw lengths of the string values are a *lower* bound on the JSON length. Escaping
+    maps each character to one or more characters and so never shortens; keys, separators, brackets
+    and quotes only add; numbers, booleans and nulls contribute at least one character each and are
+    counted as zero here. Every one of those makes this an under-estimate, which is the safe
+    direction: under-estimating can only fail to refuse, and then the encoder decides.
+
+    Why it is worth having. The dump runs before the gate refuses, so its cost is bounded by
+    `MAX_BODY_BYTES` rather than by `cap`: a 2 MiB body -- the largest the streaming cap admits --
+    cost 5.68 ms to serialize for a request that is then rejected, which is more than the 2.22 ms
+    `json.loads` spent parsing it in the first place. Finding one 2 MiB string instead takes a single
+    `len()`. Measured: 5.687 ms -> 0.0003 ms on that state, while every state that IS accepted pays
+    at most 0.01 ms more (worst ratio 2.08x, on a 6 us deeply-nested case).
+    """
+    total = 0
+    budget = _STATE_PROBE_VALUES
+    stack = [state]
+    while stack and budget > 0:
+        budget -= 1
+        item = stack.pop()
+        if isinstance(item, str):
+            total += len(item)
+            if total > cap:
+                return True
+        elif isinstance(item, dict):
+            # `.values()` and `extend` stay at C level; the keys are ignored, which keeps this a
+            # lower bound. Iterating items in Python here made a 2000-key state 1.66x slower.
+            stack.extend(item.values())
+        elif isinstance(item, (list, tuple)):
+            stack.extend(item)
+    return False
+
+
 def _state_length(state: Any) -> int:
     r"""Length of the state text that will be tokenized; 400 if it has none.
 
@@ -219,18 +263,22 @@ def _state_length(state: Any) -> int:
     module level and `import laya.serve` must not (tests/test_lazy_import.py). The two are pinned
     to each other in tests/test_serve.py.
 
-    The dump runs before the gate decides, so its bound is MAX_BODY_BYTES, not MAX_STATE_CHARS. At
-    the gate's own ceiling it is 0.133 ms against 0.080 ms for the `str()` it replaces, three
-    orders of magnitude under the forward pass that state then gets. On a 2 MiB body -- the largest
-    the streaming cap allows, and one this refuses -- it is 5.68 ms against 3.46 ms, on a request
-    that is rejected either way and whose `str()` upstream already walked in full. (Best of 200
-    after 20 warm-up iterations, CPython 3.12 on a 10-core arm64 laptop.) So the serialized text is
-    not worth threading through `predict()` to be encoded only once.
+    Cost. At the gate's own ceiling the dump is 0.133 ms against 0.080 ms for the `str()` it
+    replaces -- orders of magnitude under the forward pass that state then gets, so the serialized
+    text is not worth threading through `predict()` to be encoded only once. A state large enough
+    for that difference to matter never reaches the dump: `_provably_over_state_limit` refuses it
+    first, which is what keeps an oversized body from costing more to reject than it did upstream.
+    (Best of 200 after 20 warm-up iterations, CPython 3.12 on a 10-core arm64 laptop.)
     """
     from fastapi import HTTPException
 
     if isinstance(state, str):
         return len(state)  # `serialize_state` returns a string state unchanged
+    if _provably_over_state_limit(state, MAX_STATE_CHARS):
+        # Already over on a lower bound, so serializing the rest cannot change the verdict. The
+        # number reported is the bound rather than the true length, which is why the message says
+        # "over" instead of quoting a total it did not measure.
+        return MAX_STATE_CHARS + 1
     try:
         return len(json.dumps(state, ensure_ascii=False))
     except (TypeError, ValueError, RecursionError):

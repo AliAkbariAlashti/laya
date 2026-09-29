@@ -1090,3 +1090,74 @@ def test_an_oversized_integer_state_never_reaches_the_gate(monkeypatch, default_
     assert r.status_code == 400
     assert r.json()["detail"] == "request body must be valid JSON"
     assert fake.calls == []
+
+
+# --- the lower-bound probe in front of the exact measurement ---------------------------------
+
+def test_the_probe_refuses_an_oversized_value_without_serializing_the_state(monkeypatch):
+    """An oversized state is refused without the 2 MiB dump whose result cannot change the verdict.
+
+    This is the check that goes red if `_provably_over_state_limit` is removed: without it the gate
+    still answers 413, so the *absence of the dump* is the only observable difference.
+    """
+    import laya.serve as serve_mod
+
+    calls = []
+    real_dumps = serve_mod.json.dumps
+
+    def counting_dumps(obj, **kw):
+        calls.append(kw)
+        return real_dumps(obj, **kw)
+
+    monkeypatch.setattr(serve_mod.json, "dumps", counting_dumps)
+    state = {"body": "a" * (2 * 1024 * 1024)}
+    assert serve_mod._state_length(state) > serve_mod.MAX_STATE_CHARS
+    assert calls == [], "the state was serialized although one value already exceeds the cap"
+
+
+def test_the_probe_verdict_always_matches_the_exact_measurement():
+    """The probe may only report "provably over"; its verdict must never differ from the encoder's.
+
+    An unsound probe would be a security bug in the same family as the one this PR fixes, so the two
+    are compared across shapes placed deliberately on both sides of the limit -- including the
+    escape-heavy values where `repr` and JSON diverge, which is what the gate exists for.
+    """
+    import laya.serve as serve_mod
+    cap = serve_mod.MAX_STATE_CHARS
+    shapes = []
+    for ch in ("a", '"', "\u200b", "\U000e0001", "\n", "\\", "\u4e2d"):
+        for n in (1, 100, cap // 2, cap - 1, cap, cap + 1, cap * 2):
+            shapes.append({"body": ch * n})
+            shapes.append([ch * n])
+            shapes.append({"a": {"b": [ch * n]}})
+    shapes += [
+        {("k%05d" % i): "v" for i in range(3000)},
+        {("k%05d" % i): "v" * 40 for i in range(3000)},
+        [{"role": "user", "content": "hi"} for _ in range(4000)],
+        {"n": 1, "f": 1.5, "t": True, "z": None},
+        {},
+        [],
+    ]
+    assert len(shapes) == 7 * 7 * 3 + 6, len(shapes)
+    for state in shapes:
+        exact = len(json.dumps(state, ensure_ascii=False))
+        probed = serve_mod._state_length(state)
+        assert (probed > cap) == (exact > cap), \
+            "probe and encoder disagree for a %d-character state" % exact
+        if exact <= cap:
+            # Stronger than agreeing on the verdict: under the cap the *exact* length is returned,
+            # so the 413 message keeps quoting a number something actually measured.
+            assert probed == exact
+
+
+def test_the_probe_is_bounded_and_falls_through_rather_than_guessing():
+    """The probe examines a constant number of values, so it can never become the expensive step.
+
+    A state of 200 000 small values is not provably over within that budget, and must fall through
+    to the encoder rather than be refused on a partial sum.
+    """
+    import laya.serve as serve_mod
+    assert serve_mod._STATE_PROBE_VALUES <= 256
+    wide = {("k%06d" % i): "x" for i in range(200000)}
+    assert serve_mod._provably_over_state_limit(wide, serve_mod.MAX_STATE_CHARS) is False
+    assert serve_mod._state_length(wide) == len(json.dumps(wide, ensure_ascii=False))
