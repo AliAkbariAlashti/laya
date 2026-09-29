@@ -241,8 +241,13 @@ These apply to the `laya-serve` service only.
 | `LAYA_MAX_CONCURRENT` | `16` | requests admitted at once; later ones get `503` (a value that does not parse, or is not positive, falls back to `16`) |
 | `LAYA_LOG_LEVEL` | `info` | uvicorn log level |
 | `LAYA_API_KEY` | (none) | when set, requires `Authorization: Bearer <key>` |
+| `LAYA_ROOT_PATH` | (empty) | public URL prefix for FastAPI when behind a reverse proxy; the proxy should strip it before forwarding |
 | `LAYA_MAX_TOKEN_BUDGET` | `8192` | cap on per-request `max_len` and `head_max_len` overrides |
 | `LAYA_SHA256_DIGESTS` | (none) | JSON digests checked before a checkpoint is parsed: `{artifact: digest}` for every checkpoint, or `{model: {artifact: digest}}` per checkpoint. See [Security](security.md) |
+
+For example, set `LAYA_ROOT_PATH=/laya` when publishing the API under `/laya`. The proxy must
+strip that prefix before forwarding to the container; this setting updates FastAPI's generated
+URLs and does not change the internal `/health` or `/v1/systemone` routes.
 
 `LAYA_PRELOAD` defaults to `0` here rather than the package default of `1`, because
 preloading makes the first boot download all three checkpoints. Set it to `1` for a

@@ -37,6 +37,8 @@ services:
       LAYA_HOST: "${LAYA_HOST:-0.0.0.0}"
       LAYA_PORT: "${LAYA_PORT:-8000}"
       LAYA_DEVICE: "${LAYA_DEVICE:-cpu}"
+      # FastAPI's external URL prefix behind a reverse proxy; forward stripped paths.
+      LAYA_ROOT_PATH: "${LAYA_ROOT_PATH:-}"
       # Autocast dtype the runtime reads when building the model; empty keeps the checkpoint's own
       # `amp_dtype`. Set LAYA_CUDA_AMP=fp16 to serve fp16 on a GPU host.
       LAYA_CUDA_AMP: "${LAYA_CUDA_AMP:-}"

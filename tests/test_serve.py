@@ -81,6 +81,28 @@ def _budget_client(monkeypatch, api_key=None):
     return TestClient(create_app(router=fake)), fake
 
 
+def test_root_path_from_environment_updates_openapi_and_keeps_routes(monkeypatch):
+    monkeypatch.setenv("LAYA_ROOT_PATH", "/laya")
+    app = create_app(router=FakeRouter())
+
+    assert app.root_path == "/laya"
+    with TestClient(app) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/openapi.json").json()["servers"] == [{"url": "/laya"}]
+
+
+@pytest.mark.parametrize("root_path", [None, ""])
+def test_root_path_defaults_to_empty(monkeypatch, root_path):
+    if root_path is None:
+        monkeypatch.delenv("LAYA_ROOT_PATH", raising=False)
+    else:
+        monkeypatch.setenv("LAYA_ROOT_PATH", root_path)
+
+    app = create_app(router=FakeRouter())
+
+    assert app.root_path == ""
+
+
 
 REQ = {
     "model": "jev-1",  # a non-Laya model id -> should be ignored, router auto-routes

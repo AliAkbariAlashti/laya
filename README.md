@@ -542,6 +542,10 @@ send `Authorization: Bearer <key>`). A client's `model` field is honoured when i
 names a Laya checkpoint (`english`/`multilingual`/`typed-decisions`), otherwise
 the router auto-selects by script/language.
 
+When publishing the server under a reverse-proxy prefix such as `/laya`, set
+`LAYA_ROOT_PATH=/laya`. The proxy should strip that prefix before forwarding;
+the setting controls FastAPI-generated URLs and leaves the internal routes unchanged.
+
 Three things differ from Jev when you port a client:
 
 * **Options per question.** A question's options share the checkpoint's option budget, `head_max_len` (192 tokens on `laya`, 256 on the other two), not Jev's cap of 255 options. In addition, the HTTP server (`laya.serve`) enforces an amplification guard of at most 100 choice options per question (`MAX_CHOICE_OPTIONS = 100`, rejected with 413 before inference). Once options overflow the token budget, around 20 options with a short description each, every option is trimmed to fit, so long or similar labels can reach the model reading the same ([Where Jev leads](#where-jev-leads)). Once they no longer fit the window at all, the library rejects the request with 422. For more candidates, narrow them first with `predict_shortlist` ([Honest limits](#honest-limits)).

@@ -44,6 +44,17 @@ in
       description = "TCP port to listen on.";
     };
 
+    rootPath = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/laya";
+      description = ''
+        Public URL prefix used by FastAPI behind a reverse proxy (sets
+        `LAYA_ROOT_PATH`). The proxy should strip this prefix before forwarding
+        requests. null leaves the root path empty.
+      '';
+    };
+
     device = lib.mkOption {
       type = lib.types.str;
       default = "cuda";
@@ -274,6 +285,8 @@ in
       } // lib.optionalAttrs (cfg.threads != null) {
         LAYA_THREADS = toString cfg.threads;
         OMP_NUM_THREADS = toString cfg.threads;
+      } // lib.optionalAttrs (cfg.rootPath != null) {
+        LAYA_ROOT_PATH = cfg.rootPath;
       } // lib.optionalAttrs (cfg.logLevel != null) {
         LAYA_LOG_LEVEL = cfg.logLevel;
       } // lib.optionalAttrs (cfg.maxConcurrent != null) {

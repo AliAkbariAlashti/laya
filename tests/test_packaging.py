@@ -269,6 +269,8 @@ check_true("compose.http/the server reads the same variable",
 # unreachable for the documented compose path -- `docker run -e` still works, compose does not.
 check_true("compose.http/forwards the resident-checkpoint cap",
            'LAYA_MAX_LOADED: "${LAYA_MAX_LOADED:-}"' in http)
+check_true("compose.http/forwards the FastAPI root path",
+           'LAYA_ROOT_PATH: "${LAYA_ROOT_PATH:-}"' in http)
 check_true("compose.http/shares the model cache",
            "model-cache:/home/laya/.cache/huggingface" in http)
 # The base service is what `docker compose run --rm laya` uses; publishing it a port or
@@ -470,7 +472,7 @@ def option_type(opt):
 
 # Every new knob is opt-in: unset means the unit exports nothing and the runtime's own default
 # applies, so a host that ignores them gets today's behaviour byte for byte.
-for opt in ("logLevel", "maxConcurrent", "cudaAmp", "cpuAmp", "mpsAmpMinRows",
+for opt in ("rootPath", "logLevel", "maxConcurrent", "cudaAmp", "cpuAmp", "mpsAmpMinRows",
             "maxLoaded", "maxTokenBudget", "revision"):
     _t = option_text(opt)
     check_true("nix/module declares %s" % opt, _t != "", "option not found")
