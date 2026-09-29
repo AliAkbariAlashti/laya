@@ -165,10 +165,13 @@ export function emailState(
   sender?: string | null,
   clean = true,
   extra: Record<string, unknown> = {},
+  // The budget cleanEmailBody cuts the body to, as Python's email_state(max_chars=) (#589).
+  // Last, so existing positional calls keep their meaning. Ignored when clean is false.
+  maxChars = 3000,
 ): Record<string, unknown> {
   const state: Record<string, unknown> = {
     subject: (subject ?? "").trim(),
-    body: clean ? cleanEmailBody(body ?? "") : (body ?? ""),
+    body: clean ? cleanEmailBody(body ?? "", maxChars) : (body ?? ""),
   };
   if (sender) state["from"] = sender;
   for (const [k, v] of Object.entries(extra ?? {})) {
