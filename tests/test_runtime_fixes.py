@@ -9,13 +9,16 @@ import os
 import sys
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from laya.agent import MPS_AMP_MIN_ROWS_DEFAULT, Agent, _amp_context, _cuda_amp_dtype, _mps_amp_min_rows  # noqa: E402
+from laya.agent import (  # noqa: E402
+    MPS_AMP_MIN_ROWS_DEFAULT, Agent, _BATCH_AUTOCAST_CACHE, _amp_context, _cuda_amp_dtype, _mps_amp_min_rows,
+)
 from laya.common import DecisionModel, build_sequence, serialize_state  # noqa: E402
 
 PASS, FAIL = [], []
@@ -321,14 +324,33 @@ oom.device = torch.device("cuda")   # the OOM branch only reads .type
 check("oom-fallback/count starts at 0", oom.cpu_fallback_count, 0)
 check("oom-fallback/reason starts None", oom.last_fallback_reason, None)
 
-out = oom._infer(oom_batch)          # first forward raises OOM -> scoped CPU retry
+fallback_events = []
+original_to = oom.model.to
+
+
+def record_move(device):
+    fallback_events.append("move-%s" % device)
+    return original_to(device)
+
+
+oom.model.to = record_move
+with patch.object(torch, "clear_autocast_cache", side_effect=lambda: fallback_events.append("clear")):
+    out = oom._infer(oom_batch)      # first forward raises OOM -> scoped CPU retry
 check("oom-fallback/retry answered", isinstance(out, tuple), True)
+check("oom-fallback/no batch scope leaves other caches alone", fallback_events[:1], ["move-cpu"])
 check("oom-fallback/count recorded", oom.cpu_fallback_count, 1)
 check("oom-fallback/reason recorded",
       "out of memory" in (oom.last_fallback_reason or ""), True)
 check("oom-fallback/scoped: device restored", oom.device.type, "cuda")
 
-oom._infer(oom_batch)                # a second OOM accumulates
+fallback_events.clear()
+token = _BATCH_AUTOCAST_CACHE.set(True)
+try:
+    with patch.object(torch, "clear_autocast_cache", side_effect=lambda: fallback_events.append("clear")):
+        oom._infer(oom_batch)        # a second OOM inside the batch scope clears before CPU move
+finally:
+    _BATCH_AUTOCAST_CACHE.reset(token)
+check("oom-fallback/batch copies cleared before CPU move", fallback_events[:2], ["clear", "move-cpu"])
 check("oom-fallback/second OOM counts too", oom.cpu_fallback_count, 2)
 
 # a plain forward never touches the counters

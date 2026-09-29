@@ -5,7 +5,8 @@ import tempfile
 import threading
 import time
 import warnings
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
+from contextvars import ContextVar
 from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
@@ -158,6 +159,7 @@ _TOKENIZERS_LOCK = threading.Lock()
 # model while other threads may be running their own forward, so the demotion and the restore are
 # serialised. A second request that hits OOM waits here and re-demotes only if it needs to.
 _OOM_FALLBACK_LOCK = threading.Lock()
+_BATCH_AUTOCAST_CACHE = ContextVar("laya_batch_autocast_cache", default=False)
 
 
 def _load_tokenizer(tok_dir: str, cfg: Dict) -> Any:
@@ -972,6 +974,10 @@ class Agent(HookRegistry):
                     self.last_fallback_reason = str(e)
                     held_device, held_dtype, held_amp = self.device, self.dtype, self.amp_enabled
                     had_fast = self._fast is not None
+                    # Only our batch scope can retain BF16 copies after this failed forward.
+                    # Release them before moving the model and retrying on CPU.
+                    if self.device.type == "cuda" and _BATCH_AUTOCAST_CACHE.get():
+                        torch.clear_autocast_cache()
                     # FastLaya keeps copied CUDA weights and replaces model.forward.  Move
                     # the model first without that replacement, or the retry would still
                     # execute on the failed CUDA fast path.
@@ -1131,6 +1137,7 @@ class Agent(HookRegistry):
         timeout = self.hooks_timeout if hooks_timeout is None else validate_timeout(hooks_timeout)
         ctx = PredictContext(states=states, questions=questions, model=self.model_id, agent=self,
                              max_len=max_len, head_max_len=head_max_len)
+        amp_stack = ExitStack()
         try:
             dispatch(active, "on_predict_start", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
             states, questions = ctx.states, ctx.questions
@@ -1169,6 +1176,18 @@ class Agent(HookRegistry):
                             self._check_question(qid, questions[qid])
                         internal = {qid: self._to_internal(questions[qid]) for qid in ids}
                         chunk = batch_size if (batch_size and batch_size > 0) else len(states)
+
+                        # Keep inner _infer weight casts cached across CUDA eager forwards.
+                        # A disabled outer scope leaves encoding/decoding in their usual
+                        # precision and inherits the caller's cache_enabled setting. If the
+                        # caller already owns a CUDA autocast scope, its cache is sufficient.
+                        if (chunk < len(states) and getattr(self, "device", None) is not None
+                                and self.device.type == "cuda" and self.amp_enabled
+                                and self._fast is None and not self._compiled
+                                and not torch.is_autocast_enabled()):
+                            amp_stack.enter_context(torch.autocast(device_type="cuda", dtype=self.dtype,
+                                                                   enabled=False))
+                            amp_stack.callback(_BATCH_AUTOCAST_CACHE.reset, _BATCH_AUTOCAST_CACHE.set(True))
 
                         # Per-call token-budget overrides (a start hook may have set them).
                         overrides: Dict[str, int] = {}
@@ -1221,6 +1240,7 @@ class Agent(HookRegistry):
                             results.extend(window_results)
                         ctx.results = results
         except BaseException as exc:
+            amp_stack.close()
             ctx.error = exc
             try:
                 dispatch(active, "on_error", ctx, raise_errors=raise_errors, lock=self._hooks_lock, timeout=timeout)
@@ -1229,6 +1249,7 @@ class Agent(HookRegistry):
                 exc.__context__ = hook_exc
             raise
         finally:
+            amp_stack.close()
             ctx.elapsed_ms = (time.perf_counter() - ctx.started_at) * 1000.0
             if ctx.results is not None:
                 ctx.usage = aggregate_usage(ctx.results)
