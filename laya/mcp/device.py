@@ -1,7 +1,10 @@
 """Device resolution: LAYA_DEVICE has the same meaning as in laya.serve.
 
-The environment variable is passed straight to torch (``Router(device=...)``);
-``resolve_device`` is a best-effort label of the *configured preference*
+The environment variable is normalised once, in `env_device`, and passed on to torch
+(``Router(device=...)``); `resolve_device` reports that same string, so the device a client is
+told about and the device torch is asked for cannot drift apart. Normalisation lower-cases the
+device type, because torch's parser is case-sensitive.
+`resolve_device` is a best-effort label of the *configured preference*
 (LAYA_DEVICE or torch auto-detection), not of the device a loaded checkpoint
 actually runs on. For the real device read ``Agent.device`` via
 ``agent_device`` / ``router_agent``: the Agent falls back to CPU silently when
@@ -18,12 +21,27 @@ _ENV_KEY = "LAYA_DEVICE"
 
 
 def env_device() -> str | None:
-    """LAYA_DEVICE verbatim (empty or unset = None), ready for Router(device=...)."""
+    """LAYA_DEVICE (empty or unset = None), ready for Router(device=...).
+
+    Lower-cased, not verbatim. torch's device parser is case-sensitive -- it accepts ``cuda``
+    and rejects ``CUDA`` with "Expected one of cpu, cuda, ..." -- so a value this function
+    returned unchanged could fail the Router build while `laya_status` reported the
+    lower-cased form as the working device. The same normalisation `resolve_device` applies
+    is applied here, so the value handed to torch and the value reported are one string.
+
+    Splitting on the device *type* and the optional index keeps that true for ``CUDA:0``:
+    torch wants the type lower-cased and does not care about the index, so
+    ``CUDA:0 -> cuda:0``.
+    """
     value = os.environ.get(_ENV_KEY)
     if value is None:
         return None
     value = value.strip()
-    return value or None
+    if not value:
+        return None
+    kind, sep, index = value.partition(":")
+    kind = kind.lower()
+    return "%s%s%s" % (kind, sep, index) if sep else kind
 
 
 def resolve_device(force: str | None = None) -> str:
@@ -43,7 +61,7 @@ def resolve_device(force: str | None = None) -> str:
         return force
     value = env_device()
     if value is not None:
-        return value.lower()
+        return value
     try:
         import torch
 
