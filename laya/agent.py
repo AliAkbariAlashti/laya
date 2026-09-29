@@ -34,6 +34,7 @@ from .common import (
     _reuse_question_tokens,
     _disable_question_token_reuse,
     encode_text,
+    render_criterion,
     render_options,
     serialize_state,
     temp_bucket,
@@ -960,7 +961,15 @@ class Agent(HookRegistry):
                 answers[qid] = {
                     "type": "score",
                     "score": round(exp_score, 4),
-                    "legend": {str(i): c for i, c in enumerate(q["crit"])},
+                    # A legend maps an index to the text of a level, and the keys are already
+                    # strings. `render_criterion` rather than `str`: a dict or list level then
+                    # comes back as the same JSON text the model was shown, where `str` produced
+                    # a Python repr. A numeric scale passed as `[1, 2, 3]` used to come back as
+                    # `{"0": 1, "1": 2, "2": 3}`, so the response's JSON types depended on what
+                    # the caller happened to pass; `structured` stringifies every level it builds
+                    # and `probabilities` stringifies its keys right below, so this was the one
+                    # path that did not.
+                    "legend": {str(i): render_criterion(c) for i, c in enumerate(q["crit"])},
                     "probabilities": {str(i): round(float(v), 4) for i, v in enumerate(p)},
                     "confidence": round(confidence_from_probs(p, k), 4),
                     "answer_confidence": ans_conf,
