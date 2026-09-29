@@ -250,7 +250,10 @@ function project(answers: Record<string, Record<string, any> | undefined>, field
           if (v > best) { best = v; idx = i; }
         }
       } else {
-        idx = Math.round(Number(answer.score ?? 0.0)) - (f.minimum ?? 0);
+        // `score` is always the probability-weighted 0-based level index,
+        // the same space `idx` is in above -- not an absolute field value --
+        // so it is rounded on its own, with no `minimum` subtracted first.
+        idx = Math.round(Number(answer.score ?? 0.0));
       }
       values[f.name] = (f.minimum ?? 0) + idx;
     } else {
