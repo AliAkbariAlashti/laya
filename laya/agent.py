@@ -624,6 +624,37 @@ class Agent(HookRegistry):
         self.model.forward = self._fast.forward
         return True
 
+    # (rows, tokens, markers) run by `warmup()`: one row, which torch specialises into a graph of
+    # its own, and a small batch. The three sizes differ within each shape, so none are tied.
+    WARMUP_SHAPES = ((1, 64, 3), (4, 128, 5))
+
+    @torch.no_grad()
+    def warmup(self, shapes=None) -> float:
+        """Run the forward on synthetic input of each shape now and return the seconds it took.
+
+        `compile=True` traces and compiles on the first request that needs a graph (tens of
+        seconds on a GPU), and `fast=True` builds its kernels and CUDA graphs per shape bucket on
+        first use. Calling this after loading, before serving, moves that cost out of the first
+        requests. With the stock forward it is a few ordinary forward passes. `shapes` is a list
+        of (rows, tokens, markers); tokens are capped at the agent's `max_len`. Nothing is
+        returned to or recorded for any caller, and hooks do not run.
+        """
+        max_len = int(self.cfg.get("max_len", 512))
+        fill = self.tok.cls_token_id or 0
+        t0 = time.perf_counter()
+        for rows, tokens, markers in (self.WARMUP_SHAPES if shapes is None else shapes):
+            tokens = max(markers + 2, min(int(tokens), max_len))
+            self._infer({
+                "input_ids": torch.full((rows, tokens), fill, dtype=torch.long),
+                "attention_mask": torch.ones((rows, tokens), dtype=torch.long),
+                "marker_pos": torch.arange(1, markers + 1, dtype=torch.long).repeat(rows, 1),
+                "marker_mask": torch.ones((rows, markers), dtype=torch.bool),
+                "qtype": torch.zeros(rows, dtype=torch.long),
+            })
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        return time.perf_counter() - t0
+
     def deaccelerate(self):
         """Restore the stock forward."""
         if self._fast is not None:
