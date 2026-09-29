@@ -187,6 +187,13 @@ for bad_type in ([], {}):
     except Exception as e:
         FAIL.append("%s: %s instead of ValueError: %s" % (name, type(e).__name__, e))
     check("%s does not run the session" % name, invalid.session.calls, [])
+for bad_ins in (None, "", "   ", []):
+    check_raises("invalid/instructions %r rejected" % (bad_ins,), ValueError,
+                 lambda bi=bad_ins: _bare_onnx().predict_batch(STATES, {"q": {"type": "noul", "instructions": bi}}))
+check_raises("invalid/questions not a dict", TypeError,
+             lambda: _bare_onnx().predict_batch(STATES, ["not", "a", "dict"]))
+check_raises("invalid/state is None in batch", TypeError,
+             lambda: _bare_onnx().predict_batch([None], QUESTIONS))
 check("budget/max_len and head_max_len forward through the batch path",
       _bare_onnx().predict_batch(STATES, QUESTIONS, max_len=32, head_max_len=16),
       [_bare_onnx().system_one(s, QUESTIONS, max_len=32, head_max_len=16) for s in STATES])
