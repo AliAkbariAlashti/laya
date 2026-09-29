@@ -46,6 +46,8 @@
 
 ## Calibration and training
 
+::: laya.common.answer_confidence
+
 ::: laya.common.confidence_from_probs
 
 ::: laya.common.ece_score
