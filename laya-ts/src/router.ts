@@ -1,5 +1,6 @@
 import { analyse, type AnalyseResult } from "./lang.js";
 import type { PredictOptions, QuestionDef, SystemOneResult } from "./agent.js";
+import { checkMinConfidence, flagLowConfidence } from "./common.js";
 import { decide, type DecideOptions, type DecisionResult } from "./structured.js";
 import {
   HookRegistry,
@@ -567,6 +568,8 @@ export class Router extends HookRegistry {
     questions: Record<string, QuestionDef>,
     opts: RouteOptions & PredictOptions = {},
   ): Promise<RoutedResult> {
+    const mcOpt = opts.minConfidence ?? opts.min_confidence;
+    const mc = mcOpt !== undefined && mcOpt !== null ? checkMinConfidence(mcOpt) : null;
     const active = composeHooks(this.hooks, opts.hooks, opts.onPredictStart, opts.onPredictEnd);
     const raiseErrors = opts.hooksRaise ?? this.hooksRaise;
 
@@ -576,7 +579,7 @@ export class Router extends HookRegistry {
       systemOne(
         s: unknown,
         q: Record<string, QuestionDef>,
-        opts?: { lang?: string | null },
+        opts?: PredictOptions,
       ): Promise<SystemOneResult>;
     };
     const ctx = new PredictContext({
@@ -598,7 +601,8 @@ export class Router extends HookRegistry {
         // explicit lang="en" can select an "en" override.
         const detected = decision.detection?.language;
         const effectiveLang = opts.lang ?? (detected && detected !== "en" ? detected : null);
-        const agentOpts = { lang: effectiveLang };
+        const agentOpts: PredictOptions = { lang: effectiveLang };
+        if (mc !== null) agentOpts.minConfidence = mc;
         markDefaultsRan(agentOpts);
         const result = (await agent.systemOne(
           ctx.states[0],
@@ -626,7 +630,12 @@ export class Router extends HookRegistry {
       throw err;
     } finally {
       ctx.markElapsed();
-      if (ctx.results !== null) ctx.usage = aggregateUsage(ctx.results);
+      if (ctx.results !== null) {
+        ctx.usage = aggregateUsage(ctx.results);
+        if (mc !== null) {
+          flagLowConfidence(ctx.results as unknown as Record<string, unknown>[], mc);
+        }
+      }
       try {
         await dispatchAsync(active, "onPredictEnd", ctx, { raiseErrors });
       } catch (hookErr) {

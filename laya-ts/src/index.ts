@@ -58,6 +58,8 @@ export {
   softmax,
   confidenceFromProbs,
   answerConfidence,
+  checkMinConfidence,
+  flagLowConfidence,
   clampTemperature,
   tempBucket,
   collateItems,

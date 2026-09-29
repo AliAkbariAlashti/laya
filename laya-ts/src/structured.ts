@@ -19,6 +19,7 @@
  * with a `toJSONSchema()` method is accepted.
  */
 import type { QuestionDef } from "./agent.js";
+import { checkMinConfidence, flagLowConfidence } from "./common.js";
 
 export const MAX_PROPERTIES = 32;
 export const MAX_OPTIONS = 32;
@@ -71,6 +72,10 @@ export interface DecideOptions {
   questions?: Record<string, QuestionDef>;
   /** Return a DecisionResult with confidence, probabilities and raw answers. */
   returnDetails?: boolean;
+  /** Minimum confidence threshold in [0.0, 1.0]. Low confidence answers project to null. */
+  minConfidence?: number | null;
+  /** Python parity alias for minConfidence. */
+  min_confidence?: number | null;
   /** Anything else is forwarded to runner.predict (hooks, model, ...). */
   [k: string]: unknown;
 }
@@ -236,6 +241,10 @@ function project(answers: Record<string, Record<string, any> | undefined>, field
   for (const f of fields) {
     const answer = answers[f.name];
     if (answer == null) continue;
+    if (answer.low_confidence) {
+      values[f.name] = null;
+      continue;
+    }
     if (f.kind === "noul") {
       values[f.name] = Number(answer.noul ?? 0.0) >= 0.5;
     } else if (f.kind === "score") {
@@ -319,9 +328,14 @@ export async function decide(
   schema?: unknown,
   opts: DecideOptions = {},
 ): Promise<Record<string, unknown> | DecisionResult> {
-  const { questions, returnDetails = false, ...predictOpts } = opts;
+  const { questions, returnDetails = false, minConfidence, min_confidence, ...predictOpts } = opts;
   if ((schema == null) === (questions == null)) {
     throw new Error("pass exactly one of schema= or questions=");
+  }
+  const mcOpt = minConfidence ?? min_confidence;
+  const mc = mcOpt !== undefined && mcOpt !== null ? checkMinConfidence(mcOpt) : null;
+  if (mc !== null) {
+    predictOpts.minConfidence = mc;
   }
   let fields: PlannedField[] | null = null;
   let qs = questions;
@@ -330,6 +344,9 @@ export async function decide(
     qs = Object.fromEntries(fields.map((f) => [f.name, f.question]));
   }
   const result = await runner.predict(state, qs as Record<string, QuestionDef>, predictOpts);
+  if (mc !== null && result && typeof result === "object") {
+    flagLowConfidence(result as Record<string, unknown>, mc);
+  }
   const answers = result.answers ?? {};
   const values = fields ? project(answers, fields) : { ...answers };
   if (returnDetails) return detailsOf(values, answers, result);

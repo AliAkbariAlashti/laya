@@ -293,3 +293,73 @@ describe("structured/nullable-anyof", () => {
   });
 });
 
+describe("structured/min_confidence", () => {
+  const fakeRunner = (answers: Record<string, any>) => ({
+    calls: [] as any[],
+    async predict(state: unknown, questions: any, opts: any) {
+      this.calls.push({ state, questions, opts });
+      return { model: "fake", answers: JSON.parse(JSON.stringify(answers)) };
+    },
+  });
+
+  it("default behavior unchanged when minConfidence is omitted", async () => {
+    const runner = fakeRunner(ANSWERS);
+    const out = await decide(runner, "s", SCHEMA);
+    expect(out.department).toBe("billing");
+    expect(out.urgency).toBe(2);
+    expect(out.needs_human).toBe(true);
+    expect(out.priority).toBe(2);
+    expect(Object.values(ANSWERS).some((a: any) => a.low_confidence)).toBe(false);
+  });
+
+  it("with minConfidence=0.85, answers below threshold project as null", async () => {
+    const runner = fakeRunner(ANSWERS);
+    const out = await decide(runner, "s", SCHEMA, { minConfidence: 0.85 });
+    expect(out.department).toBe("billing"); // 0.9 >= 0.85
+    expect(out.urgency).toBeNull(); // 0.5 < 0.85
+    expect(out.needs_human).toBeNull(); // 0.8 < 0.85
+    expect(out.priority).toBeNull(); // 0.7 < 0.85
+  });
+
+  it("accepts python parity alias min_confidence", async () => {
+    const runner = fakeRunner(ANSWERS);
+    const out = await decide(runner, "s", SCHEMA, { min_confidence: 0.85 });
+    expect(out.department).toBe("billing");
+    expect(out.urgency).toBeNull();
+  });
+
+  it("with returnDetails: true, details keep raw confidence and answers dict", async () => {
+    const runner = fakeRunner(ANSWERS);
+    const det = await decide(runner, "s", SCHEMA, { minConfidence: 0.85, returnDetails: true });
+    expect(det.values.urgency).toBeNull();
+    expect(det.confidence.urgency).toBe(0.5);
+    expect((det.answers.urgency as any).low_confidence).toBe(true);
+    expect(det.values.department).toBe("billing");
+    expect((det.answers.department as any).low_confidence).toBeUndefined();
+  });
+
+  it("direct answersToJson with low_confidence: true in answer projects to null", () => {
+    const answersWithFlag = {
+      department: { type: "choice", choice: "billing", confidence: 0.4, low_confidence: true },
+      urgency: {
+        type: "score",
+        score: 2.0,
+        confidence: 0.9,
+        probabilities: { "0": 0.0, "1": 0.1, "2": 0.9 },
+        legend: {},
+      },
+    };
+    const proj = answersToJson(answersWithFlag as any, SCHEMA);
+    expect(proj.department).toBeNull();
+    expect(proj.urgency).toBe(2);
+  });
+
+  it("rejects invalid minConfidence values", async () => {
+    const runner = fakeRunner(ANSWERS);
+    await expect(decide(runner, "s", SCHEMA, { minConfidence: 1.2 })).rejects.toThrow(/min_confidence must be a float/);
+    await expect(decide(runner, "s", SCHEMA, { minConfidence: -0.1 })).rejects.toThrow(/min_confidence must be a float/);
+    await expect(decide(runner, "s", SCHEMA, { minConfidence: true as any })).rejects.toThrow(/min_confidence must be a float/);
+    await expect(decide(runner, "s", SCHEMA, { minConfidence: "0.85" as any })).rejects.toThrow(/min_confidence must be a float/);
+  });
+});
+
