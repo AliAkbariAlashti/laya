@@ -243,6 +243,55 @@ check("empty/no questions -> empty answers, windowed usage",
       ({}, True, True))
 
 
+# ---------------------------------------------------------------- start hooks may replace questions
+question_rewrites = [
+    ("append", {**QUESTIONS, "review": QUESTIONS["urgent"]}),
+    ("replace", {"review": QUESTIONS["urgent"]}),
+    ("delete", {"urgent": QUESTIONS["urgent"]}),
+    ("clear", {}),
+    ("choice to noul", {**QUESTIONS, "dept": QUESTIONS["urgent"]}),
+    ("noul to choice", {**QUESTIONS, "urgent": QUESTIONS["dept"]}),
+]
+for name, rewritten_questions in question_rewrites:
+    expected = _bare_onnx().predict_long(LONG_STATE, rewritten_questions)
+    try:
+        actual = _bare_onnx().predict_long(
+            LONG_STATE, QUESTIONS,
+            on_predict_start=lambda ctx: setattr(ctx, "questions", rewritten_questions))
+    except Exception as exc:
+        FAIL.append("questions/%s raised %r" % (name, exc))
+    else:
+        check("questions/%s matches directly requesting the final schema" % name, actual, expected)
+
+check("questions/no-op preserves the unhooked result",
+      _bare_onnx().predict_long(LONG_STATE, QUESTIONS, on_predict_start=lambda ctx: None),
+      _bare_onnx().predict_long(LONG_STATE, QUESTIONS))
+
+
+def _annotate_first_window(ctx):
+    ctx.results[0]["answers"]["review"] = {"type": "noul", "noul": 0.9, "answer_confidence": 0.9}
+
+
+expected = _bare_onnx().predict_long(LONG_STATE, QUESTIONS)
+try:
+    actual = _bare_onnx().predict_long(LONG_STATE, QUESTIONS, on_predict_end=_annotate_first_window)
+except Exception as exc:
+    FAIL.append("questions/a first-window end annotation raised %r" % exc)
+else:
+    check("questions/a first-window end annotation preserves the scan's answers", actual, expected)
+
+for malformed in (None, [], {"bad": None}, {"bad": {}}, {"bad": {"type": "unknown"}}):
+    errors = []
+    for method in ("system_one", "predict_long"):
+        try:
+            getattr(_bare_onnx(), method)(LONG_STATE, malformed)
+        except Exception as exc:
+            errors.append((type(exc).__name__, str(exc)))
+        else:
+            errors.append(None)
+    check("questions/invalid input keeps the validator's error: %r" % malformed, errors[1], errors[0])
+
+
 # ---------------------------------------------------------------- report
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:

@@ -262,11 +262,18 @@ def _start_evidence():
     inference, `states` is a snapshot of the states that reached it (`None` if the probe never ran,
     which means `predict_batch` was replaced and no hook chain was dispatched).
     """
-    evidence = {"answered": False, "states": None}
+    evidence = {"answered": False, "states": None, "question_types": None}
 
     def probe(ctx):
         evidence["answered"] = ctx.results is not None
         evidence["states"] = list(ctx.states)
+        # Snapshot only the inference schema; leave malformed questions to predict_batch's
+        # validator, and do not inspect questions when a hook has already answered the call.
+        if ctx.results is None and isinstance(ctx.questions, dict):
+            evidence["question_types"] = {
+                qid: qdef.get("type") if isinstance(qdef, dict) else None
+                for qid, qdef in ctx.questions.items()
+            }
 
     return probe, evidence
 
@@ -1400,12 +1407,13 @@ class Agent(HookRegistry):
             return {"model": "laya-rl-agent", "answers": {},
                     "usage": {**aggregate_usage(results), "windows": 0}}
 
-        ids = list(questions.keys())
-        internal = {qid: self._to_internal(questions[qid]) for qid in ids}
+        question_types = evidence["question_types"]
+        if question_types is None:       # a replacement predict_batch may not dispatch hooks
+            question_types = {qid: self._to_internal(qdef)["t"] for qid, qdef in questions.items()}
         answers = {}
-        for qid in ids:
+        for qid, qtype in question_types.items():
             per = [r["answers"][qid] for r in results]
-            if internal[qid]["t"] == "noul":
+            if qtype == "noul":
                 # Evidence anywhere: the strongest window decides. Its own P(true) and confidence
                 # (and act) are carried through, so the fields stay mutually consistent.
                 best = max(range(len(per)), key=lambda j: float(per[j]["noul"]))

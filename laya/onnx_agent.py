@@ -500,12 +500,13 @@ class ONNXAgent(HookRegistry):
             return {"model": "laya-rl-agent-onnx", "answers": {},
                     "usage": {**aggregate_usage(results), "windows": 0}}
 
-        ids = list(questions.keys())
-        internal = {qid: self._to_internal(questions[qid]) for qid in ids}
+        question_types = evidence["question_types"]
+        if question_types is None:       # a replacement predict_batch may not dispatch hooks
+            question_types = {qid: self._to_internal(qdef)["t"] for qid, qdef in questions.items()}
         answers = {}
-        for qid in ids:
+        for qid, qtype in question_types.items():
             per = [r["answers"][qid] for r in results]
-            if internal[qid]["t"] == "noul":
+            if qtype == "noul":
                 # Evidence anywhere: the strongest window decides, carrying its own P(true),
                 # confidence and act so the fields stay mutually consistent.
                 best = max(range(len(per)), key=lambda j: float(per[j]["noul"]))

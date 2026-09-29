@@ -473,6 +473,59 @@ check("rewrite/the same length is still the same count",
 check("rewrite/a text rewrite names no span",
       sorted(k for v in (upper or {}).get("answers", {}).values() for k in v if k == "window"), [])
 
+# A shared start hook may add a review question or replace the request's schema. Aggregate the
+# questions that actually ran, just as a short state does, including a changed type under one id.
+def _question_agent():
+    a = make_real_agent()
+    a.temperature, a.temperature_by_options, a.lang_temperatures = [1.0] * 3, {}, {}
+    del a._decode_answers                 # exercise the real typed answer decoder
+
+    def forward(b):
+        n = b["input_ids"].shape[0]
+        logits = np.tile(np.array([[0.0, 1.4]], dtype=np.float32), (n, 1))
+        logits[0] = [3.0, 0.0]           # most confident differs from strongest P(true)
+        return logits, np.full((n, 2), 0.5, dtype=np.float32)
+
+    a._forward = forward
+    return a
+
+
+question_rewrites = [
+    ("append", {**Q, "review": Q["flag"]}),
+    ("replace", {"review": Q["flag"]}),
+    ("delete", {"flag": Q["flag"]}),
+    ("clear", {}),
+    ("choice to noul", {**Q, "dept": Q["flag"]}),
+    ("noul to choice", {**Q, "flag": Q["dept"]}),
+]
+for name, rewritten_questions in question_rewrites:
+    expected = _question_agent().predict_long(LONG, rewritten_questions)
+    actual, exc = _attempt(lambda: _question_agent().predict_long(
+        LONG, Q, on_predict_start=lambda ctx: setattr(ctx, "questions", rewritten_questions)))
+    check("questions/%s returns without error" % name, _kind(exc), None)
+    check("questions/%s matches directly requesting the final schema" % name, actual, expected)
+
+check("questions/no-op preserves the unhooked result",
+      _question_agent().predict_long(LONG, Q, on_predict_start=lambda ctx: None),
+      _question_agent().predict_long(LONG, Q))
+
+# An end hook may annotate only one window. Extra answers are not questions in the scan.
+def _annotate_first_window(ctx):
+    ctx.results[0]["answers"]["review"] = {"type": "noul", "noul": 0.9, "answer_confidence": 0.9}
+
+
+expected = _question_agent().predict_long(LONG, Q)
+actual, exc = _attempt(lambda: _question_agent().predict_long(LONG, Q, on_predict_end=_annotate_first_window))
+check("questions/a first-window end annotation preserves the scan's answers", actual, expected)
+check("questions/a first-window end annotation does not require other windows to match", _kind(exc), None)
+
+# The recorder must leave invalid input to predict_batch's existing question validation.
+for malformed in (None, [], {"bad": None}, {"bad": {}}, {"bad": {"type": "unknown"}}):
+    _, direct_exc = _attempt(lambda: _question_agent().system_one(LONG, malformed))
+    _, long_exc = _attempt(lambda: _question_agent().predict_long(LONG, malformed))
+    check("questions/invalid input keeps the validator's error: %r" % malformed,
+          (_kind(long_exc), str(long_exc)), (_kind(direct_exc), str(direct_exc)))
+
 # 8e. a hook that leaves nothing scores nothing: 0 windows and no answers, not a max() over []
 a = make_real_agent()
 with warnings.catch_warnings(record=True) as caught:
