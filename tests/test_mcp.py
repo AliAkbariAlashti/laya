@@ -13,6 +13,7 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 os.environ.setdefault("USE_TF", "0")
 os.environ.setdefault("USE_TORCH", "1")
