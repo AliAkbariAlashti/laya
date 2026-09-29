@@ -288,10 +288,14 @@ def _group_cases(cases: Sequence[Dict[str, Any]], key: str) -> Dict[str, List[Di
 
 
 def _percentiles(values: Sequence[float]) -> Tuple[float, float]:
-    """(median, 95th) using the nearest-rank rule the report has always used for latency."""
+    """(median, 95th) using the nearest-rank rule for latency."""
     ordered = sorted(values)
-    return (float(statistics.median(ordered)),
-            float(ordered[min(len(ordered) - 1, int(len(ordered) * 0.95))]))
+    n = len(ordered)
+    # Nearest-rank 95th percentile: the ceil(0.95 * n)-th smallest value (1-indexed).
+    # `int(n * 0.95)` truncated where it needed to round up, returning the
+    # (0.95n + 1)-th value whenever n is a multiple of 20. Integer ceil fixes that.
+    rank = (95 * n + 99) // 100
+    return (float(statistics.median(ordered)), float(ordered[rank - 1]))
 
 
 def _aggregate(cases: Sequence[Dict[str, Any]], evaluators: Sequence[Evaluator]) -> Dict[str, float]:
