@@ -387,6 +387,44 @@ def test_helpers():
     assert _env_bool("X_FLAG", True) is True
 
 
+def test_resolve_model_follows_the_router_registry(monkeypatch):
+    """A checkpoint added to laya.router must become pinnable over HTTP with no edit here.
+
+    serve used to keep two hand-copies of that registry -- a set of accepted names and a map of
+    published Hugging Face ids. Either copy left behind means a client that names a real
+    checkpoint is auto-routed instead, and the response reports whichever model did answer, so
+    the dropped pin is invisible from the outside. Only the name maps are read; nothing loads a
+    checkpoint.
+    """
+    from laya import router as router_mod
+
+    monkeypatch.setitem(router_mod.DEFAULT_MODELS, "spanish", (router_mod.BUNDLE_REPO, "spanish"))
+    monkeypatch.setitem(router_mod.STANDALONE_MODELS, "spanish", "convaiinnovations/laya-spanish")
+    monkeypatch.setitem(router_mod._ALIASES, "es", "spanish")
+
+    # The engine accepts the new name and its alias, which is the whole contract serve needs.
+    assert router_mod.normalise_name("spanish") == "spanish"
+    assert router_mod.normalise_name("es") == "spanish"
+
+    for named in ("spanish", "SPANISH", "es", "convaiinnovations/laya-spanish"):
+        assert _resolve_model(named) == "spanish", named
+
+    # And the pin reaches inference rather than stopping in the resolver.
+    client, fake = _client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, "model": "spanish"})
+    assert r.status_code == 200, r.status_code
+    assert fake.calls[-1]["model"] == "spanish", fake.calls[-1]
+
+    # Every standalone id the router publishes pins its checkpoint here -- except the bundle
+    # repo, whose documented meaning stays "let the Router choose".
+    for name, repo in router_mod.STANDALONE_MODELS.items():
+        want = None if repo == router_mod.BUNDLE_REPO else name
+        assert _resolve_model(repo) is want, repo
+
+    # A name the router does not know is still the caller's own model id: ignored, not an error.
+    assert _resolve_model("jev-1") is None
+
+
 def test_thread_limit(monkeypatch):
     pytest.importorskip("torch")
     monkeypatch.delenv("LAYA_THREADS", raising=False)

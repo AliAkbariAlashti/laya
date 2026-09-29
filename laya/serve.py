@@ -57,11 +57,6 @@ from typing import Any, Dict, Optional
 # propagates there without this module setting up any handlers.
 _log = logging.getLogger("laya.serve")
 
-# The three checkpoint names the router understands; used to decide whether a
-# client's `model` field names a Laya checkpoint (honour it) or is some other
-# Jev model id (ignore it and let the router auto-select).
-_KNOWN_MODELS = {"english", "multilingual", "typed-decisions"}
-
 # Guardrails for unauthenticated remote input. The state is tokenized once per
 # question and collated into one tensor, so an unbounded body can OOM the worker;
 # the single-worker pool means one large request would also starve /health.
@@ -80,13 +75,6 @@ MAX_TOTAL_OPTIONS = 512
 DEFAULT_MAX_CONCURRENT = 16
 # Server-side ceiling on per-request max_len/head_max_len token budget overrides.
 DEFAULT_MAX_TOKEN_BUDGET = 8192
-# Public Hugging Face ids, accepted so a client can name a checkpoint. The root bundle is
-# deliberately absent: the documented ``convaiinnovations/laya`` value means
-# "let the Router choose", rather than pinning the English checkpoint.
-_PUBLISHED_MODEL_IDS = {
-    "convaiinnovations/laya-multilingual": "multilingual",
-    "convaiinnovations/laya-typed-decisions": "typed-decisions",
-}
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -96,23 +84,39 @@ def _env_bool(name: str, default: bool) -> bool:
     return v.strip().lower() in ("1", "true", "yes", "on")
 
 
+def _published_model_ids() -> Dict[str, str]:
+    """Public Hugging Face ids accepted so a client can name a checkpoint.
+
+    Inverted from `laya.router.STANDALONE_MODELS` at call time rather than typed out: the
+    ids a client may send belong to that registry, and a copy here would silently auto-route
+    a checkpoint the router already knows. The root bundle is deliberately absent -- the
+    documented ``convaiinnovations/laya`` value means "let the Router choose", rather than
+    pinning the English checkpoint. Imported here rather than at module scope, the way this
+    module's other `laya.router` use does, so ``import laya.serve`` stays cheap.
+    """
+    from .router import BUNDLE_REPO, STANDALONE_MODELS
+
+    return {repo: name for name, repo in STANDALONE_MODELS.items() if repo != BUNDLE_REPO}
+
+
 def _resolve_model(model: Optional[str]) -> Optional[str]:
     """Map a client's `model` field onto a Laya checkpoint, or None to auto-route."""
     if not model:
         return None
-    published = _PUBLISHED_MODEL_IDS.get(str(model).strip().lower())
+    published = _published_model_ids().get(str(model).strip().lower())
     if published is not None:
         return published
     from .router import normalise_name
 
     # normalise_name raises ValueError on anything that is not a known checkpoint
-    # or alias. A Jev client's `model` field (e.g. "jev-1") is expected to miss;
-    # treat that as "no explicit checkpoint" and let the router auto-select.
+    # or alias, and returns a name from router.DEFAULT_MODELS when it does accept one --
+    # so it is the only list of accepted names this needs. A Jev client's `model` field
+    # (e.g. "jev-1") is expected to miss; treat that as "no explicit checkpoint" and let
+    # the router auto-select.
     try:
-        key = normalise_name(model)
+        return normalise_name(model)
     except Exception:
         return None
-    return key if key in _KNOWN_MODELS else None
 
 
 def _resolve_max_concurrent() -> int:
