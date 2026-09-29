@@ -56,29 +56,72 @@ def _extract_text(input_val: Any, state_key: Optional[Union[str, Callable[[Any],
         return input_val
 
     if isinstance(input_val, list):
+        text = _content_text(input_val)
+        if text is not input_val:
+            return text
         return _extract_from_messages_list(input_val)
 
     return str(input_val)
 
 
+def _content_text(val: Any) -> Any:
+    """The text of a message `content` value, unwrapped from a content-block list.
+
+    `content` is not only a string. A `HumanMessage(content=[{"type": "text", "text": ...}])`
+    is accepted by langchain-core and keeps `.content` as a list, so `str(content)` produced a
+    Python repr -- braces, quotes, and the literal field names `type` and `text` -- and that
+    repr is what Laya scored. Nothing raised; the guardrail simply answered about a string the
+    caller never wrote.
+
+    Text-bearing blocks are concatenated in the order they appear, which is how such a list is
+    meant to be read. A list carrying no text block is returned **unchanged**, so a genuinely
+    structured state still reaches the caller as the caller shaped it instead of being
+    flattened into invented prose; callers distinguish "extracted" from "unchanged" by identity.
+    A plain string is returned untouched.
+    """
+    if not isinstance(val, list):
+        return val
+    parts = []
+    for block in val:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    if not parts:
+        return val
+    return "".join(parts) if len(parts) == 1 else "\n".join(parts)
+
+
 def _extract_from_message_or_value(val: Any) -> Any:
     if hasattr(val, "content"):
-        return str(val.content)
+        return _content_text(val.content)
     if isinstance(val, list):
+        # a content-block list is already text; a list of messages is not
+        text = _content_text(val)
+        if text is not val:
+            return text
         return _extract_from_messages_list(val)
     return val
 
 
-def _extract_from_messages_list(msgs: Sequence[Any]) -> str:
+def _extract_from_messages_list(msgs: Sequence[Any]) -> Union[str, dict, list]:
+    # Not `-> str`. `_content_text` hands a content value back untouched when it holds no
+    # text block, so a message carrying only structured content returns that list, and a list
+    # entry with no `.content` returns the entry itself. Both are states `Agent._encode_state`
+    # already accepts (`state: Union[str, dict, list]`, documented as a conversation turn list),
+    # and the public `_extract_text` above already declares the same three types -- so this
+    # widens the annotation to match the behaviour, not the behaviour to match the annotation.
     if not msgs:
         return ""
     # Search backwards for the most recent human/user message
     for m in reversed(msgs):
         role = getattr(m, "type", None) or getattr(m, "role", None)
         if role in ("human", "user"):
-            return str(getattr(m, "content", m))
+            return _content_text(getattr(m, "content", m))
     last = msgs[-1]
-    return str(getattr(last, "content", last))
+    return _content_text(getattr(last, "content", last))
 
 
 class _SameOriginRedirectHandler(urllib.request.HTTPRedirectHandler):

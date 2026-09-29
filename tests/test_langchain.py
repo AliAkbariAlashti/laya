@@ -71,6 +71,123 @@ msgs = [
 check("extract/messages_list", _extract_text(msgs), "second human message")
 check("extract/dict_with_messages", _extract_text({"messages": msgs}), "second human message")
 
+
+# A message `content` is not only a string. langchain-core accepts
+# `HumanMessage(content=[{"type": "text", "text": ...}])` and keeps `.content` as a list, so
+# `str(content)` used to hand Laya a Python repr -- braces, quotes, and the literal field
+# names -- as the state to decide on. Nothing raised, so the guardrail just answered about a
+# string the caller never wrote. `DummyMessage` is the local stand-in for that shape.
+TXT = "I was billed twice for the same plan."
+BLOCKS = [{"type": "text", "text": TXT}]
+
+check("extract/blocks_human_message", _extract_text([DummyMessage("human", BLOCKS)]), TXT)
+check("extract/blocks_ai_message_fallback", _extract_text([DummyMessage("ai", BLOCKS)]), TXT)
+check("extract/blocks_newest_human_wins",
+      _extract_text([DummyMessage("human", BLOCKS), DummyMessage("ai", BLOCKS)]), TXT)
+check("extract/blocks_dict_messages",
+      _extract_text({"messages": [DummyMessage("human", BLOCKS)]}), TXT)
+check("extract/blocks_dict_content", _extract_text({"content": BLOCKS}), TXT)
+check("extract/blocks_dict_input", _extract_text({"input": BLOCKS}), TXT)
+check("extract/blocks_bare_list", _extract_text(BLOCKS), TXT)
+
+# Several text blocks are read in order; the separator is a newline so two sentences do not
+# fuse into one token the model reads differently than the caller wrote.
+check("extract/blocks_multiple_joined",
+      _extract_text([DummyMessage("human", [{"type": "text", "text": "first part."},
+                                            {"type": "text", "text": "second part."}])]),
+      "first part.\nsecond part.")
+
+# A block with no text carries nothing to score. Rather than invent prose, the value is
+# passed through as the caller shaped it, so a structured state stays structured.
+check("extract/blocks_non_text_only_preserved",
+      _extract_text([DummyMessage("human", [{"type": "image_url", "image_url": {"url": "x"}}])]),
+      [{"type": "image_url", "image_url": {"url": "x"}}])
+check("extract/blocks_empty_list_preserved", _extract_text([]), "")
+
+# Mixed blocks: only the text-bearing ones are read, and their order is kept.
+check("extract/blocks_mixed_skips_non_text",
+      _extract_text([DummyMessage("human", [{"type": "image_url", "image_url": {"url": "x"}},
+                                            {"type": "text", "text": TXT}])]),
+      TXT)
+
+# --- why `block.get("text")` is not too broad -------------------------------------------
+# A dict block is read on the strength of its `text` field, with no `type` gate. That is safe
+# against langchain-core's own vocabulary rather than by luck: of the standard content blocks,
+# exactly two declare a `text` field -- TextContentBlock (`type: "text"`) and
+# PlainTextContentBlock (`type: "text-plain"`, a document body). Every other one carries its
+# payload elsewhere or not at all: image/video/audio/file hold `url`/`base64`/`file_id`,
+# ReasoningContentBlock holds `reasoning`, NonStandardContentBlock holds `value`, and the
+# tool-call and server-tool blocks hold `name`/`args`/`id`. None of them has a `text` field, so
+# there is no standard non-text block this heuristic can mistake for prose.
+#
+# The check below fails if a future langchain-core adds a non-text block that does declare one.
+# That is the moment to gate on `type` -- and the reason to have the check rather than a
+# comment asserting the vocabulary cannot change.
+#
+# Guarded because this suite is written to run *without* langchain-core installed: `DummyMessage`
+# stands in for a real message throughout, and the Windows job does not install the optional
+# dependency. An unguarded import here aborts the whole file at import time, taking the other
+# 200+ checks with it -- the same shape as the `decision/lcel` block at the end of this file.
+try:
+    try:  # module layout moved between langchain-core versions
+        from langchain_core.messages import content_blocks as _cb
+    except ImportError:
+        import importlib
+        _cb = importlib.import_module("langchain_core.messages.content")
+except ImportError:
+    _cb = None
+
+if _cb is None:
+    PASS.append("std/block-vocabulary skipped (langchain-core not installed)")
+else:
+    _TEXT_BEARING = sorted(n for n in dir(_cb)
+                           if isinstance(getattr(_cb, n, None), type)
+                           and n.endswith(("Block", "Result", "Annotation", "Call"))
+                           and "text" in (getattr(getattr(_cb, n), "__annotations__", {}) or {}))
+    check("std/only_two_standard_blocks_declare_a_text_field",
+          _TEXT_BEARING, ["PlainTextContentBlock", "TextContentBlock"])
+
+# A `type` gate would also be a regression in the other direction: langchain-core accepts a
+# text block that carries no discriminator at all, and it keeps `.content` as a list.
+for _shape, _label in (([{"text": TXT}], "untyped_text_block"),
+                       ([{"type": "text-plain", "text": TXT}], "text_plain_block")):
+    check("extract/blocks_%s" % _label, _extract_text([DummyMessage("human", _shape)]), TXT)
+
+# A `text` field that is not a string is payload, not prose, and must not be flattened.
+check("extract/blocks_non_string_text_is_not_prose",
+      _extract_text([DummyMessage("human", [{"type": "x", "text": {"nested": 1}}])]),
+      [{"type": "x", "text": {"nested": 1}}])
+
+# --- the return annotation has to admit what the function can actually return -------------
+# `_content_text` passes a content value back untouched when it holds no text block, so this
+# helper returns a list for a message carrying only structured content, and the entry itself
+# for a list entry with no `.content`. Both are accepted by `Agent._encode_state`
+# (`state: Union[str, dict, list]`) and already declared by the public `_extract_text`. An
+# annotation of `-> str` was therefore wrong, and could drift back unnoticed without this.
+import typing as _typing  # noqa: E402
+
+# `langchain_module` is the module this file already imports; `_extract_from_messages_list` is
+# private, so it is reached through the module rather than the from-import above.
+_ANNOTATED = _typing.get_type_hints(langchain_module._extract_from_messages_list).get("return")
+if _typing.get_origin(_ANNOTATED) is _typing.Union:
+    _ALLOWED = _typing.get_args(_ANNOTATED)
+else:  # a bare annotation admits only that one type
+    _ALLOWED = (_ANNOTATED,)
+
+_RUNTIME = [
+    (str, [DummyMessage("human", "plain")]),
+    (str, [DummyMessage("human", [{"type": "text", "text": TXT}])]),
+    (list, [DummyMessage("human", [{"type": "image_url", "image_url": {"url": "x"}}])]),
+    (list, [DummyMessage("ai", "prior"), DummyMessage("human", [{"type": "file", "file_id": "f"}])]),
+    (dict, [{"kind": "a"}, {"kind": "b"}]),
+    (str, []),
+]
+for _want, _msgs in _RUNTIME:
+    _got = langchain_module._extract_from_messages_list(_msgs)
+    check("contract/messages_list_returns_%s" % _want.__name__, _got.__class__, _want)
+    check("contract/annotation_admits_%s" % _want.__name__,
+          _got.__class__ in _ALLOWED, True)
+
 # Custom callable extractor
 check("extract/custom_callable", _extract_text({"custom": "special"}, lambda x: x["custom"].upper()), "SPECIAL")
 
