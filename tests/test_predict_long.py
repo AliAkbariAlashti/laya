@@ -170,6 +170,53 @@ check("long/noul names the deciding window", res["answers"]["flag"]["window"]["i
 check("long/window start is the 3rd overlap offset", res["answers"]["dept"]["window"]["token_start"], 72)
 check("long/window carries the count", res["answers"]["flag"]["window"]["count"], nwin)
 
+
+# 2b. a per-question usage field is merged across windows, not replaced
+# `usage["options"]` is a dict keyed by question id, set only on the windows where option
+# spans actually collapsed. The deciding window is the most confident one, so it is not
+# necessarily the last window that collapsed: replacing instead of merging reported a
+# collapse for a window that did not decide and dropped the deciding window's own record.
+def collapsing(states, q):
+    # window 0 collapses dept and is the most confident; every later window collapses flag,
+    # so the last collapsing window is not the deciding one
+    out = []
+    for i, _ in enumerate(states):
+        conf = 0.9 if i == 0 else 0.4
+        which = "dept" if i == 0 else "flag"
+        total, distinct = (58, 42) if which == "dept" else (30, 12)
+        opt = {which: {"total": total, "distinct": distinct, "tokens_per_option": 0.5}}
+        out.append({"answers": {
+            "dept": {"type": "choice", "choice": "b" if i == 0 else "a",
+                     "probabilities": {"a": 1 - conf, "b": conf}, "confidence": conf,
+                     "answer_confidence": conf, "action": {"act_probability": 1.0}},
+            "flag": {"type": "noul", "noul": 0.9 if i == 0 else 0.1, "confidence": conf,
+                     "answer_confidence": conf, "action": {"act_probability": 1.0}},
+        }, "usage": {"input_tokens": 10, "options": opt}})
+    return out
+
+
+_seen_windows = []
+
+
+def collapsing_capturing(states, q, **kw):
+    _seen_windows.extend(states)
+    return collapsing(states, q, **kw)
+
+
+a = make_agent(collapsing_capturing)
+res = a.predict_long({"body": "y" * 300}, Q)
+opts = res["usage"].get("options") or {}
+nwin = len(_seen_windows)
+decided = res["answers"]["dept"]["window"]["index"]
+check("collapse/records from more than one window survive", sorted(opts), ["dept", "flag"])
+check("collapse/the deciding window is the confident first one", decided, 0)
+check_true("collapse/which is not the last window scanned", decided != nwin - 1, [decided, nwin])
+check("collapse/so the deciding window's own record is reported", opts.get("dept"), {
+    "total": 58, "distinct": 42, "tokens_per_option": 0.5})
+check("collapse/a later non-deciding window is reported too", opts.get("flag"), {
+    "total": 30, "distinct": 12, "tokens_per_option": 0.5})
+check("collapse/numerics still sum across every window", res["usage"]["input_tokens"], 10 * nwin)
+
 # 3. only aggregate="auto" is supported
 a = make_agent(canned)
 check_raises("aggregate/rejects unknown mode", ValueError,

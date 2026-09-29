@@ -177,6 +177,42 @@ check_true("aggregate/the fixture actually varies across windows (parity is not 
            len({pw["answers"]["dept"]["answer_confidence"] for pw in per_window}) > 1)
 
 
+# ------------------------------------------------- per-question usage fields merge across windows
+# `usage["options"]` is a dict keyed by question id and is set only on windows where option
+# spans collapsed, so it is a per-question record rather than a scalar counter. Replacing it
+# per window left the caller holding whichever collapsing window came last, and the deciding
+# window is the most confident one rather than the last one. Every window is given a record
+# keyed by its own index, so the aggregate must keep all of them.
+_onnx = _bare_onnx()
+_orig_batch = _onnx.predict_batch
+_scan = []
+
+
+def _with_collapse(sts, q, **kw):
+    _scan.extend(sts)
+    rows = _orig_batch(list(sts), q, **kw)
+    for i, row in enumerate(rows):
+        row["usage"] = dict(row["usage"])
+        row["usage"]["options"] = {"w%d" % i: {"total": 10 + i, "distinct": i + 1,
+                                               "tokens_per_option": 0.5}}
+    return rows
+
+
+_onnx.predict_batch = _with_collapse
+_merged = _onnx.predict_long(LONG_STATE, QUESTIONS)
+_seen = _merged["usage"].get("options") or {}
+_nwin = len(_scan)
+_won = _merged["answers"]["dept"]["window"]["index"]
+check("collapse/every window record survives the merge",
+      sorted(_seen), sorted("w%d" % i for i in range(_nwin)))
+check_true("collapse/the deciding window kept its own record",
+           "w%d" % _won in _seen, sorted(_seen))
+check("collapse/record contents are carried per window, not summed",
+      [_seen.get("w%d" % i, {}).get("total") for i in range(_nwin)],
+      [10 + i for i in range(_nwin)])
+check_true("collapse/more than one window, so this is a real test", _nwin > 1, _nwin)
+
+
 # ---------------------------------------------------------------- shared session runs and chunking
 shared = _bare_onnx()
 shared.predict_long(LONG_STATE, QUESTIONS)

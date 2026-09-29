@@ -1422,13 +1422,26 @@ class Agent(HookRegistry):
                                  "token_end": min(starts[best] + budget, len(state_ids)),
                                  "count": len(results)}
             answers[qid] = ans
-        # Aggregate usage generically so fields predict_batch may grow later (e.g. the fallback
-        # counters from #351) are propagated, not silently dropped: sum numeric fields across
-        # windows, carry any non-numeric field through, then record the window count.
+        # Aggregate usage generically so fields predict_batch may grow later (e.g. the
+        # fallback counters from #351) are propagated, not silently dropped: sum numeric
+        # fields across windows, merge the per-question records, then record the window
+        # count.
+        # A per-question field has to be merged rather than replaced. `usage["options"]` is a
+        # dict keyed by question id, set only on the windows where option spans actually
+        # collapsed, so replacing it left the caller holding whichever collapsing window came
+        # last. The deciding window is the most confident one, not the last one, so that could
+        # report a collapse for a window that did not decide while the deciding window's own
+        # record was gone.
         usage: Dict[str, Any] = {}
         for r in results:
             for key, val in r["usage"].items():
-                usage[key] = (usage.get(key, 0) + val) if isinstance(val, (int, float)) else val
+                prev = usage.get(key)
+                if isinstance(val, (int, float)):
+                    usage[key] = (prev if isinstance(prev, (int, float)) else 0) + val
+                elif isinstance(val, dict) and isinstance(prev, dict):
+                    usage[key] = {**prev, **val}
+                else:
+                    usage[key] = val
         usage["output_tokens"] = 0
         usage["windows"] = len(results)
         return {"model": "laya-rl-agent", "answers": answers, "usage": usage}
