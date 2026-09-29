@@ -86,8 +86,16 @@ describe("audit regressions", () => {
     expect(check(["yes", { k: 1 }])).toThrow("choice label 1 is a dict");
     expect(check([["y", ["z"]], "no"])).toThrow("choice label 0 is a list");
     expect(check(["a", "b", [1]])).toThrow('question "q": choice label 2 is a list');
-    expect(check(["a", 1, true, null, 2.5])).not.toThrow();
+    expect(check(["a", 1, true, "", 2.5])).not.toThrow();
     expect(() => checkQuestion("q", { type: "choice", instructions: "?", criteria: { a: "x", b: { d: 1 } } })).not.toThrow();
+  });
+
+  it("rejects a null choice label, as Python does (#508)", () => {
+    const check = (criteria: unknown[]) => () => checkQuestion("q", { type: "choice", instructions: "?", criteria });
+    expect(check(["billing", null])).toThrow('question "q": choice label 1 is null');
+    expect(check([undefined, "a"])).toThrow("choice label 0 is null");
+    expect(check(["a", , "b"])).toThrow("choice label 1 is null");
+    expect(() => checkQuestion("q", { type: "choice", instructions: "?", criteria: { a: null, b: null } })).not.toThrow();
   });
 
   it("rejects malformed provider output", async () => {
