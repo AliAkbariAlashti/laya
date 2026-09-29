@@ -285,20 +285,56 @@ conditions were fixed before the 10-state run:
 The tightest margin is the english first-slot rate, at 0.054 against the 0.05 rule.
 An order-invariant checkpoint sits at exactly 0.333 on that check.
 
+### Other languages
+
+`--lang` runs both checks on fixed states in Japanese, Korean, Hindi or Turkish (#602).
+Each set translates the ten English states one for one, with the level texts in the
+same language. Every state routes to `multilingual` under `Router`: Japanese, Korean
+and Hindi by script, Turkish by its non-English letters. The run prints the checkpoint
+`Router` picks for each language. Korean, Hindi and Turkish are among the languages
+whose per-language MASSIVE gains the multilingual model card lists, and they cover
+three routing paths (Hangul, Devanagari, Latin with diacritics). Japanese is where
+#131 was found. The gates are the English ones. Without `--lang` the run and its report are
+unchanged.
+
+```bash
+python research/eval/presentation_checks.py --model convaiinnovations/laya \
+    --subfolder multilingual --lang ja,ko,hi,tr --out langs.json
+```
+
+CPU, fp32, `convaiinnovations/laya@55cf4c4` (subfolder `multilingual`), laya 0.3.21.
+Full output: `research/results/presentation_checks_langs.json`. The same run without
+`--lang` reproduces the English row above exactly.
+
+| language | `score_slot0_identical` (leave-one-out) | `score_first_slot_permuted` (leave-one-out) | parity max \|Δp\| |
+|---|---|---|---|
+| `ja` | −0.018 (−0.120 .. +0.031) PASS | **0.000** (0.000 .. 0.000) FAIL | 4.68e-5 |
+| `ko` | **−0.570** (−0.622 .. −0.506) FAIL | **0.050** (0.019 .. 0.056) FAIL | 4.97e-5 |
+| `hi` | **−0.225** (−0.300 .. −0.182) FAIL | **0.067** (0.037 .. 0.074) FAIL | 4.91e-5 |
+| `tr` | +0.139 (+0.068 .. +0.174) PASS | **0.033** (0.019 .. 0.037) FAIL | 4.95e-5 |
+
+The first-slot check fails in all four languages, as it does in English. The
+identical-option control passes in Japanese and Turkish, so on those states it would
+not catch the prior on its own. That is the case for running both checks in every
+language.
+
 ### Tests
 
 `research/eval/test_presentation_checks.py` runs offline, with scripted logits in
 place of a checkpoint:
 
 ```bash
-python research/eval/test_presentation_checks.py     # 69 passed, 0 failed
+python research/eval/test_presentation_checks.py     # 154 passed, 0 failed
 ```
 
 It pins the fixed inputs and both gates. It checks that the identical-option
 questions render as `level i: <same text>`, and that every level sits in every slot
 exactly twice. It also checks the metric arithmetic by hand, the leave-one-out
 bounds, the one-sided gates, and the exit codes. A scripted slot-0 hole fails both
-checks, and an order-invariant model scores exactly 1/3.
+checks, and an order-invariant model scores exactly 1/3. For each language it
+pins ten distinct states, three levels in every slot twice, and routing to
+`multilingual`. It also checks the `--lang` parsing. The default run gives the same
+report as `lang="en"`.
 
 ### Limits
 
@@ -312,8 +348,10 @@ checks, and an order-invariant model scores exactly 1/3.
   (multilingual: −0.75 / −0.52 / −0.25 and −0.58 / −0.47 / −0.37.)
 * Passing is not accuracy. A checkpoint can clear both gates and still rank urgency
   badly; this checks one known failure, not `score` quality.
-* English only, `score` only, 10 states. The states are short support messages, so a
-  checkpoint's behaviour on long inputs or other languages is not covered here.
+* `score` only, 10 states per language. The states are short support messages, so a
+  checkpoint's behaviour on long inputs is not covered here. The Korean, Hindi and
+  Turkish states and levels were written by a non-native speaker; corrections from
+  native speakers are welcome.
 * Thresholds were set on CPU fp32. On CUDA, `Agent` runs the forward pass under
   reduced-precision autocast and `score_cases` does not. The parity check reports that
   difference instead of hiding it.
