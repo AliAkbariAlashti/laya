@@ -293,14 +293,6 @@ jobs:
 
       # Same suites as the Linux job. Guarded with -f so a suite added by another open branch
       # cannot make this job red on a tree that does not have it yet.
-      #
-      # test_docker_entrypoint is skipped here on purpose. It drives docker/entrypoint.py, which
-      # only ever runs inside a Linux container, through `os.execvp`. On Windows exec* rebuilds
-      # the command line from argv without re-applying the quoting `subprocess` used to build it,
-      # so its `-c "<script>"` argument arrives split at the first space and the child dies with
-      # "SyntaxError: invalid syntax" before printing. The environment passthrough the suite
-      # exists to check is unaffected, and switching the entrypoint to `subprocess.run` makes it
-      # pass -- a change to a container script, so it belongs in its own PR, not this one.
       - name: Routing and language-detection tests
         run: |
           for t in test_router test_criteria test_batch test_predict_long \
@@ -316,10 +308,6 @@ jobs:
                    test_langchain test_portability test_training \
                    test_example_server_limits test_blank_lang_routing \
                    test_export_onnx_safety test_load_errors test_revision_pinning; do
-            if [ "$t" = "test_docker_entrypoint" ]; then
-              echo "skipping $t: docker/entrypoint.py is Linux-container only"
-              continue
-            fi
             if [ -f "tests/$t.py" ]; then python "tests/$t.py"; fi
           done
         shell: bash
