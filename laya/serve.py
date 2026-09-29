@@ -205,11 +205,17 @@ def _resolve_port() -> int:
 _STATE_PROBE_VALUES = 64
 
 
-def _provably_over_state_limit(state: Any, cap: int) -> bool:
-    """Whether `state` **provably** serializes past `cap`, without serializing it.
+def _state_length_lower_bound_over(state: Any, cap: int) -> int:
+    """A measured lower bound on the serialized length, if it already exceeds `cap`; else 0.
 
-    Returns True only when that is certain, and False for "not proven" -- never the other way round,
-    so a False sends the state on to the exact `json.dumps` measurement and the verdict is unchanged.
+    Non-zero only when exceeding `cap` is certain, and 0 for "not proven" -- never the other way
+    round, so a 0 sends the state on to the exact `json.dumps` measurement and no verdict changes.
+
+    The value is returned rather than a bool so the 413 can quote a number something measured. It
+    understates the true length (see below), so the message is a true statement about the state --
+    unlike reporting `cap + 1`, which would answer "state too large (50001 > 50000 chars)" for a
+    60 012-character state. That is the same fabricated-count flaw this gate replaces, and an
+    earlier revision of this branch reintroduced it.
 
     The bound: the raw lengths of the string values are a *lower* bound on the JSON length. Escaping
     maps each character to one or more characters and so never shortens; keys, separators, brackets
@@ -233,14 +239,14 @@ def _provably_over_state_limit(state: Any, cap: int) -> bool:
         if isinstance(item, str):
             total += len(item)
             if total > cap:
-                return True
+                return total
         elif isinstance(item, dict):
             # `.values()` and `extend` stay at C level; the keys are ignored, which keeps this a
             # lower bound. Iterating items in Python here made a 2000-key state 1.66x slower.
             stack.extend(item.values())
         elif isinstance(item, (list, tuple)):
             stack.extend(item)
-    return False
+    return 0
 
 
 def _state_length(state: Any) -> int:
@@ -274,11 +280,12 @@ def _state_length(state: Any) -> int:
 
     if isinstance(state, str):
         return len(state)  # `serialize_state` returns a string state unchanged
-    if _provably_over_state_limit(state, MAX_STATE_CHARS):
-        # Already over on a lower bound, so serializing the rest cannot change the verdict. The
-        # number reported is the bound rather than the true length, which is why the message says
-        # "over" instead of quoting a total it did not measure.
-        return MAX_STATE_CHARS + 1
+    over = _state_length_lower_bound_over(state, MAX_STATE_CHARS)
+    if over:
+        # Already past the cap on a lower bound, so serializing the rest cannot change the verdict.
+        # The bound is what gets reported: it is a measured number and it understates, so the 413
+        # never claims a length larger than the state really has.
+        return over
     try:
         return len(json.dumps(state, ensure_ascii=False))
     except (TypeError, ValueError, RecursionError):

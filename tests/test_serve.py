@@ -1150,6 +1150,21 @@ def test_the_probe_verdict_always_matches_the_exact_measurement():
             assert probed == exact
 
 
+def test_the_early_refusal_reports_a_number_it_measured():
+    """The 413 must not invent a count. Reporting `cap + 1` would answer "50001 > 50000" for a
+    60 012-character state -- the same fabricated count this gate was written to remove.
+    """
+    import laya.serve as serve_mod
+    cap = serve_mod.MAX_STATE_CHARS
+    for state in ({"body": "x" * 60000}, {"body": "y" * (2 * 1024 * 1024)}, {"a": ["z" * 80000]}):
+        exact = len(json.dumps(state, ensure_ascii=False))
+        reported = serve_mod._state_length(state)
+        assert reported > cap, reported
+        assert reported != cap + 1, "the refusal reported cap+1, a number nothing measured"
+        assert reported <= exact, \
+            "reported %d for a state of %d characters -- a 413 must never overstate" % (reported, exact)
+
+
 def test_the_probe_is_bounded_and_falls_through_rather_than_guessing():
     """The probe examines a constant number of values, so it can never become the expensive step.
 
@@ -1159,5 +1174,5 @@ def test_the_probe_is_bounded_and_falls_through_rather_than_guessing():
     import laya.serve as serve_mod
     assert serve_mod._STATE_PROBE_VALUES <= 256
     wide = {("k%06d" % i): "x" for i in range(200000)}
-    assert serve_mod._provably_over_state_limit(wide, serve_mod.MAX_STATE_CHARS) is False
+    assert serve_mod._state_length_lower_bound_over(wide, serve_mod.MAX_STATE_CHARS) == 0
     assert serve_mod._state_length(wide) == len(json.dumps(wide, ensure_ascii=False))
