@@ -20,7 +20,9 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 from laya.serve import (  # noqa: E402
     DEFAULT_MAX_TOKEN_BUDGET,
     MAX_BODY_BYTES,
+    MAX_STATE_CHARS,
     _apply_thread_limit,
+    _check_request_limits,
     _env_bool,
     _resolve_max_token_budget,
     _resolve_max_loaded,
@@ -1274,3 +1276,265 @@ def test_inference_timing_headers_absent_on_error():
     assert "Server-Timing" not in res.headers
     assert "X-Inference-Time-Ms" not in res.headers
 
+
+# --------------------------------------------------------------------------- #
+# The state-size gate has to measure the text that reaches the tokenizer
+# --------------------------------------------------------------------------- #
+
+# Two dict states whose `str()` and whose `serialize_state()` are different lengths, which is
+# what the gate measured wrongly. The numbers are exact rather than approximate: if either one
+# moves, the divergence these checks pin has moved with it.
+_QUOTE_STATE = {"body": '"' * 49988}       # len(str()) == 50000, serialized == 99988
+_ZWSP_STATE = {"body": "\u200b" * 8332}    # len(str()) == 50004, serialized == 8344
+
+
+def _serialized_len(state):
+    """The length `laya.common.serialize_state` produces, without importing torch."""
+    return len(json.dumps(state, ensure_ascii=False))
+
+
+def test_the_gate_counts_the_json_the_tokenizer_will_see(monkeypatch):
+    """`repr` leaves a `"` inside a value one character; JSON escapes it to two.
+
+    So a state sitting exactly on the 50000-character gate was tokenized as 99988 characters --
+    the documented limit admitting very nearly twice what it says.
+    """
+    assert len(str(_QUOTE_STATE)) == MAX_STATE_CHARS   # exactly at a repr-measured gate
+    assert _serialized_len(_QUOTE_STATE) == 99988      # what build_sequence would encode
+    client, fake = _client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, "state": _QUOTE_STATE})
+    assert r.status_code == 413
+    assert r.json()["detail"] == "state too large (99988 > %d chars)" % MAX_STATE_CHARS
+    assert fake.calls == []                            # refused before inference, as intended
+
+
+def test_a_state_a_sixth_of_the_limit_is_not_refused_for_its_repr(monkeypatch):
+    """The same mismatch the other way: `repr` escapes a zero-width space to six characters.
+
+    `ensure_ascii=False` writes the one character it is, so this state serializes to 8344 --
+    and was answered "state too large (50004 > 50000 chars)".
+    """
+    assert len(str(_ZWSP_STATE)) == 50004              # over a repr-measured gate
+    assert _serialized_len(_ZWSP_STATE) == 8344        # a sixth of the limit, once serialized
+    client, fake = _client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, "state": _ZWSP_STATE})
+    assert r.status_code == 200
+    assert fake.calls[0]["state"] == _ZWSP_STATE       # reached inference unchanged
+
+
+# Deliberately states whose `repr` and whose JSON are the same length, so these four answer the
+# same before and after the fix. They are here to pin what must NOT move: the limit still admits a
+# state that sits exactly on it and still refuses one character more.
+# The explicit ids are required, not cosmetic. pytest builds each case's node id out of the
+# parameter value, and writes that node id into the PYTEST_CURRENT_TEST environment variable -- a
+# 50 000-character state produces a 50 084-character id, and a Windows environment variable cannot
+# exceed 32 767 characters, so every case errors at teardown with
+# `ValueError: the environment variable is longer than 32767 characters`. It passes on Linux, which
+# has no comparable per-variable limit. `b"[" * 100000` in this file carries an id for the same
+# reason.
+@pytest.mark.parametrize("state, expected", [
+    # str() and JSON are both exactly 50000
+    pytest.param({"body": "a" * 49988}, 200, id="dict-exactly-at-the-limit"),
+    # both exactly one character over
+    pytest.param({"body": "a" * 49989}, 413, id="dict-one-character-over"),
+    # a string state is its own serialization
+    pytest.param("A" * MAX_STATE_CHARS, 200, id="str-exactly-at-the-limit"),
+    pytest.param("A" * (MAX_STATE_CHARS + 1), 413, id="str-one-character-over"),
+])
+def test_the_declared_limit_is_the_limit_for_ordinary_states(monkeypatch, request, state, expected):
+    # Asserted here rather than left to the Windows job: pytest writes this node id into
+    # PYTEST_CURRENT_TEST, where Windows caps a variable at 32 767 characters, so dropping the
+    # explicit ids above turns every case in this test into a teardown error -- on Windows only.
+    # This assertion fails on any platform, so the ids cannot be lost without CI saying so.
+    assert len(request.node.nodeid) < 32767, \
+        "node id is %d characters; give this parameter an explicit short id" % len(request.node.nodeid)
+    client, _ = _client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, "state": state})
+    assert r.status_code == expected
+
+
+def test_the_gate_agrees_with_the_function_that_feeds_the_tokenizer():
+    """Pin serve.py's inline `json.dumps` to `serialize_state` itself.
+
+    serve.py cannot import it -- `laya.common` imports torch at module level and
+    `import laya.serve` must not (tests/test_lazy_import.py) -- so the mirror is held here
+    instead. Looked up rather than imported at module scope so that a serve.py without the
+    helper fails this one check instead of aborting the suite's import.
+    """
+    import laya.serve as serve_mod
+
+    state_length = getattr(serve_mod, "_state_length", None)
+    assert state_length is not None, "laya.serve no longer measures the state through _state_length"
+    serialize_state = pytest.importorskip("laya.common").serialize_state
+    for state in (_QUOTE_STATE, _ZWSP_STATE, "plain text", {}, [],
+                  {"a": {"b": ["c", 1, 1.5, None, True]}},
+                  ["\u4e2d\u6587", '"', "'", "\n", "\x00", "\U0001f600"],
+                  # A non-BMP format character is the widest divergence a client can send: `repr`
+                  # writes it as the ten characters `\U000e0001`, `ensure_ascii=False` as one.
+                  {"tag": "\U000e0001" * 10},
+                  {"d": "it's", "q": 'say "hi"'}):
+        assert state_length(state) == len(serialize_state(state)), state
+
+
+@pytest.fixture
+def default_int_digits():
+    """Pin CPython's int-to-str digit guard for the tests that rely on it.
+
+    The guard defaults to 4300 but is operator-configurable (`PYTHONINTMAXSTRDIGITS`,
+    `sys.set_int_max_str_digits`). With it switched off, `json.dumps(10 ** 4300)` succeeds and
+    `json.loads` accepts a 4301-digit body, so these two tests fail while the code under test stays
+    correct -- verified: `PYTHONINTMAXSTRDIGITS=0` turns both of them red on an unmodified tree. A
+    test that depends on an operator's setting is measuring the environment, not the change.
+    """
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(4300)
+    try:
+        yield
+    finally:
+        sys.set_int_max_str_digits(previous)
+
+
+def test_an_unserializable_state_is_a_400_not_a_count_nothing_measured(default_int_digits):
+    """The old `except Exception` answered 413 "state too large (50001 > 50000 chars)".
+
+    That reported a length nothing had measured, for a state that may be a few bytes. These
+    states are unreachable over HTTP -- `json.loads` builds only JSON types -- but they are
+    what an in-process caller of this helper can pass, and on the old path a state
+    `serialize_state` cannot render passed the gate and failed later as a 500.
+    """
+    from fastapi import HTTPException
+
+    # 10 ** 4300 has 4301 digits, one past CPython's int-to-str limit, and is built by
+    # arithmetic because `int("1" * 4301)` would hit that same limit while parsing.
+    for state in ({1, 2}, 10 ** 4300, {"n": 10 ** 4300}, [10 ** 4300]):
+        with pytest.raises(HTTPException) as exc:
+            _check_request_limits(state, REQ["questions"])
+        assert exc.value.status_code == 400
+        # The whole detail, so a count nothing measured cannot creep back into it.
+        assert exc.value.detail == "'state' must be JSON-serializable"
+
+
+def test_an_oversized_integer_state_never_reaches_the_gate(monkeypatch, default_int_digits):
+    """Why the 400 above is not an HTTP-reachable case: the parser refuses the body first."""
+    client, fake = _client(monkeypatch)
+    r = client.post("/v1/systemone",
+                    content=b'{"state": ' + b"1" * 4301 + b', "questions": {}}',
+                    headers={"content-type": "application/json"})
+    assert r.status_code == 400
+    assert r.json()["detail"] == "request body must be valid JSON"
+    assert fake.calls == []
+
+
+# --- the lower-bound probe in front of the exact measurement ---------------------------------
+
+def test_the_probe_refuses_an_oversized_value_without_serializing_the_state(monkeypatch):
+    """An oversized state is refused without the 2 MiB dump whose result cannot change the verdict.
+
+    This is the check that goes red if `_state_length_lower_bound_over` is removed: without it the gate
+    still answers 413, so the *absence of the dump* is the only observable difference.
+    """
+    import laya.serve as serve_mod
+
+    calls = []
+    real_dumps = json.dumps
+
+    def counting_dumps(obj, **kw):
+        calls.append(kw)
+        return real_dumps(obj, **kw)
+
+    # Scoped to the module's own binding: `serve_mod.json` IS the stdlib module, so patching an
+    # attribute on it would replace `json.dumps` for the whole process for the test's duration.
+    monkeypatch.setattr(serve_mod, "json", SimpleNamespace(dumps=counting_dumps))
+    # F2: a conversation LIST is this library's dominant state shape, and the probe's list branch
+    # can be deleted with every other check still green unless one of these is list-shaped.
+    for state in ({"body": "a" * (2 * 1024 * 1024)},
+                  ["z" * 60000],
+                  [{"role": "user", "content": "x" * 70000}],
+                  ({"role": "user", "content": "x" * 70000},)):
+        calls.clear()
+        assert serve_mod._state_length(state) > serve_mod.MAX_STATE_CHARS, state.__class__.__name__
+        assert calls == [], "a %s state was serialized although one value already exceeds the cap" \
+            % type(state).__name__
+
+
+def test_the_probe_verdict_always_matches_the_exact_measurement():
+    """The probe may only report "provably over"; its verdict must never differ from the encoder's.
+
+    An unsound probe would be a security bug in the same family as the one this PR fixes, so the two
+    are compared across shapes placed deliberately on both sides of the limit -- including the
+    escape-heavy values where `repr` and JSON diverge, which is what the gate exists for.
+    """
+    import laya.serve as serve_mod
+    cap = serve_mod.MAX_STATE_CHARS
+    shapes = []
+    for ch in ("a", '"', "\u200b", "\U000e0001", "\n", "\\", "\u4e2d"):
+        for n in (1, 100, cap // 2, cap - 1, cap, cap + 1, cap * 2):
+            shapes.append({"body": ch * n})
+            shapes.append([ch * n])
+            shapes.append({"a": {"b": [ch * n]}})
+    shapes += [
+        {("k%05d" % i): "v" for i in range(3000)},
+        {("k%05d" % i): "v" * 40 for i in range(3000)},
+        [{"role": "user", "content": "hi"} for _ in range(4000)],
+        {"n": 1, "f": 1.5, "t": True, "z": None},
+        {},
+        [],
+    ]
+    assert len(shapes) == 7 * 7 * 3 + 6, len(shapes)
+    for state in shapes:
+        exact = len(json.dumps(state, ensure_ascii=False))
+        probed = serve_mod._state_length(state)
+        assert (probed > cap) == (exact > cap), \
+            "probe and encoder disagree for a %d-character state" % exact
+        if exact <= cap:
+            # Stronger than agreeing on the verdict: under the cap the *exact* length is returned,
+            # so the 413 message keeps quoting a number something actually measured.
+            assert probed == exact
+
+
+def test_the_early_refusal_reports_a_number_it_measured():
+    """The 413 must not invent a count. Reporting `cap + 1` would answer "50001 > 50000" for a
+    60 012-character state -- the same fabricated count this gate was written to remove.
+    """
+    import laya.serve as serve_mod
+    cap = serve_mod.MAX_STATE_CHARS
+    # `cap + 1` is NOT the tell: {"body": "a" * 50001} legitimately sums to exactly that. The
+    # property that distinguishes a measured bound from a fabricated one is `cap < reported <= exact`.
+    for state in ({"body": "x" * 60000}, {"body": "y" * (2 * 1024 * 1024)}, {"a": ["z" * 80000]},
+                  {"body": "a" * (cap + 1)}, ["w" * 60000]):
+        exact = len(json.dumps(state, ensure_ascii=False))
+        reported = serve_mod._state_length(state)
+        assert reported > cap, reported
+        assert reported <= exact, \
+            "reported %d for a state of %d characters -- a 413 must never overstate" % (reported, exact)
+
+
+def test_the_probe_is_bounded_and_falls_through_rather_than_guessing():
+    """The probe examines a constant number of values, so it can never become the expensive step.
+
+    A state of 200 000 small values is not provably over within that budget, and must fall through
+    to the encoder rather than be refused on a partial sum.
+    """
+    import laya.serve as serve_mod
+    assert serve_mod._STATE_PROBE_VALUES <= 256
+    wide = {("k%06d" % i): "x" for i in range(200000)}
+    assert serve_mod._state_length_lower_bound_over(wide, serve_mod.MAX_STATE_CHARS) == 0
+    assert serve_mod._state_length(wide) == len(json.dumps(wide, ensure_ascii=False))
+
+
+def test_the_probe_walks_exact_container_types_only():
+    """A subclass may override `values()` while `json.dumps` reads the real items, so walking one
+    would let the "lower bound" exceed the true length. Measured before this was narrowed: a
+    13-character state refused as `60000 > 50000`. No HTTP request can reach it -- `json.loads`
+    builds exact types -- but the 400 branch exists for in-process callers.
+    """
+    import laya.serve as serve_mod
+
+    class Lying(dict):
+        def values(self):
+            return ["x" * 60000]
+
+    state = Lying(x="tiny")
+    exact = len(json.dumps(state, ensure_ascii=False))
+    assert serve_mod._state_length_lower_bound_over(state, serve_mod.MAX_STATE_CHARS) == 0
+    assert serve_mod._state_length(state) == exact == 13

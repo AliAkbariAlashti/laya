@@ -206,6 +206,121 @@ def _resolve_port() -> int:
     return port
 
 
+#: Values the walk in `_state_length_lower_bound_over` will examine before giving up. This bounds the
+#: values *inspected*, not the total work: `stack.extend` pushes a container's elements without
+#: charging them against the budget, so a 2 MiB body of many small values costs ~0.43 ms of walking
+#: before falling through to the dump it was going to pay anyway (~6% on top). An ACCEPTED state is
+#: capped at MAX_STATE_CHARS, where the walk is ~0.01 ms.
+_STATE_PROBE_VALUES = 64
+
+
+def _state_length_lower_bound_over(state: Any, cap: int) -> int:
+    """A measured lower bound on the serialized length, if it already exceeds `cap`; else 0.
+
+    Non-zero only when exceeding `cap` is certain, and 0 for "not proven" -- never the other way
+    round, so a 0 sends the state on to the exact `json.dumps` measurement and no verdict changes.
+
+    The value is returned rather than a bool so the 413 can quote a number something measured. It
+    understates the true length (see below), so the message is a true statement about the state --
+    unlike reporting `cap + 1`, which would answer "state too large (50001 > 50000 chars)" for a
+    60 012-character state. That is the same fabricated-count flaw this gate replaces, and an
+    earlier revision of this branch reintroduced it.
+
+    One consequence worth knowing: the number in a 413 is therefore the exact serialized length when
+    the encoder ran, and this understated bound when it did not. Both are truthful and neither
+    overstates, but a client trimming exactly the difference the message names can still be refused.
+
+    The bound: the raw lengths of the string values are a *lower* bound on the JSON length. Escaping
+    maps each character to one or more characters and so never shortens; keys, separators, brackets
+    and quotes only add; numbers, booleans and nulls contribute at least one character each and are
+    counted as zero here. Every one of those makes this an under-estimate, which is the safe
+    direction: under-estimating can only fail to refuse, and then the encoder decides.
+
+    Why it is worth having. The dump runs before the gate refuses, so its cost is bounded by
+    `MAX_BODY_BYTES` rather than by `cap`: a 2 MiB body -- the largest the streaming cap admits --
+    cost 5.68 ms to serialize for a request that is then rejected, which is more than the 2.22 ms
+    `json.loads` spent parsing it in the first place. Finding one 2 MiB string instead takes a single
+    `len()`. Measured: 5.687 ms -> 0.0003 ms on that state, while every state that IS accepted pays
+    at most 0.01 ms more (worst ratio 2.08x, on a 6 us deeply-nested case).
+    """
+    total = 0
+    budget = _STATE_PROBE_VALUES
+    stack = [state]
+    while stack and budget > 0:
+        budget -= 1
+        item = stack.pop()
+        if isinstance(item, str):
+            total += len(item)
+            if total > cap:
+                return total
+        elif type(item) is dict:
+            # `.values()` and `extend` stay at C level; the keys are ignored, which keeps this a
+            # lower bound. Iterating items in Python here made a 2000-key state 1.66x slower.
+            stack.extend(item.values())
+        elif type(item) is list or type(item) is tuple:
+            stack.extend(item)
+        else:
+            # EXACT types only, deliberately. A `dict` subclass may override `values()` while
+            # `json.dumps` reads the real items, which would let this "lower bound" exceed the true
+            # length -- measured: a 13-character state refused as `60000 > 50000`. Anything else,
+            # including a subclass, a set or a cycle, is handed to the encoder, which decides the
+            # size or raises and becomes the 400 below. `json.loads` only ever builds exact types,
+            # so no HTTP request takes this branch.
+            return 0
+    return 0
+
+
+def _state_length(state: Any) -> int:
+    r"""Length of the state text that will be tokenized; 400 if it has none.
+
+    `laya.common.serialize_state(state)` is what gets tokenized -- the state itself for a string,
+    `json.dumps(state, ensure_ascii=False)` for a dict or list, which the agents then strip mask
+    tokens out of, and that can only shorten it. `MAX_STATE_CHARS` has to be measured on that
+    text, not on `str()`, which is a different length in both directions:
+
+    * `repr` quotes a value with `'` and leaves a `"` inside it one character, where JSON escapes
+      it to the two characters `\"`. A `{"body": '"' * 49988}` state has a `len(str())` of exactly
+      50000, so it passed the gate, and then serialized to 99988 -- the documented 50000-character
+      limit admitting very nearly twice what it says.
+    * `repr` renders a zero-width space as the six characters `\u200b` where `ensure_ascii=False`
+      writes the one character it is, so a state that serializes to 8344 characters -- a sixth of
+      the limit -- was refused with "state too large (50004 > 50000 chars)".
+
+    `json.dumps` inline rather than importing `serialize_state`: `laya.common` imports torch at
+    module level and `import laya.serve` must not (tests/test_lazy_import.py). The two are pinned
+    to each other in tests/test_serve.py.
+
+    Cost. At the gate's own ceiling the dump is 0.133 ms against 0.080 ms for the `str()` it
+    replaces -- orders of magnitude under the forward pass that state then gets, so the serialized
+    text is not worth threading through `predict()` to be encoded only once. A state large enough
+    for that difference to matter never reaches the dump: `_state_length_lower_bound_over` refuses it
+    first, which is what keeps an oversized body from costing more to reject than it did upstream.
+    (Best of 200 after 20 warm-up iterations, CPython 3.12 on a 10-core arm64 laptop.)
+    """
+    from fastapi import HTTPException
+
+    if isinstance(state, str):
+        return len(state)  # `serialize_state` returns a string state unchanged
+    over = _state_length_lower_bound_over(state, MAX_STATE_CHARS)
+    if over:
+        # Already past the cap on a lower bound, so serializing the rest cannot change the verdict.
+        # The bound is what gets reported: it is a measured number and it understates, so the 413
+        # never claims a length larger than the state really has.
+        return over
+    try:
+        return len(json.dumps(state, ensure_ascii=False))
+    except (TypeError, ValueError, RecursionError):
+        # A state `serialize_state` cannot render is not a size problem, and the 413 this replaces
+        # reported a count nothing had measured: `str()` raises on an integer of over 4300 digits
+        # (CPython's own int-to-str guard), and the old `except` answered "state too large (50001
+        # > 50000 chars)" for a state of a few kilobytes. No HTTP request reaches that case --
+        # `json.loads` builds only JSON types and refuses that integer itself, which
+        # `_systemone_inner` already answers 400 -- but in-process callers get here, and a state
+        # `json.dumps` refuses (a set, a datetime, a circular reference) used to pass the gate on
+        # its `str()` and then fail inside `serialize_state`, reported as a 500 "inference failed".
+        raise HTTPException(status_code=400, detail="'state' must be JSON-serializable")
+
+
 def _check_request_limits(state: Any, questions: Any) -> None:
     """Reject absent or oversized inference requests before tokenization (400/413)."""
     from fastapi import HTTPException
@@ -252,10 +367,7 @@ def _check_request_limits(state: Any, questions: Any) -> None:
             detail="too many answer options across questions (%d > %d)" % (total_options, MAX_TOTAL_OPTIONS),
         )
 
-    try:
-        state_len = len(state) if isinstance(state, str) else len(str(state))
-    except Exception:
-        state_len = MAX_STATE_CHARS + 1
+    state_len = _state_length(state)
     if state_len > MAX_STATE_CHARS:
         raise HTTPException(status_code=413,
                             detail="state too large (%d > %d chars)" % (state_len, MAX_STATE_CHARS))

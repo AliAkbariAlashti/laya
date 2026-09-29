@@ -138,7 +138,7 @@ nothing but the bytes it read. Every one of them is a `413`; the `detail` says w
 | limit | value |
 |---|---|
 | request body | 2 MiB, enforced while streaming -- a chunked or understated `Content-Length` cannot bypass it |
-| `state` | 50,000 characters |
+| `state` | 50,000 characters of the text the model is given -- the string itself for a string state, `json.dumps(state, ensure_ascii=False)` for an object or array |
 | questions per request | 64 |
 | options per `choice` question | 100 |
 | levels per `score` question | 32 |
