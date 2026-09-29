@@ -684,6 +684,39 @@ class ValidatingRouter:
         raise AssertionError("validation should have rejected this before predict()")
 
 
+@pytest.mark.parametrize("bad_type", [[], {}, "bogus", 123])
+def test_malformed_question_type_is_a_named_422(monkeypatch, bad_type):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    client = TestClient(create_app(router=ValidatingRouter()), raise_server_exceptions=False)
+    body = dict(REQ)
+    body["questions"] = {"refund": {"type": bad_type, "instructions": "Is a refund requested?"}}
+    response = client.post("/v1/systemone", json=body)
+    assert response.status_code == 422, response.text
+    assert "unknown type" in response.text, response.text
+
+
+@pytest.mark.parametrize("bad_ins", [None, "", "   ", []])
+def test_malformed_instructions_is_a_named_422(monkeypatch, bad_ins):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    client = TestClient(create_app(router=ValidatingRouter()), raise_server_exceptions=False)
+    body = dict(REQ)
+    body["questions"] = {"refund": {"type": "noul", "instructions": bad_ins}}
+    response = client.post("/v1/systemone", json=body)
+    assert response.status_code == 422, response.text
+    assert "instructions" in response.text, response.text
+
+
+@pytest.mark.parametrize("bad_qid", ["", "   "])
+def test_malformed_question_id_is_a_named_422(monkeypatch, bad_qid):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    client = TestClient(create_app(router=ValidatingRouter()), raise_server_exceptions=False)
+    body = dict(REQ)
+    body["questions"] = {bad_qid: {"type": "noul", "instructions": "Is it urgent?"}}
+    response = client.post("/v1/systemone", json=body)
+    assert response.status_code == 422, response.text
+    assert "question id" in response.text, response.text
+
+
 def test_a_nested_choice_label_is_a_caller_error_not_a_server_fault(monkeypatch):
     """A `criteria` list containing a list/dict label is the caller's mistake, so it must be 422.
 

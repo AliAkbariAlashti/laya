@@ -175,6 +175,16 @@ check_raises("empty/bare dict rejected", TypeError,
              lambda: _bare_onnx().predict_batch({"body": "x"}, QUESTIONS))
 check_raises("empty/invalid question rejected before any run", ValueError,
              lambda: _bare_onnx().predict_batch(STATES, {"bad": {"type": "nope", "instructions": "?"}}))
+for bad_type in ([], {}):
+    check_raises("invalid/question type %r rejected" % (bad_type,), ValueError,
+                 lambda bt=bad_type: _bare_onnx().predict_batch(STATES, {"q": {"type": bt, "instructions": "?"}}))
+for bad_ins in (None, "", "   ", []):
+    check_raises("invalid/instructions %r rejected" % (bad_ins,), ValueError,
+                 lambda bi=bad_ins: _bare_onnx().predict_batch(STATES, {"q": {"type": "noul", "instructions": bi}}))
+check_raises("invalid/questions not a dict", TypeError,
+             lambda: _bare_onnx().predict_batch(STATES, ["not", "a", "dict"]))
+check_raises("invalid/state is None in batch", TypeError,
+             lambda: _bare_onnx().predict_batch([None], QUESTIONS))
 check("budget/max_len and head_max_len forward through the batch path",
       _bare_onnx().predict_batch(STATES, QUESTIONS, max_len=32, head_max_len=16),
       [_bare_onnx().system_one(s, QUESTIONS, max_len=32, head_max_len=16) for s in STATES])

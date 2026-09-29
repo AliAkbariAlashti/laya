@@ -624,14 +624,28 @@ class Agent(HookRegistry):
         'NoneType' object has no attribute 'items'`, `KeyError: 'bool'`, or a `selected index k out
         of range` raised inside the model for a question that ended up with no options at all.
         """
+        if qid is None:
+            raise ValueError("question id must not be None")
+        if not isinstance(qid, (str, int)) or (isinstance(qid, str) and not qid.strip()):
+            raise ValueError("question id must be a non-empty string, got %r" % (qid,))
         if not isinstance(qdef, dict):
             raise ValueError("question %r: definition must be a dict, got %s"
                              % (qid, type(qdef).__name__))
         t = qdef.get("type")
-        if t not in QTYPES:
+        if not isinstance(t, str) or t not in QTYPES:
             raise ValueError("question %r: unknown type %r; use one of %s" % (qid, t, sorted(QTYPES)))
         if "instructions" not in qdef:
             raise ValueError("question %r: no 'instructions'; add the text the model should answer" % (qid,))
+        ins = qdef["instructions"]
+        if ins is None:
+            raise ValueError("question %r: 'instructions' must not be None; add the text the model should answer" % (qid,))
+        if isinstance(ins, str) and not ins.strip():
+            raise ValueError("question %r: 'instructions' must not be empty; add the text the model should answer" % (qid,))
+        if isinstance(ins, (list, dict)) and not ins:
+            raise ValueError("question %r: 'instructions' must not be empty; add the text the model should answer" % (qid,))
+        if not isinstance(ins, (str, dict, list, int, float)):
+            raise ValueError("question %r: 'instructions' must be a string, dict, or list, got %s"
+                             % (qid, type(ins).__name__))
         crit = qdef.get("criteria")
         if t == "choice":
             if not isinstance(crit, (dict, list)):
@@ -1158,6 +1172,11 @@ class Agent(HookRegistry):
         left no states to score, before any window was read -- on either path, so a cached answer
         never reads as a window the model read.
         """
+        if state is None:
+            raise TypeError("state must not be None; pass a string, dict, or list")
+        if not isinstance(questions, dict):
+            raise TypeError("questions must be a dict of question id -> definition, got %s"
+                            % type(questions).__name__)
         if aggregate != "auto":
             raise ValueError("predict_long: only aggregate='auto' is supported")
         hook_kwargs = {"hooks": hooks, "on_predict_start": on_predict_start,
