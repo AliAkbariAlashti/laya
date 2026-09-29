@@ -992,13 +992,29 @@ def test_a_state_a_sixth_of_the_limit_is_not_refused_for_its_repr(monkeypatch):
 # Deliberately states whose `repr` and whose JSON are the same length, so these four answer the
 # same before and after the fix. They are here to pin what must NOT move: the limit still admits a
 # state that sits exactly on it and still refuses one character more.
+# The explicit ids are required, not cosmetic. pytest builds each case's node id out of the
+# parameter value, and writes that node id into the PYTEST_CURRENT_TEST environment variable -- a
+# 50 000-character state produces a 50 084-character id, and a Windows environment variable cannot
+# exceed 32 767 characters, so every case errors at teardown with
+# `ValueError: the environment variable is longer than 32767 characters`. It passes on Linux, which
+# has no comparable per-variable limit. `b"[" * 100000` in this file carries an id for the same
+# reason.
 @pytest.mark.parametrize("state, expected", [
-    ({"body": "a" * 49988}, 200),                      # str() and JSON are both exactly 50000
-    ({"body": "a" * 49989}, 413),                      # both exactly one character over
-    ("A" * MAX_STATE_CHARS, 200),                      # a string state is its own serialization
-    ("A" * (MAX_STATE_CHARS + 1), 413),
+    # str() and JSON are both exactly 50000
+    pytest.param({"body": "a" * 49988}, 200, id="dict-exactly-at-the-limit"),
+    # both exactly one character over
+    pytest.param({"body": "a" * 49989}, 413, id="dict-one-character-over"),
+    # a string state is its own serialization
+    pytest.param("A" * MAX_STATE_CHARS, 200, id="str-exactly-at-the-limit"),
+    pytest.param("A" * (MAX_STATE_CHARS + 1), 413, id="str-one-character-over"),
 ])
-def test_the_declared_limit_is_the_limit_for_ordinary_states(monkeypatch, state, expected):
+def test_the_declared_limit_is_the_limit_for_ordinary_states(monkeypatch, request, state, expected):
+    # Asserted here rather than left to the Windows job: pytest writes this node id into
+    # PYTEST_CURRENT_TEST, where Windows caps a variable at 32 767 characters, so dropping the
+    # explicit ids above turns every case in this test into a teardown error -- on Windows only.
+    # This assertion fails on any platform, so the ids cannot be lost without CI saying so.
+    assert len(request.node.nodeid) < 32767, \
+        "node id is %d characters; give this parameter an explicit short id" % len(request.node.nodeid)
     client, _ = _client(monkeypatch)
     r = client.post("/v1/systemone", json={**REQ, "state": state})
     assert r.status_code == expected
