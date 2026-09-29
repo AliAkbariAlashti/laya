@@ -196,7 +196,81 @@ check_true("docs/docker.md says why MPS is not forwarded",
            mps_reason is not None and "no image here can reach" in mps_reason.group(0),
            "the omission has to be explained where a reader meets it")
 
-# 6. the real renderer, when this machine has one: the rendered environment must carry the value.
+# 6. The same drift one level up. `dtype_names()` above is deliberately narrow -- a dtype
+#    decision and the name it reads -- because that is the contract it was written for. The cost
+#    is that a name read by any *other* module is invisible to it: `LAYA_REVISION` is read by
+#    `laya/revisions.py`, it is documented, and it was forwarded by no Compose file at all. So an
+#    operator's pin was interpolated, discarded without a warning, and the checkpoints loaded at
+#    whatever the mutable default branch held.
+#
+#    This widens the derivation to every `LAYA_*` the package reads and checks the three-way
+#    agreement -- package, docs, deployment -- in both directions, at "forwarded by at least one
+#    file" granularity. Per-service granularity would be wrong the other way: `LAYA_PORT` belongs
+#    to `laya-serve` and must not be demanded of the SDK service.
+package_read: set = set()
+for _dirpath, _dirs, _files in os.walk(os.path.join(ROOT, "laya")):
+    for _filename in _files:
+        if not _filename.endswith(".py"):
+            continue
+        _rel = os.path.relpath(os.path.join(_dirpath, _filename), ROOT)
+        package_read |= set(ENVIRON_GET.findall(read(_rel)))
+
+# A row may name two variables in one cell (``LAYA_API_KEY` / `LAYA_API_KEY_FILE`), so collect
+# every name appearing anywhere in a table row as well. Matching only a lone backticked name
+# would report a correctly documented variable as undocumented.
+documented_rows = set(re.findall(r"^\| `(LAYA_[A-Z0-9_]+)` \|", docker_md, re.M))
+for _row in re.findall(r"^\|.*$", docker_md, re.M):
+    documented_rows |= set(NAME.findall(_row))
+
+_mps_doc = re.search(r"`LAYA_MPS_AMP_MIN_ROWS`[^.]*\.", docker_md, re.S)
+excluded = set(NAME.findall(_mps_doc.group(0))) if _mps_doc else set()
+
+# `LAYA_MAX_CONCURRENT` and `LAYA_MAX_TOKEN_BUDGET` are the same defect -- documented in the
+# laya-serve table, read by `laya/serve.py`, forwarded by no file -- and are deliberately NOT
+# fixed here. `compose.http.yaml` is the only place they could be forwarded and three open PRs
+# conflict on it: #528 and #656 insert at the environment block, and #528 is itself adding
+# `LAYA_SHA256_DIGESTS` to that block, so the serve-side forwarding belongs with whoever lands
+# that cluster. Pinned as a literal and re-asserted below, the way check 5 pins the MPS
+# exclusion, so the day those PRs close this file fails and the decision gets made again rather
+# than the two names quietly staying missing.
+DEFERRED = ("LAYA_MAX_CONCURRENT", "LAYA_MAX_TOKEN_BUDGET")
+required = sorted((package_read & documented_rows) - excluded - set(DEFERRED))
+
+check_true("core/the widened set is not empty", len(required) >= 10, required)
+check_true("core/the widened set includes the name this change forwards",
+           "LAYA_REVISION" in required, sorted(required))
+check_true("core/the deferred set is exactly the two serve knobs",
+           tuple(sorted(DEFERRED)) == DEFERRED, DEFERRED)
+check_true("core/the deferred names are still read and still documented, not quietly renamed",
+           all(n in package_read and n in documented_rows for n in DEFERRED), sorted(DEFERRED))
+
+forwarded_anywhere: set = set()
+for _rel in COMPOSE_FILES:
+    for _service, _env in env_blocks(read(_rel)).items():
+        forwarded_anywhere |= {k for k in _env if NAME.fullmatch(k)}
+
+for _name in required:
+    check_true("compose/at least one file forwards %s" % _name, _name in forwarded_anywhere,
+               "read by the runtime and documented, but no Compose file names it, so an "
+               "operator's value is interpolated and then silently dropped")
+    _values = [e[_name] for _r in COMPOSE_FILES
+               for e in env_blocks(read(_r)).values() if _name in e]
+    if _values:
+        # Starts with `"${NAME:-` and ends with `}"`. The tail is matched loosely on purpose:
+        # LAYA_THREADS nests a second default, `"${LAYA_THREADS:-${OMP_NUM_THREADS:-4}}"`,
+        # which is still a host passthrough and is the idiom this file already used.
+        check_true("compose/%s is a host passthrough" % _name,
+                   all(v.startswith('"${%s:-' % _name) and v.endswith('}"') for v in _values),
+                   _values)
+
+# the other direction: a name Compose forwards with no row in the table is one a reader cannot
+# find, which is the same drift seen from the docs side.
+for _name in sorted(forwarded_anywhere - set(required)):
+    check_true("docs/docker.md documents the forwarded %s" % _name,
+               _name in documented_rows,
+               "the deployment sets it and the page never mentions it")
+
+# 7. the real renderer, when this machine has one: the rendered environment must carry the value.
 if shutil.which("docker"):
     env = dict(os.environ, LAYA_CUDA_AMP="fp16")
     proc = subprocess.run(["docker", "compose", "-f", "compose.yaml", "-f", "compose.cuda.yaml",
