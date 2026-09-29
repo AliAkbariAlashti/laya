@@ -693,6 +693,8 @@ export class Agent extends HookRegistry {
        * or executed. A missing artifact or digest mismatch throws and loading is refused.
        */
       expectedSha256?: Record<string, string>;
+      signal?: AbortSignal | null;
+      onProgress?: ((done: number, total: number, file: string) => void) | null;
     },
   ): Promise<Agent> {
     const sub = opts?.subfolder ?? null;
@@ -709,6 +711,8 @@ export class Agent extends HookRegistry {
         subfolder: sub,
         revision: opts?.revision,
         expectedSha256: opts?.expectedSha256,
+        signal: opts?.signal,
+        onProgress: opts?.onProgress,
       });
       cfg = bundle.cfg;
       tokenizerJson = bundle.tokenizerJson;
@@ -726,6 +730,8 @@ export class Agent extends HookRegistry {
         token: opts?.token,
         revision: opts?.revision,
         expectedSha256: opts?.expectedSha256,
+        signal: opts?.signal,
+        onProgress: opts?.onProgress,
       });
       cfg = bundle.cfg;
       tokenizerJson = bundle.tokenizerJson;
