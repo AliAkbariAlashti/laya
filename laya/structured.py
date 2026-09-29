@@ -20,7 +20,7 @@ from collections.abc import Sequence as SequenceABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from .confidence import check_min_confidence, flag_low_confidence
+from .confidence import answer_confidence_value, check_min_confidence, flag_low_confidence
 
 MAX_PROPERTIES = 32
 MAX_OPTIONS = 32
@@ -37,6 +37,22 @@ class DecisionResult:
 
     `values` is the schema-shaped output. `confidence` and `probabilities` are keyed by field,
     and `answers` is Laya's raw answer per field.
+
+    `answer_confidence` is `max(p)` per field -- the probability mass on the answer being
+    reported, under its own name. That makes it the same decision quantity `min_confidence`
+    compares against and the calibration and eval stack measures, which is the reason to report
+    it: a caller filtering this artifact to decide what to automate has to be filtering on the
+    number the gate actually used.
+
+    It is not a claim that the number is right. Reading it as "about c of the answers returned at
+    c are correct" holds only after temperatures are fitted and validated on held-out data for
+    that checkpoint and question shape; the shipped checkpoints are over-confident as shipped and
+    `laya-multilingual` ships with no fitted temperatures at all. See `common.answer_confidence`
+    and the README's Calibration section.
+
+    `confidence` keeps the normalized-entropy value it has always had, because that is a
+    different quantity on a scale that depends on the label count. A field that reported no
+    usable `answer_confidence` maps to `None`, which is not the same as a reported `0.0`.
     """
 
     values: Dict[str, Any]
@@ -45,6 +61,9 @@ class DecisionResult:
     answers: Dict[str, Any]
     usage: Optional[Dict[str, int]] = None
     routing: Optional[Dict[str, Any]] = None
+    # Appended with a default so every existing construction of this dataclass keeps working, and
+    # the first six fields keep their positions.
+    answer_confidence: Dict[str, Optional[float]] = field(default_factory=dict)
 
 
 @dataclass
@@ -238,9 +257,13 @@ def answer_to_pydantic(model: Any, answers: Dict[str, Any]) -> Any:
 
 def _details(values: Dict[str, Any], answers: Dict[str, Any], result: Dict[str, Any]) -> DecisionResult:
     confidence: Dict[str, float] = {}
+    answer_confidence: Dict[str, Optional[float]] = {}
     probabilities: Dict[str, Dict[str, Any]] = {}
     for name, answer in answers.items():
         confidence[name] = float(answer.get("confidence", 0.0))
+        # Read through the module that owns the definition, so this and the `min_confidence` gate
+        # cannot disagree about which quantity is being reported.
+        answer_confidence[name] = answer_confidence_value(answer)
         if answer.get("type") == "noul":
             p = float(answer.get("noul", 0.0))
             probabilities[name] = {"false": round(1.0 - p, 4), "true": round(p, 4)}
@@ -253,6 +276,7 @@ def _details(values: Dict[str, Any], answers: Dict[str, Any], result: Dict[str, 
         answers=dict(answers),
         usage=result.get("usage"),
         routing=result.get("routing"),
+        answer_confidence=answer_confidence,
     )
 
 

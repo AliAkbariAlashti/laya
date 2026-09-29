@@ -211,6 +211,65 @@ check_true("decide/details answers flag set", det.answers["urgency"].get("low_co
 check("decide/details high conf value kept", det.values["department"], "billing")
 check_true("decide/details high conf flag unset", det.answers["department"].get("low_confidence") is not True)
 
+# --------------------------------------------------------------------- answer_confidence
+# The decision: "which of my structured decisions are safe to automate?" is answered by filtering
+# the details artifact, so the number that filter reads has to be the one the gate uses.
+#
+# `DecisionResult.confidence` is built from the answer's `confidence` field, which is normalized
+# entropy: `laya/common.py` calls it "not calibrated: it is not what temperature scaling fits and
+# not what the reported ECE measures", `tests/test_confidence.py` pins that a two-option
+# distribution reads 0.90 on a `noul` and 0.53 on an equivalent `choice`, and #394 is an open issue
+# saying a confidence threshold does not transfer across option counts -- which is the entropy
+# definition's failure mode, since `log(k)` is in the denominator.
+#
+# So a caller filtering `details.confidence` to decide what to escalate filters on a different
+# quantity from the one `min_confidence` compares against, and on one that moves with the shape of
+# the question rather than with how right the answer is.
+#
+# Terminology, deliberately careful: `answer_confidence` is `max(p)`, the quantity calibration
+# fits and every calibration figure is computed on, and the quantity the gate is defined against.
+# That makes it the right number to *filter* on. It is NOT a claim that the number is right --
+# "about c of the answers returned at c are correct" holds only after temperatures are fitted and
+# validated for that checkpoint and question shape, and the shipped checkpoints are over-confident
+# as shipped (README, Calibration).
+CAL = {"department": {"type": "choice", "choice": "billing", "confidence": 0.30, "answer_confidence": 0.95},
+       "urgency": {"type": "score", "score": 2.0, "confidence": 0.90, "answer_confidence": 0.40,
+                   "probabilities": {"0": 0.1, "1": 0.5, "2": 0.4}, "legend": {}}}
+cal_det = decide(FakeRunner(CAL), "s", schema=SCHEMA, return_details=True)
+
+# The two numbers differ on the same field, which is the whole point: the entropy value ranks
+# `urgency` above `department` and max(p) reverses it.
+check_true("details/the two confidences really do disagree",
+           cal_det.confidence["department"] < cal_det.confidence["urgency"])
+check_true("details/…and answer_confidence reverses that order",
+           cal_det.answer_confidence["department"] > cal_det.answer_confidence["urgency"])
+check("details/answer_confidence is reported per field", cal_det.answer_confidence["department"], 0.95)
+
+# The name means what it says, so a caller that sorts by it sorts on the same quantity the gate
+# and the eval harness use.
+check("details/entropy field is left exactly as it was", cal_det.confidence["department"], 0.30)
+
+# A field with no usable answer_confidence is `None`, not 0.0. `confidence` defaults to 0.0, so
+# today an absent confidence and a genuinely zero one are the same value, and a caller filtering on
+# "below 0.4, escalate" escalates both without being able to tell why.
+NO_CONF = {"department": {"type": "choice", "choice": "billing", "confidence": 0.0}}
+no_det = decide(FakeRunner(NO_CONF), "s", schema=SCHEMA, return_details=True)
+check("details/absent answer_confidence is None, not 0.0", no_det.answer_confidence["department"], None)
+check_true("details/…and stays distinct from a reported zero",
+           no_det.answer_confidence["department"] is not cal_det.answer_confidence["urgency"])
+
+# A `bool` is not a confidence, and a NaN is not a decision.
+BAD_CONF = {"department": {"type": "choice", "choice": "billing", "answer_confidence": True}}
+bad_det = decide(FakeRunner(BAD_CONF), "s", schema=SCHEMA, return_details=True)
+check("details/a bool is not reported as a confidence", bad_det.answer_confidence["department"], None)
+NAN_CONF = {"department": {"type": "choice", "choice": "billing", "answer_confidence": float("nan")}}
+nan_det = decide(FakeRunner(NAN_CONF), "s", schema=SCHEMA, return_details=True)
+check("details/a NaN is not reported as a confidence", nan_det.answer_confidence["department"], None)
+
+# Every field is accounted for, so a caller can iterate `answer_confidence` without a KeyError on
+# a field the model did not answer.
+check_true("details/one entry per field", set(cal_det.answer_confidence) == set(CAL))
+
 # Direct projection with low_confidence: True in answer
 answers_with_flag = {
     "department": {"type": "choice", "choice": "billing", "confidence": 0.4, "low_confidence": True},

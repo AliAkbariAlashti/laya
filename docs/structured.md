@@ -146,19 +146,40 @@ with per-field confidence, probabilities, the raw answers, and the usage and rou
 
 ```python
 result = agent.decide(state, schema=Ticket, return_details=True)
-result.values["department"]        # "billing"
-result.confidence["department"]    # 0.94
-result.probabilities["department"] # {"billing": 0.94, "support": 0.06, "sales": 0.0}
-result.usage                       # {"input_tokens": 42, "output_tokens": 0}
-result.routing                     # the Router decision, when a Router answered
+result.values["department"]            # "billing"
+result.answer_confidence["department"] # 0.94  max(p): the quantity min_confidence gates on
+result.confidence["department"]        # 0.71  normalized entropy, which depends on label count
+result.probabilities["department"]     # {"billing": 0.94, "support": 0.06, "sales": 0.0}
+result.usage                           # {"input_tokens": 42, "output_tokens": 0}
+result.routing                         # the Router decision, when a Router answered
 ```
 
-You can gate on it, for example escalate a field whose confidence is below a threshold:
+`confidence` and `answer_confidence` are different quantities, and the names follow the definitions.
+`answer_confidence` is `max(p)`, the probability mass on the answer being reported. It is what
+temperature scaling fits, what every calibration figure in this repository is computed on, and what
+`min_confidence` is compared against — which is the reason to gate on it rather than on
+`confidence`. `confidence` is normalized entropy, which depends on how many options the question
+had: `tests/test_confidence.py` pins that a two-option distribution comes back as 0.90 on a `noul`
+and 0.53 on an equivalent `choice`, so it does not compare against a threshold. A field that
+reported no usable `answer_confidence` maps to `None`, which is not the same as a reported `0.0`.
+
+Gate on the same quantity the gate uses:
 
 ```python
-if result.confidence["department"] < 0.6:
+if result.answer_confidence["department"] < 0.6:
     result.values["department"] = "human-review"
 ```
+
+`answer_confidence` being the right number to *filter* on is not the same as it being a trustworthy
+probability. Reading it as "about c of the answers returned at c are correct" holds only after
+temperatures have been fitted and validated on held-out data for that checkpoint and question shape.
+The shipped checkpoints are over-confident as shipped and `laya-multilingual` ships with no fitted
+temperatures at all — see the README's
+[Calibration](https://github.com/NandhaKishorM/laya#calibration) and
+[Honest limits](https://github.com/NandhaKishorM/laya#honest-limits) sections, and the
+[fine-tuning notebook](https://github.com/NandhaKishorM/laya/blob/main/notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb)
+for the fitting loop. Fit before you rely on the level; report it because it is the quantity the
+gate and the eval harness both use.
 
 ## How it maps internally
 
