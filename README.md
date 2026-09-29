@@ -271,6 +271,10 @@ curl -s localhost:8000/predict -H 'content-type: application/json' -d '{
 `--no-preload` loads checkpoints lazily instead of all three up front; `--device cuda|cpu|mps`
 pins the device. See `python examples/server.py --help` for the rest.
 
+A request body may carry `model` to pin a checkpoint instead of letting the router choose, and it
+takes exactly the spellings `laya --model` takes: names, aliases and casing all resolve through
+`laya.router`. `GET /models` lists the checkpoints and the aliases alongside them.
+
 ### JavaScript / TypeScript
 
 [`laya-client`](sdk/typescript/README.md) supports JavaScript and TypeScript
