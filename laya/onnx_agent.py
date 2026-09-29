@@ -59,6 +59,7 @@ class ONNXAgent(HookRegistry):
         hooks_concurrent: bool = True,
         hooks_timeout: Optional[float] = None,
         lang_temperatures: Optional[Dict[str, Dict[str, Any]]] = None,
+        calibration: Optional[str] = None,
     ):
         """Load a Laya agent backed by ONNX Runtime.
 
@@ -206,6 +207,15 @@ class ONNXAgent(HookRegistry):
                 "confidence; clamping %s. Treat confidence from the affected buckets as uncalibrated."
                 % (TEMP_MIN, TEMP_MAX, ", ".join(rejected)),
                 RuntimeWarning, stacklevel=2)
+        if calibration:
+            self.load_calibration(calibration)
+
+    def load_calibration(self, path: str) -> None:
+        """Read a JSON map written by `save_calibration` onto this agent."""
+        from .calibrate import apply_calibration_payload
+        with open(path) as f:
+            payload = json.load(f)
+        apply_calibration_payload(self, payload)
 
     @staticmethod
     def _to_internal(qdef: Dict) -> Dict:
