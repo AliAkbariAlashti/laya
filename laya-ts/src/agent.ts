@@ -173,14 +173,24 @@ export function checkQuestion(qid: string, qdef: unknown): void {
       throw new Error(`question ${qidStr(qid)}: a choice question needs at least one criterion`);
     }
     if (Array.isArray(crit)) {
-      crit.forEach((label: unknown, i) => {
-        if (typeof label !== "object" || label === null) return;
+      // An indexed loop, not forEach: a hole in a sparse list is an undefined label too.
+      for (let i = 0; i < crit.length; i++) {
+        const label: unknown = crit[i];
+        if (label === null || label === undefined) {
+          // A null label becomes the answer key "null", which a client cannot tell apart from
+          // the string "null", and `criteria[choice]` never finds it. Python rejects it (#508).
+          throw new Error(
+            `question ${qidStr(qid)}: choice label ${i} is null; a label is rendered as option text and used ` +
+              `as the answer key, so it must be a string, number or bool`,
+          );
+        }
+        if (typeof label !== "object") continue;
         throw new Error(
           `question ${qidStr(qid)}: choice label ${i} is a ${Array.isArray(label) ? "list" : "dict"}; a label is ` +
             `rendered as option text and used as the answer key, so it must be a scalar (a string, number or ` +
-            `null), got ${JSON.stringify(label)}`,
+            `bool), got ${JSON.stringify(label)}`,
         );
-      });
+      }
     }
   } else if (t === "score") {
     if (!Array.isArray(crit)) {
