@@ -8,6 +8,7 @@ compiler; the guards and recompiles being tested are dynamo's, the same under ev
 import os
 import sys
 import threading
+from types import SimpleNamespace
 
 import torch
 
@@ -76,6 +77,21 @@ def test_one_graph_across_shapes_and_same_outputs():
     # then two duck-sizing recompiles); dynamic=True with independent dimensions builds one
     assert graphs() - start == 1, graphs() - start
     assert fx_config.use_duck_shape is before
+
+
+def test_warmup_builds_every_graph_before_the_first_request():
+    torch._dynamo.reset()
+    agent = compiled_agent(tiny_model())
+    agent.cfg = {"max_len": 512}
+    agent.tok = SimpleNamespace(cls_token_id=1)
+    start = graphs()
+    assert agent.warmup() >= 0.0
+    # the batch graph and torch's own single-row specialisation
+    assert graphs() - start == 2, graphs() - start
+    with torch.no_grad():
+        for shape in SHAPES + [(1, 50, 4), (1, 200, 2)]:
+            agent._infer(batch(*shape))
+    assert graphs() - start == 2, graphs() - start
 
 
 def test_duck_shape_restored_after_errors_and_nesting():

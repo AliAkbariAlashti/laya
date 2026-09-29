@@ -1,6 +1,6 @@
 """Graphs built and per-call cost under `compile=True`: this tree vs the stock `torch.compile(model)`.
 
-    python benchmarks/bench_compile.py [--subfolder multilingual] [--device cuda] [--stock]
+    python benchmarks/bench_compile.py [--subfolder multilingual] [--device cuda] [--stock] [--warmup]
     python benchmarks/bench_compile.py --device cpu --dynamo-backend eager     # graph count only, no inductor
 
 Runs a fixed sequence of `predict()` calls whose questions, options and state length change on
@@ -8,6 +8,7 @@ every call, the way real traffic does, and prints each call's wall time and how 
 has built so far. A call that builds a graph is a (re)compile: tens of seconds on a GPU with
 inductor. `--stock` compiles the way `compile=True` did before (`torch.compile(model)`, duck sizing
 on); `--dynamo-backend eager` swaps inductor out so the graph count is cheap to check on CPU.
+`--warmup` calls `agent.warmup()` after loading and reports its time before the first request.
 """
 import argparse, os, sys, time
 from contextlib import nullcontext
@@ -31,6 +32,7 @@ def main():
     ap.add_argument("--model", default="convaiinnovations/laya"); ap.add_argument("--subfolder", default=None)
     ap.add_argument("--device", default=None); ap.add_argument("--stock", action="store_true")
     ap.add_argument("--dynamo-backend", default=None, help="torch.compile backend (default inductor)")
+    ap.add_argument("--warmup", action="store_true", help="call agent.warmup() before the first request")
     args = ap.parse_args()
     import torch
     import laya.agent as A
@@ -44,6 +46,8 @@ def main():
         A.compile_model = lambda m: _compile.compile_model(m, **kw)
     agent = A.Agent(args.model, subfolder=args.subfolder, device=args.device, compile=True)
     print("%s compile, device %s, torch %s" % ("stock" if args.stock else "this tree", agent.device, torch.__version__))
+    if args.warmup:
+        print("  warmup(): %8.2f s, graphs so far %d" % (agent.warmup(), counters["stats"]["unique_graphs"]))
     total = time.perf_counter()
     for n, k, words in CALLS:
         state = " ".join(WORDS[i % len(WORDS)] for i in range(words))

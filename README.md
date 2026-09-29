@@ -683,6 +683,25 @@ The fast path runs in the agent's autocast dtype at the time `accelerate()` is c
 Falls back to the stock forward on CPU/MPS or when `tilelang` is not installed; `agent.deaccelerate()`
 restores it. Kernels compile once per shape bucket on first use (a few seconds, cached on disk).
 
+### Warm-up before serving: `agent.warmup()`
+
+`compile=True` compiles on the first request that needs a graph, and the first single-question request
+needs a second one (torch specialises a batch of 1). Both stall a live request. `agent.warmup()` runs the
+forward on a few synthetic shapes now and returns the seconds it took, so the compiles happen before
+traffic arrives:
+
+```python
+agent = laya.load("convaiinnovations/laya", compile=True)
+agent.warmup()                   # ~46 s on an RTX 4070 Ti SUPER; every later request ~10-30 ms
+```
+
+Measured with `benchmarks/bench_compile.py --device cuda [--warmup]` (English checkpoint, torch 2.11, ten
+requests of changing shape): without it the first request took 51 s and the first single-question request,
+the eighth, took another 41 s; after `warmup()` no request took more than 30 ms. It works the same with
+`fast=True` (kernels and CUDA graphs for those buckets) and costs a few forward passes on the stock path.
+Inductor caches compiled graphs under `TORCHINDUCTOR_CACHE_DIR` (by default in `/tmp`); point it at a
+persistent directory to keep them across restarts.
+
 ---
 
 ## Automated Confidence Gating
