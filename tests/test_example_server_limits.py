@@ -47,6 +47,22 @@ cap to fit what it preloads (`laya/router.py:275` -> `:372`), so the demo's own 
 with three checkpoints resident while `/health` reported one. Nothing in the file ever asked the
 running Router what it was holding.
 
+`main` is at 66 checks now, and this file is at 81. The fifteen new ones are the request `model`
+field. `laya.router.normalise_name` is core's one resolver -- trim, lower-case, alias table,
+registry -- and `laya --model` and `laya/serve.py` both hand it the caller's string, but this demo
+compared it against a tuple of the three checkpoint names. So on `main` the aliases, the checkpoint
+ids with the `laya-` prefix, `typed_decisions`, and the upper-cased and space-padded form of every
+one of them answer 422 here: 60 of the 67 spellings core resolves, which
+`laya-bench/model_alias_witness_main.log` counts against `main` at 9d95567 through
+`_check_model` and through `POST /predict` on a TestClient -- `{"model": "english"}` answers 503,
+`{"model": "laya"}` answers 422, while `laya --model laya` pins the checkpoint. The new checks take
+the probe from `laya.router`'s own tables rather than listing the aliases here, require the
+canonical name to reach the Router, keep blank meaning "do not pin" as the playground sends it,
+read the alias list back out of `/models`, its HTML page, the published request schema and the
+README section for this server, and then add a fourth checkpoint to core at runtime, reload the
+demo, and require it to be pinnable by name and by alias and to appear in that text with no edit to
+this file.
+
 Run: python tests/test_example_server_limits.py
 """
 import importlib
@@ -506,6 +522,166 @@ def main():
        and all("503" in r.get("error", "") for r in not_ready.json()["results"]),
        json.dumps(not_ready.json())[:200])
     demo.ROUTER = None
+
+    # ---- the `model` field resolves the way core resolves one ----------------
+    # `laya.router.normalise_name` trims, lower-cases and maps its alias table before it checks
+    # the checkpoint registry, and `laya --model laya` and `POST /v1/systemone {"model":"laya"}`
+    # both go through it. This demo compared the string against a tuple of the three names, so the
+    # alias worked on the CLI and answered 422 here. The probe below is built from laya.router's
+    # own tables, so it covers spellings this file has never heard of and cannot fall behind.
+    from laya import router as _router_mod
+
+    names = sorted(_router_mod.DEFAULT_MODELS)
+    aliases = sorted(a for a, target in _router_mod._ALIASES.items()
+                     if target in _router_mod.DEFAULT_MODELS)
+    spellings = [spelling for value in names + aliases
+                 for spelling in (value, value.upper(), " %s " % value)]
+
+    refused, not_canonical = [], []
+    for value in spellings:
+        want = _router_mod.normalise_name(value)
+        try:
+            got = demo._check_model(value)
+        except Exception as exc:
+            refused.append("%r -> %s" % (value, exc))
+            continue
+        if got != want:
+            not_canonical.append("%r -> %r, core says %r" % (value, got, want))
+    ok("every one of the %d spellings core resolves, the demo resolves too" % len(spellings),
+       not refused, "; ".join(refused[:3]))
+    ok("and what reaches the Router is the checkpoint, not the spelling that named it",
+       not not_canonical, "; ".join(not_canonical[:3]))
+
+    # The negatives, derived from the same tables so one of them cannot accidentally be real.
+    unknown = [v + "-nope" for v in names + aliases]
+
+    def _refuses(fn, value):
+        try:
+            fn(value)
+        except ValueError:
+            return True
+        return False
+
+    ok("a name neither core nor the demo knows still refuses on both surfaces",
+       all(_refuses(_router_mod.normalise_name, v) and _refuses(demo._check_model, v)
+           for v in unknown),
+       repr([v for v in unknown if not _refuses(demo._check_model, v)][:3]))
+
+    # Blank is the demo's own convenience, not core's: the playground posts an empty field, and
+    # core's resolver raises on one. Parity must not take that away.
+    def _resolves(v):
+        """The value the field validator accepts, or the refusal it gave -- never a raised error."""
+        try:
+            return demo._check_model(v)
+        except Exception as exc:
+            return "refused: %s" % exc
+
+    ok("a blank or whitespace-only model still means 'do not pin'",
+       [_resolves(v) for v in (None, "", "   ")] == [None, None, None],
+       repr([(v, _resolves(v)) for v in (None, "", "   ")])[:180])
+
+    regressed = demo.ROUTER
+    demo.ROUTER = RecordingRouter()
+    http = TestClient(demo.app, raise_server_exceptions=False)
+    single = http.post("/predict", json={"state": "ticket 0", "questions": one, "model": "ml"})
+    ok("an alias is accepted by /predict and the Router is asked for its checkpoint",
+       single.status_code == 200 and demo.ROUTER.predict_calls
+       and demo.ROUTER.predict_calls[-1][1].get("model") == "multilingual",
+       "%s %r" % (single.status_code, demo.ROUTER.predict_calls[-1:]))
+    batch = http.post("/predict/batch", json={"states": states, "questions": one, "model": "LAYA"})
+    ok("the same alias on /predict/batch pins english for every state in the batch",
+       batch.status_code == 200 and demo.ROUTER.batch_calls
+       and [r.get("model") for r in demo.ROUTER.batch_calls[-1][0]] == ["english"] * len(states),
+       "%s %r" % (batch.status_code, [r.get("model")
+                                      for r in (demo.ROUTER.batch_calls[-1][0]
+                                                if demo.ROUTER.batch_calls else [])][:3]))
+    bad = http.post("/predict", json={"state": "ticket 0", "questions": one,
+                                      "model": names[0] + "-nope"})
+    bad_text = json.dumps(bad.json())
+    ok("an unknown name is still a 422, in core's words plus this server's own hint",
+       bad.status_code == 422 and "unknown model" in bad_text and "choose one of" in bad_text
+       and "(or omit it)" in bad_text, bad_text[:220])
+
+    listing = http.get("/models").json()
+    ok("/models publishes the aliases a caller may use, and every one it publishes validates",
+       listing["allowed"] == names and listing.get("aliases") == {a: _router_mod._ALIASES[a]
+                                                                  for a in aliases}
+       and all(_resolves(a) == c for a, c in (listing.get("aliases") or {}).items()),
+       json.dumps(listing)[:220])
+    page = http.get("/models", headers={"accept": "text/html"}).text
+    ok("the page that lists the checkpoints names the count and the spellings it accepts",
+       ("%d checkpoints, one router" % len(names)) in page
+       and all("<code>%s</code>" % a in page for a in aliases), page[:160])
+    demo.ROUTER = regressed
+
+    def _rendered(desc):
+        """The checkpoint list and the alias list, read back out of the field's own description.
+
+        That sentence is generated from `MODELS`/`MODEL_ALIASES`, so the honest gate is to parse
+        the lists out of it and compare them with what `laya.router` accepts -- a substring check
+        would also pass a sentence somebody typed beside the tables. A render this cannot read
+        comes back as two empty lists, which fails by name instead of raising and aborting the run.
+        """
+        try:
+            names_part, alias_part = desc.split("one of ", 1)[1].split(
+                ", or an alias core resolves (", 1)
+            alias_part = alias_part.split("), in any casing", 1)[0]
+        except (IndexError, ValueError):
+            return [], []
+        return ([p.strip() for p in names_part.split(" | ")] if names_part.strip() else [],
+                [p.strip() for p in alias_part.split(", ")] if alias_part.strip() else [])
+
+    schema = http.get("/openapi.json").json()["components"]["schemas"]
+    description = schema["PredictRequest"]["properties"]["model"].get("description", "")
+    ok("the published request schema lists every name and alias the endpoint takes, in neither "
+       "more nor less", _rendered(description) == (names, aliases),
+       "rendered %r %r from tables %r %r" % (_rendered(description)[0], _rendered(description)[1],
+                                             names, aliases))
+    ok("and both request models describe the one field identically",
+       description and description
+       == schema["BatchRequest"]["properties"]["model"].get("description", ""),
+       schema["BatchRequest"]["properties"]["model"].get("description", ""))
+
+    # The section of the README that teaches this server has to say the field exists and where its
+    # spellings come from, or the only way to learn it is to get a 422.
+    with open(os.path.join(ROOT, "README.md"), encoding="utf-8") as handle:
+        readme = handle.read()
+    demo_page = readme.split("## Try it locally: web GUI + JSON API", 1)[1].split("\n---", 1)[0]
+    ok("the README section for this server teaches `model` and where its names come from",
+       "`model`" in demo_page and "laya.router" in demo_page and "/models" in demo_page,
+       demo_page[-200:])
+
+    # The registry is read, not copied. A checkpoint added to laya.router has to become pinnable
+    # here -- by name, by alias, in the schema text and on /models -- with no edit to this file.
+    # `laya.DEFAULT_MODELS` is the same dict object, so one insert reaches both reads.
+    _router_mod.DEFAULT_MODELS["spanish"] = (_router_mod.BUNDLE_REPO, "spanish")
+    _router_mod._ALIASES["es"] = "spanish"
+    try:
+        grown = importlib.reload(demo)
+        grown_names = sorted(_router_mod.DEFAULT_MODELS)
+        ok("a checkpoint core gains is pinnable here without editing this file",
+           "spanish" in grown.MODELS and _resolves("spanish") == "spanish"
+           and _resolves(" ES ") == "spanish"
+           and grown.MODEL_ALIASES.get("es") == "spanish",
+           "%r %r" % (sorted(grown.MODELS), _resolves(" es ")))
+        grown_schema = TestClient(grown.app, raise_server_exceptions=False).get(
+            "/openapi.json").json()["components"]["schemas"]
+        grown_description = grown_schema["PredictRequest"]["properties"]["model"].get("description", "")
+        ok("and the text that teaches the list is rendered from it, not typed beside it",
+           _rendered(grown_description) == (grown_names, sorted(grown.MODEL_ALIASES))
+           and grown_description
+           == grown_schema["BatchRequest"]["properties"]["model"].get("description", ""),
+           "rendered %r from %r -- %s" % (_rendered(grown_description), grown_names,
+                                          grown_description[:120]))
+        grown_listing = TestClient(grown.app, raise_server_exceptions=False).get("/models").json()
+        ok("/models reports the new checkpoint and its new alias",
+           grown_listing["allowed"] == grown_names
+           and (grown_listing.get("aliases") or {}).get("es") == "spanish",
+           json.dumps(grown_listing)[:220])
+    finally:
+        _router_mod.DEFAULT_MODELS.pop("spanish", None)
+        _router_mod._ALIASES.pop("es", None)
+        demo = importlib.reload(demo)
 
     print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
     for f in FAIL:

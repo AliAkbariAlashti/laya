@@ -57,6 +57,9 @@ from laya import Router
 # predating them the demo falls back to the 0.3.10 numbers rather than refusing to start,
 # and the fallback is dead code on every release since.
 import laya.serve as _laya_serve
+# `laya/__init__.py` already imports this module for `Router`, so naming it here costs nothing;
+# it is the source of the model registry the check below reads.
+import laya.router as _laya_router
 
 MAX_QUESTIONS = getattr(_laya_serve, "MAX_QUESTIONS", 64)
 MAX_STATE_CHARS = getattr(_laya_serve, "MAX_STATE_CHARS", 50_000)
@@ -79,17 +82,47 @@ _log = logging.getLogger("laya.example-server")
 
 MODELS = tuple(getattr(laya, "DEFAULT_MODELS", {}) or ("english", "multilingual", "typed-decisions"))
 
+# `laya.router.normalise_name` is core's one model resolver: it trims, lower-cases, maps
+# `_ALIASES`, and then checks `DEFAULT_MODELS`. Every other surface hands a caller's model string
+# to it -- `laya/serve.py::_resolve_model`, `laya/cli.py::model_name`, `laya/mcp/tools.py` -- and
+# this demo was the exception: it compared the string against `MODELS` exactly, so `laya --model
+# laya` pinned the English checkpoint while the same value POSTed here answered 422.
+normalise_name = _laya_router.normalise_name
+
+# The other spellings a caller may use for a checkpoint, inverted from the router's own table and
+# filtered to aliases that still name one of the checkpoints above, so an alias cannot outlive its
+# target and a checkpoint added to core is pinnable by alias with no edit to this file. Read with
+# the same `getattr` as the bounds: if that table ever moves, `/models` reports no aliases and
+# validation still goes through the public resolver.
+MODEL_ALIASES = {
+    alias: target
+    for alias, target in (getattr(_laya_router, "_ALIASES", {}) or {}).items()
+    if target in MODELS
+}
+
+
+def _model_names() -> str:
+    """The accepted spellings, rendered from the two lists above rather than typed out."""
+    return "one of %s, or an alias core resolves (%s), in any casing; omit to auto-route." % (
+        " | ".join(sorted(MODELS)), ", ".join(sorted(MODEL_ALIASES)))
+
 
 def _check_model(v: Optional[str]) -> Optional[str]:
-    """`model` is optional; when given it must name a known checkpoint."""
+    """`model` is optional; when given it must name a checkpoint the way core names one.
+
+    Returns the canonical checkpoint name, so what reaches the Router and what the response
+    reports is the checkpoint rather than the spelling that named it. A blank string stays
+    "do not pin": the playground posts an empty field, and core's resolver raises on one.
+    """
     if v is None:
         return None
     v = v.strip()
     if not v:
         return None
-    if v not in MODELS:
-        raise ValueError(f"unknown model {v!r}; expected one of {sorted(MODELS)} (or omit it)")
-    return v
+    try:
+        return normalise_name(v)
+    except ValueError as error:
+        raise ValueError("%s (or omit it)" % error) from None
 
 
 class Question(BaseModel):
@@ -131,8 +164,7 @@ class PredictRequest(BaseModel):
     questions: Dict[str, Question] = Field(..., min_length=1)
     model: Optional[str] = Field(
         default=None,
-        description="Optional checkpoint override: english | multilingual | typed-decisions. "
-                    "Omit to auto-route by language.",
+        description="Checkpoint override: " + _model_names(),
         examples=["multilingual"],
     )
     task: Optional[str] = None
@@ -151,7 +183,8 @@ class PredictRequest(BaseModel):
 class BatchRequest(BaseModel):
     states: List[Union[str, Dict[str, Any], List[Any]]] = Field(..., min_length=1, max_length=64)
     questions: Dict[str, Question] = Field(..., min_length=1)
-    model: Optional[str] = None
+    model: Optional[str] = Field(default=None, description="Checkpoint override: "
+                                                           + _model_names())
     task: Optional[str] = None
     lang: Optional[str] = None
 
@@ -247,6 +280,9 @@ def models(request: Request):
     payload = {
         "default": _CFG["default"],
         "allowed": sorted(MODELS),
+        # `allowed` alone would under-report the endpoint: a checkpoint may also be named by any
+        # alias core resolves, in any casing. Both lists come from laya.router, not from this file.
+        "aliases": dict(sorted(MODEL_ALIASES.items())),
         "models": {k: list(v) for k, v in (getattr(laya, "DEFAULT_MODELS", {}) or {}).items()},
     }
     return _models_page(payload) if _wants_html(request) else payload
@@ -3295,9 +3331,12 @@ def _models_page(payload: Dict[str, Any]) -> HTMLResponse:
     return _page(
         "Laya models",
         "Models",
-        "<div class='doc-head'><h1>Models</h1><span class='doc-sub'>Three checkpoints, one router</span></div>"
-        "<p class='lead'>Leave <code>model</code> out and the router picks a checkpoint by language. "
-        "Send it to pin one; any other value is rejected with a 422.</p>"
+        "<div class='doc-head'><h1>Models</h1><span class='doc-sub'>%d checkpoints, one router"
+        "</span></div>" % len(payload["allowed"])
+        + "<p class='lead'>Leave <code>model</code> out and the router picks a checkpoint by language. "
+        "Send it to pin one: a checkpoint name, or any alias core resolves -- "
+        + ", ".join("<code>%s</code>" % escape(alias) for alias in payload["aliases"])
+        + " -- in any casing. Any other value is rejected with a 422.</p>"
         + cards
         + "<div class='foot'><a class='btn line' href='/'>Open the playground</a>"
         "<a class='btn' href='/docs'>API docs</a></div>",
