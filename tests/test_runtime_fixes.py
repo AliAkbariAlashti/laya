@@ -233,6 +233,17 @@ check("mps-gate/amp disabled stays off", _mps_agent(amp=False)._amp_enabled_for(
 cpu = _bare_agent(FakeModel(), dtype=torch.bfloat16, amp=True)
 check("cpu-gate/not gated by rows", cpu._amp_enabled_for(1), True)
 
+# `dtype` is the autocast target; `dtype_for(rows)` is the precision a forward with `rows` rows
+# runs in (#621). Below the MPS gate that is fp32, even though `dtype` still says fp16.
+a = _mps_agent()
+check("dtype_for/mps below threshold is fp32", a.dtype_for(a.mps_amp_min_rows - 1), torch.float32)
+check("dtype_for/mps at threshold is the target", a.dtype_for(a.mps_amp_min_rows), torch.float16)
+check("dtype_for/mps huge threshold stays fp32", _mps_agent(min_rows=10 ** 9).dtype_for(10), torch.float32)
+check("dtype_for/target unchanged", a.dtype, torch.float16)
+check("dtype_for/amp disabled is fp32", _mps_agent(amp=False).dtype_for(100), torch.float32)
+check("dtype_for/cpu bf16 not gated by rows", cpu.dtype_for(1), torch.bfloat16)
+check("dtype_for/plain cpu is fp32", _bare_agent(FakeModel()).dtype_for(1), torch.float32)
+
 os.environ["LAYA_MPS_AMP_MIN_ROWS"] = "2"
 check("mps-gate/env override", _mps_amp_min_rows(), 2)
 os.environ["LAYA_MPS_AMP_MIN_ROWS"] = "nonsense"
