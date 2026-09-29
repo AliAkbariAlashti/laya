@@ -55,6 +55,10 @@ NQ = 2
 QUESTIONS = {"a": {"type": "noul", "instructions": "?"}, "b": {"type": "noul", "instructions": "?"}}
 
 
+# `_encode_state` items carry the state truncation counts that `predict_batch` reports in `usage` (#174)
+NO_STATE_STATS = {"state_tokens": 0, "state_tokens_used": 0, "state_tokens_dropped": 0, "truncated": False}
+
+
 def make_fake():
     """A real `predict_batch` with the three composed helpers stubbed out."""
     fake = Agent.__new__(Agent)
@@ -65,7 +69,7 @@ def make_fake():
 
     def _encode_state(state, ids, internal):
         fake._encode_states.append(state)
-        return [{"ids": [1, 2, 3], "markers": [0, 1], "qtype": 2} for _ in ids]
+        return [{"ids": [1, 2, 3], "markers": [0, 1], "qtype": 2, "state_stats": NO_STATE_STATS} for _ in ids]
 
     def _forward(b):
         n = b["input_ids"].shape[0]
@@ -447,7 +451,7 @@ def make_len_fake():
 
     def _encode(state, ids, internal, max_len=None, head_max_len=None):
         fake._seen.append((max_len, head_max_len))
-        return [{"ids": [1, 2, 3], "markers": [0, 1], "qtype": 2} for _ in ids]
+        return [{"ids": [1, 2, 3], "markers": [0, 1], "qtype": 2, "state_stats": NO_STATE_STATS} for _ in ids]
 
     fake._encode_state = _encode
     return fake

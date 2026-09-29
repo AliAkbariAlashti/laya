@@ -74,6 +74,10 @@ def make_agent(batch_result_fn):
     return a
 
 
+# `_encode_state` items carry the state truncation counts that `predict_batch` reports in `usage` (#174)
+NO_STATE_STATS = {"state_tokens": 0, "state_tokens_used": 0, "state_tokens_dropped": 0, "truncated": False}
+
+
 def make_real_agent():
     """`predict_long` on the real `predict_batch`/`system_one`, with only the three composed
     helpers stubbed -- the harness `tests/test_hooks.py` uses, so no weights are involved.
@@ -97,7 +101,7 @@ def make_real_agent():
 
     def _encode_state(state, ids, internal, **overrides):
         a._encoded.append(state)
-        return [{"ids": [1, 2, 3], "markers": [0, 1], "qtype": 2} for _ in ids]
+        return [{"ids": [1, 2, 3], "markers": [0, 1], "qtype": 2, "state_stats": NO_STATE_STATS} for _ in ids]
 
     def _forward(b):
         n = b["input_ids"].shape[0]

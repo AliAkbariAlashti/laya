@@ -424,7 +424,9 @@ class ONNXAgent(HookRegistry):
             hooks_timeout: Override the agent's `hooks_timeout` for this call.
 
         Returns a single result dict, the same shape as `system_one`, with `usage["windows"]`
-        added.
+        added. Across several windows the truncation keys are summed or carried the same way as
+        in `Agent.predict_long`: `truncated` is a window count and `truncated_questions` is the
+        last window's list, so `truncated` can be above 0 while the list is empty.
         """
         from .agent import _start_evidence, _with_start_probe
         from .hooks import aggregate_usage
@@ -567,10 +569,11 @@ class ONNXAgent(HookRegistry):
         items = []
         for qid in ids:
             q = internal[qid]
-            seq, markers, stats = build_sequence(
+            seq, markers, stats, state_stats = build_sequence(
                 self.tok, state, q, max_len, head_max_len,
                 option_order=q.get("option_order"),
                 truncate_left=truncate_left, state_ids=state_ids, return_stats=True,
+                return_truncation_stats=True,
             )
             n_opts = len(render_options(q))
             if len(markers) != n_opts:
@@ -585,7 +588,8 @@ class ONNXAgent(HookRegistry):
                     "head_max_len=%d spent on the question; lower head_max_len, raise max_len, "
                     "or use fewer options"
                     % (qid, len(markers), n_opts, max_len, head_max_len))
-            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]], "options": stats})
+            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]], "options": stats,
+                          "state_stats": state_stats})
         return items
 
     def _decode_answers(self, logits, act, items: List[Dict[str, Any]], ids: List[str],
@@ -715,7 +719,18 @@ class ONNXAgent(HookRegistry):
                 for index, items in zip(indices, per_state_items):
                     nrows = len(items)
                     n_tokens = int(att[row:row + nrows].sum())
-                    usage = {"input_tokens": n_tokens, "output_tokens": 0}
+                    # Same truncation report as Agent.predict_batch (#174).
+                    stats = [item["state_stats"] for item in items]
+                    dropped = max(s["state_tokens_dropped"] for s in stats)
+                    usage = {
+                        "input_tokens": n_tokens,
+                        "output_tokens": 0,
+                        "state_tokens": stats[0]["state_tokens"],
+                        # worst case: the questions share one state, not one head budget
+                        "state_tokens_dropped": dropped,
+                        "truncated": dropped > 0,
+                        "truncated_questions": [qid for qid, s in zip(ids, stats) if s["truncated"]],
+                    }
                     # Only when a question lost options to the head budget, as on the torch Agent.
                     collapsed = collapsed_options(ids, items)
                     if collapsed:

@@ -881,10 +881,10 @@ class Agent(HookRegistry):
         items = []
         for qid in ids:
             q = internal[qid]
-            seq, markers, stats = build_sequence(self.tok, state, q, max_len, head_max_len,
-                                                 option_order=q.get("option_order"),
-                                                 truncate_left=truncate_left, state_ids=state_ids,
-                                                 return_stats=True)
+            seq, markers, stats, state_stats = build_sequence(self.tok, state, q, max_len, head_max_len,
+                                                              option_order=q.get("option_order"),
+                                                              truncate_left=truncate_left, state_ids=state_ids,
+                                                              return_stats=True, return_truncation_stats=True)
             n_opts = len(render_options(q))
             if len(markers) != n_opts:
                 # The markers are placed at absolute positions and `build_sequence` then drops the
@@ -902,7 +902,8 @@ class Agent(HookRegistry):
                     "head_max_len=%d spent on the question; lower head_max_len, raise max_len, "
                     "or use fewer options"
                     % (qid, len(markers), n_opts, max_len, head_max_len))
-            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]], "options": stats})
+            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]], "options": stats,
+                          "state_stats": state_stats})
         return items
 
     def _amp_enabled_for(self, rows: int) -> bool:
@@ -1222,7 +1223,21 @@ class Agent(HookRegistry):
                                     n_tokens = int(att[row:row + nrows].sum())
                                     answers = self._decode_answers(logits, act, items, ids, internal, row,
                                                                   **({"lang": lang} if lang else {}))
-                                    usage = {"input_tokens": n_tokens, "output_tokens": 0}
+                                    # Truncation is a token budget that moves with max_len, head_max_len
+                                    # and each question's head, so only build_sequence knows it (#174).
+                                    stats = [item["state_stats"] for item in items]
+                                    dropped = max(s["state_tokens_dropped"] for s in stats)
+                                    usage = {
+                                        "input_tokens": n_tokens,
+                                        "output_tokens": 0,
+                                        "state_tokens": stats[0]["state_tokens"],
+                                        # worst case: the questions share one state, not one head budget
+                                        "state_tokens_dropped": dropped,
+                                        "truncated": dropped > 0,
+                                        "truncated_questions": [
+                                            qid for qid, s in zip(ids, stats) if s["truncated"]
+                                        ],
+                                    }
                                     # Only when a question actually lost options to the head
                                     # budget: an answer chosen from 42 distinguishable spans of
                                     # 58 has a ceiling the caller cannot otherwise see, and a
@@ -1334,6 +1349,15 @@ class Agent(HookRegistry):
         the `N` a start hook rewrote them to), and `0` when a start hook answered the document, or
         left no states to score, before any window was read -- on either path, so a cached answer
         never reads as a window the model read.
+
+        Across several windows the truncation keys are combined like every other `usage` field:
+        `truncated`, `state_tokens` and `state_tokens_dropped` are summed (so `truncated` is the
+        number of windows that were cut, and the token counts include the overlap), and
+        `truncated_questions` is the last window's list. The two can disagree: when only an
+        earlier window was cut, `truncated` is above 0 and `truncated_questions` is empty. A
+        window is cut when it is larger than the room a question's head leaves, from a `window`
+        above the default or a start hook that narrows `max_len` / `head_max_len`. Test
+        `usage["truncated"] > 0` here, not `is True`.
         """
         if state is None:
             raise TypeError("state must not be None; pass a string, dict, or list")
@@ -1508,6 +1532,11 @@ class Agent(HookRegistry):
             `tokens_per_option` -- because an answer chosen among 42 distinguishable spans of
             58 has a ceiling that is the budget's and not the model's. Questions whose options
             all survive are absent, so a request that collapses nothing is unchanged.
+
+            `usage` also reports whether the state fit: `truncated`, `state_tokens`,
+            `state_tokens_dropped`, and `truncated_questions` (the questions whose head left
+            too little room). A caller that cares whether the answer saw the whole state should
+            read `usage["truncated"]` rather than estimate from the length of what it sent.
 
         To score many states at once, see `predict_batch`, which shares forward passes across them.
         """
