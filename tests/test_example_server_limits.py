@@ -266,8 +266,8 @@ def main():
         # other `str(state)`. It cannot catch them being wrong together: `examples/server.py` binds
         # `_state_length` from `laya.serve` by `getattr`, so a regression inside that helper moves
         # both and parity stays green. Measured: regressing `_state_length` fails 0 of these parity
-        # checks and 4 of the absolute ones below. Those are the real coverage -- do not prune them
-        # as redundant.
+        # checks and both of the absolute ones below. Those are the real coverage -- do not prune
+        # them as redundant.
         ("a state whose repr is half its JSON", {"body": '"' * 49988}, one),
     ]
     for label, st, qs in parity_cases:
@@ -277,10 +277,15 @@ def main():
     # Parity alone cannot see a bug both surfaces share, and `getattr` guarantees they share one:
     # with `_state_length` measuring `str(state)` again, both agree on accepting a state that
     # serializes to 99 988 characters and every parity check above stays green (measured: 0 of them
-    # fail, 4 of these do). So the verdict itself is asserted, not just the agreement.
+    # fail, both of these do). So the verdict itself is asserted, not just the agreement.
     quote_heavy = {"body": '"' * 49988}
-    assert len(str(quote_heavy)) <= MAX_STATE_CHARS, "the fixture must pass a str()-based gate"
-    assert len(json.dumps(quote_heavy, ensure_ascii=False)) > MAX_STATE_CHARS, "and fail a real one"
+    # Recorded through `ok` like everything else in this file: a bare `assert` here would raise out
+    # of `main()` and abandon the ~30 checks that follow instead of recording one failure.
+    ok("the quote-heavy fixture passes a str()-based gate",
+       len(str(quote_heavy)) <= MAX_STATE_CHARS, len(str(quote_heavy)))
+    ok("the quote-heavy fixture fails a serialization-based gate",
+       len(json.dumps(quote_heavy, ensure_ascii=False)) > MAX_STATE_CHARS,
+       len(json.dumps(quote_heavy, ensure_ascii=False)))
     for who, verdict in (("laya.serve", serve_verdict(quote_heavy, one)),
                          ("the demo server", demo_verdict(quote_heavy, one))):
         ok("%s refuses a state whose JSON is twice its repr" % who, verdict == "refused", verdict)

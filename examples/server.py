@@ -293,9 +293,12 @@ def _check_request_limits(state: Any, questions: Dict[str, Any]) -> None:
     Laya encodes the state once per question, so cost is questions x state size,
     collated into one tensor, and a choice or score question adds one sequence per
     option against a shared head budget. The state length comes from laya.serve's own
-    `_state_length`, so the two surfaces cannot disagree about what a state measures,
-    and the option counts exactly as it counts them, over `choice` and `score`
-    criteria only.
+    `_state_length` by `getattr`, so the two surfaces cannot disagree about what a state
+    *measures*, and the option counts exactly as it counts them, over `choice` and
+    `score` criteria only. They can still differ in which limit they report first: this
+    handler checks state size before the option budgets and `laya.serve` checks it after,
+    so a request violating both gets a different `detail` from each. That ordering is
+    unchanged here.
 
     Checked here rather than declared as pydantic constraints on the request models,
     for two reasons: a `Field(max_length=...)` violation is reported as 422 where

@@ -199,9 +199,11 @@ def _resolve_port() -> int:
     return port
 
 
-#: Values examined by `_provably_over_state_limit` before it gives up. A constant, so the probe can
-#: never cost more than one: it exists to catch an oversized value for free, not to replace the
-#: encoder.
+#: Values the walk in `_state_length_lower_bound_over` will examine before giving up. This bounds the
+#: values *inspected*, not the total work: `stack.extend` pushes a container's elements without
+#: charging them against the budget, so a 2 MiB body of many small values costs ~0.43 ms of walking
+#: before falling through to the dump it was going to pay anyway (~6% on top). An ACCEPTED state is
+#: capped at MAX_STATE_CHARS, where the walk is ~0.01 ms.
 _STATE_PROBE_VALUES = 64
 
 
@@ -216,6 +218,10 @@ def _state_length_lower_bound_over(state: Any, cap: int) -> int:
     unlike reporting `cap + 1`, which would answer "state too large (50001 > 50000 chars)" for a
     60 012-character state. That is the same fabricated-count flaw this gate replaces, and an
     earlier revision of this branch reintroduced it.
+
+    One consequence worth knowing: the number in a 413 is therefore the exact serialized length when
+    the encoder ran, and this understated bound when it did not. Both are truthful and neither
+    overstates, but a client trimming exactly the difference the message names can still be refused.
 
     The bound: the raw lengths of the string values are a *lower* bound on the JSON length. Escaping
     maps each character to one or more characters and so never shortens; keys, separators, brackets
@@ -240,12 +246,20 @@ def _state_length_lower_bound_over(state: Any, cap: int) -> int:
             total += len(item)
             if total > cap:
                 return total
-        elif isinstance(item, dict):
+        elif type(item) is dict:
             # `.values()` and `extend` stay at C level; the keys are ignored, which keeps this a
             # lower bound. Iterating items in Python here made a 2000-key state 1.66x slower.
             stack.extend(item.values())
-        elif isinstance(item, (list, tuple)):
+        elif type(item) is list or type(item) is tuple:
             stack.extend(item)
+        else:
+            # EXACT types only, deliberately. A `dict` subclass may override `values()` while
+            # `json.dumps` reads the real items, which would let this "lower bound" exceed the true
+            # length -- measured: a 13-character state refused as `60000 > 50000`. Anything else,
+            # including a subclass, a set or a cycle, is handed to the encoder, which decides the
+            # size or raises and becomes the 400 below. `json.loads` only ever builds exact types,
+            # so no HTTP request takes this branch.
+            return 0
     return 0
 
 
@@ -272,7 +286,7 @@ def _state_length(state: Any) -> int:
     Cost. At the gate's own ceiling the dump is 0.133 ms against 0.080 ms for the `str()` it
     replaces -- orders of magnitude under the forward pass that state then gets, so the serialized
     text is not worth threading through `predict()` to be encoded only once. A state large enough
-    for that difference to matter never reaches the dump: `_provably_over_state_limit` refuses it
+    for that difference to matter never reaches the dump: `_state_length_lower_bound_over` refuses it
     first, which is what keeps an oversized body from costing more to reject than it did upstream.
     (Best of 200 after 20 warm-up iterations, CPython 3.12 on a 10-core arm64 laptop.)
     """
