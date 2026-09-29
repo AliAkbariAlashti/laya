@@ -139,3 +139,49 @@ selector = LayaSingleSelector(
 ```
 
 The remote client uses Python's standard library `urllib` with zero heavy dependencies, preventing cross-origin credential forwarding and matching the `/v1/systemone` specification.
+
+---
+
+## 6. Per-call decision controls
+
+`LayaSingleSelector`, `LayaMultiSelector` and `LayaQueryRouter` take the same per-call arguments the
+core API does: the two token budgets (`max_len`, `head_max_len`) and the five prediction-hook
+arguments (`hooks`, `on_predict_start`, `on_predict_end`, `hooks_raise`, `hooks_timeout`). They are
+per selector, so a wide routing step can be given room while the rest of the pipeline keeps the
+checkpoint's defaults.
+
+A choice question's options share the checkpoint's *option* budget -- `head_max_len`, 192 tokens on
+`laya` -- and every candidate contributes its name and description, so past roughly 20 tools the
+descriptions start reaching the model as the same text.
+
+```python
+selector = LayaSingleSelector(
+    instructions="Which tool or query engine is best suited to answer this query?",
+    max_len=1024,          # total window
+    head_max_len=512,      # tokens shared by the option prompt
+)
+result = selector.select(tools, query)     # tools: 59 descriptions
+```
+
+Measured on `laya` (Apple silicon, one forward pass per query, scored on the chosen tool) with a
+59-tool roster built from the MASSIVE en intent labels and one utterance per label, so ground truth
+is exact. Each cell is how many of the 59 queries reached their own tool; both repeats gave the
+same count.
+
+| 59-tool roster | Default budget | `max_len=1024, head_max_len=384` | `…, head_max_len=512` |
+|---|---|---|---|
+| Queries on their own tool | 2/59 | 8/59 | 15/59 |
+| Median ms per query | 160 | 172 | 184 |
+
+Absolute accuracy is not the claim here: the checkpoint is not a MASSIVE classifier, and 59 similar
+labels are a stress shape. The claim is the direction and the price -- a roster the default budget
+collapses to near-nothing is readable, and at this size the window costs little time. With fewer
+than about 20 options the labels already fit and widening can move answers the wrong way, which is
+why both arguments are opt-in per selector. See the [LangChain
+integration](langchain.md#7-widening-the-token-budget-for-many-options) for that measured cliff.
+
+**Hooks run on the local path only.** A selector with a `base_url` and `hooks=[...]` raises
+`ValueError` rather than reporting a success whose cache never ran -- a hook is a Python callable
+that runs inside `predict`, and no wire format carries it. Install hooks in the process that runs
+inference. The two budgets do travel to a remote node, in the request body, up to its
+`LAYA_MAX_TOKEN_BUDGET` ceiling; a larger value comes back as a 422.

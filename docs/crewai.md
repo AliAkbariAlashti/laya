@@ -5,6 +5,8 @@ Laya provides sub-35ms, non-autoregressive decision components for **CrewAI** mu
 * **`LayaCrewRouter`**: Sub-35ms task delegation router replacing LLM managers in hierarchical crews.
 * **`LayaTaskGuard`**: Pre-execution task guardrail screening prompts and instructions for jailbreaks, injections, and policy violations.
 
+Both take core's per-call decision controls -- the two token budgets (`max_len`, `head_max_len`) and the five prediction-hook arguments (`hooks`, `on_predict_start`, `on_predict_end`, `hooks_raise`, `hooks_timeout`) -- see [Per-call decision controls](#5-per-call-decision-controls).
+
 Supports both **local in-process inference** (`Agent` or `Router`) and **remote HTTP inference** against your own `laya-serve` instance without requiring PyTorch on edge clients.
 
 ---
@@ -121,3 +123,55 @@ router = LayaCrewRouter(
 ```
 
 The remote client uses Python's standard library `urllib` with zero heavy dependencies, preventing cross-origin credential forwarding and matching the `/v1/systemone` specification.
+
+---
+
+## 5. Per-call decision controls
+
+`LayaCrewRouter` and `LayaTaskGuard` take the same per-call arguments the core API does: the two
+token budgets (`max_len`, `head_max_len`) and the five prediction-hook arguments (`hooks`,
+`on_predict_start`, `on_predict_end`, `hooks_raise`, `hooks_timeout`). They are per instance, so a
+crew with a large roster can be given room while the rest of the pipeline keeps the checkpoint's
+defaults.
+
+A delegation choice shares the checkpoint's *option* budget -- `head_max_len`, 192 tokens on `laya`
+-- and every candidate contributes its role and goal, so past roughly 20 agents the later goals
+start reaching the model as the same truncated text.
+
+```python
+router = LayaCrewRouter(
+    confidence_threshold=0.80,
+    max_len=1024,          # total window
+    head_max_len=512,      # tokens shared by the roster
+)
+
+decision = router.route(task, agents)   # agents: 59 candidates
+```
+
+Measured with `laya` on Apple silicon, one forward pass per task, scored on the delegated agent,
+against a 59-agent roster built from the MASSIVE en intent labels (role only, goal left empty) with
+one utterance per label, so ground truth is exact. Each cell is how many of the 59 tasks were given
+to their own agent; both repeats gave the same count.
+
+| 59-agent roster | Default budget | `max_len=1024, head_max_len=384` | `…, head_max_len=512` |
+|---|---|---|---|
+| Tasks on their own agent | 2/59 | 7/59 | 16/59 |
+| Median ms per task | 146 | 190 | 265 |
+
+Before this, the same run could not be asked at all: `LayaCrewRouter.__init__() got an unexpected
+keyword argument 'max_len'`.
+
+Absolute accuracy is not the claim here -- the checkpoint is not a MASSIVE classifier and 59 similar
+labels are a stress shape. The claim is reachability and price: a roster the default budget collapses
+to near-nothing is readable from a crew, and at this size the wider window costs little time. Note
+the middle row is 7/59 where the identical criteria sent straight to `Router.predict` scored 8/59;
+only the `instructions` sentence differed, which is the expected sensitivity of a choice question to
+its own wording. With fewer than about 20 candidates the roles already fit and widening can move
+answers the wrong way, which is why both budgets are opt-in per instance. See the [LangChain
+integration](langchain.md#7-widening-the-token-budget-for-many-options) for that measured cliff.
+
+**Hooks run on the local path only.** A router or guard with a `base_url` and `hooks=[...]` raises
+`ValueError` rather than reporting a success whose hook never ran -- a hook is a Python callable that
+executes inside `predict`, and no wire format carries it. Install hooks in the process that runs
+inference. The two budgets do travel to a remote node, in the request body, up to its
+`LAYA_MAX_TOKEN_BUDGET` ceiling; a larger value comes back as a 422.

@@ -51,6 +51,12 @@ class LayaTaskGuardError(ValueError):
         self.raw_decision = raw_decision
 
 
+# The per-call control rules are shared with the other two integrations: they end at the same
+# `predict` call and the same laya-serve request body, and three copies of the rule is how two of
+# them came to forward only `model`.
+from ._controls import budget_kwargs as _budget_kwargs, hook_kwargs as _hook_kwargs  # noqa: E402
+from ._controls import predict_kwargs as _predict_kwargs, reject_remote_hooks as _reject_remote_hooks  # noqa: E402
+
 # One class for every integration, so `except LayaLowConfidenceError` catches all of them.
 from ._errors import LayaLowConfidenceError  # noqa: E402
 
@@ -138,8 +144,14 @@ def _call_remote(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     timeout: float = 10.0,
+    max_len: Optional[int] = None,
+    head_max_len: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Send decision request to a remote laya-serve HTTP instance using standard library urllib."""
+    """Send decision request to a remote laya-serve HTTP instance using standard library urllib.
+
+    `max_len` / `head_max_len` travel in the body; laya-serve applies them up to its
+    `LAYA_MAX_TOKEN_BUDGET` ceiling and answers a larger value with 422.
+    """
     url = base_url.rstrip("/")
     if not url.endswith("/v1/systemone"):
         url = f"{url}/v1/systemone"
@@ -147,6 +159,10 @@ def _call_remote(
     payload: Dict[str, Any] = {"state": state, "questions": questions}
     if model:
         payload["model"] = model
+    if max_len is not None:
+        payload["max_len"] = max_len
+    if head_max_len is not None:
+        payload["head_max_len"] = head_max_len
 
     data = json.dumps(payload).encode("utf-8")
     headers = {"Content-Type": "application/json"}
@@ -186,11 +202,27 @@ def _execute_decision(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     model: Optional[str] = None,
+    max_len: Optional[int] = None,
+    head_max_len: Optional[int] = None,
+    hooks: Optional[Any] = None,
+    on_predict_start: Optional[Any] = None,
+    on_predict_end: Optional[Any] = None,
+    hooks_raise: Optional[bool] = None,
+    hooks_timeout: Optional[float] = None,
 ) -> Dict[str, Any]:
+    """One decision on the local runner or a laya-serve node, with the per-call controls kept.
+
+    Which controls either path accepts is `._controls`' rule, shared with the LangChain and
+    LlamaIndex wrappers -- they end at the same `predict` call and the same request body.
+    """
+    hook_kwargs = _hook_kwargs(hooks, on_predict_start, on_predict_end, hooks_raise, hooks_timeout)
     if base_url:
-        return _call_remote(base_url, state, questions, api_key=api_key, model=model)
+        _reject_remote_hooks(hook_kwargs, base_url)
+        budget = _budget_kwargs(max_len, head_max_len)
+        return _call_remote(base_url, state, questions, api_key=api_key, model=model, **budget)
     runner = agent if agent is not None else _get_default_router()
-    kwargs = {"model": model} if model else {}
+    kwargs = _predict_kwargs(model, max_len, head_max_len)
+    kwargs.update(hook_kwargs)
     return runner.predict(state, questions, **kwargs)
 
 
@@ -211,6 +243,13 @@ class LayaCrewRouter:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
+        max_len: Optional[int] = None,
+        head_max_len: Optional[int] = None,
+        hooks: Optional[Any] = None,
+        on_predict_start: Optional[Any] = None,
+        on_predict_end: Optional[Any] = None,
+        hooks_raise: Optional[bool] = None,
+        hooks_timeout: Optional[float] = None,
     ):
         self.instructions = instructions
         self.confidence_threshold = confidence_threshold
@@ -220,6 +259,13 @@ class LayaCrewRouter:
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
+        self.max_len = max_len
+        self.head_max_len = head_max_len
+        self.hooks = hooks
+        self.on_predict_start = on_predict_start
+        self.on_predict_end = on_predict_end
+        self.hooks_raise = hooks_raise
+        self.hooks_timeout = hooks_timeout
         self.last_decision: Optional[Dict[str, Any]] = None
 
     def route(
@@ -249,6 +295,13 @@ class LayaCrewRouter:
             base_url=self.base_url,
             api_key=self.api_key,
             model=self.model,
+            max_len=self.max_len,
+            head_max_len=self.head_max_len,
+            hooks=self.hooks,
+            on_predict_start=self.on_predict_start,
+            on_predict_end=self.on_predict_end,
+            hooks_raise=self.hooks_raise,
+            hooks_timeout=self.hooks_timeout,
         )
         self.last_decision = res
 
@@ -359,6 +412,13 @@ class LayaTaskGuard:
         base_url: Optional[str] = None,
         api_key: Optional[str] = None,
         model: Optional[str] = None,
+        max_len: Optional[int] = None,
+        head_max_len: Optional[int] = None,
+        hooks: Optional[Any] = None,
+        on_predict_start: Optional[Any] = None,
+        on_predict_end: Optional[Any] = None,
+        hooks_raise: Optional[bool] = None,
+        hooks_timeout: Optional[float] = None,
     ):
         self.questions = questions
         self.action = action
@@ -368,6 +428,13 @@ class LayaTaskGuard:
         self.base_url = base_url
         self.api_key = api_key
         self.model = model
+        self.max_len = max_len
+        self.head_max_len = head_max_len
+        self.hooks = hooks
+        self.on_predict_start = on_predict_start
+        self.on_predict_end = on_predict_end
+        self.hooks_raise = hooks_raise
+        self.hooks_timeout = hooks_timeout
         self.last_decision: Optional[Dict[str, Any]] = None
 
     def _default_questions(self) -> Dict[str, Any]:
@@ -386,6 +453,13 @@ class LayaTaskGuard:
             base_url=self.base_url,
             api_key=self.api_key,
             model=self.model,
+            max_len=self.max_len,
+            head_max_len=self.head_max_len,
+            hooks=self.hooks,
+            on_predict_start=self.on_predict_start,
+            on_predict_end=self.on_predict_end,
+            hooks_raise=self.hooks_raise,
+            hooks_timeout=self.hooks_timeout,
         )
         self.last_decision = res
         answers = res.get("answers", {})
