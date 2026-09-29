@@ -1,4 +1,5 @@
-"""Load supported file-backed secrets, then replace this process with the command."""
+"""Load supported file-backed secrets, then replace this process with the command; on Windows,
+run the child and propagate its exit code instead."""
 import os
 from pathlib import Path
 import subprocess

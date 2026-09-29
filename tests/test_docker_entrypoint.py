@@ -154,6 +154,21 @@ class EntrypointTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("command is required", result.stderr)
 
+    def test_child_exit_code_propagates(self):
+        """A child that exits 42 hands that status to the entrypoint's caller.
+
+        The exec path keeps it by replacing the process; the Windows path runs the child and
+        propagates `returncode`, which the `os.execvp` emulation never did -- it exited 0
+        whatever the child did.
+        """
+        blocked = {prefix for secret in SECRET_NAMES for prefix in (secret, secret + "_FILE")}
+        env = {key: value for key, value in os.environ.items() if key not in blocked}
+        result = subprocess.run(
+            [sys.executable, str(ENTRYPOINT), sys.executable, "-c", "import sys; sys.exit(42)"],
+            env=env, capture_output=True, text=True, check=False,
+        )
+        self.assertEqual(result.returncode, 42, result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()
