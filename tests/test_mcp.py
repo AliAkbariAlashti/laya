@@ -47,6 +47,7 @@ from laya.mcp.tools import (  # noqa: E402
     validate_batch_requests,
     validate_budget,
     validate_lang,
+    validate_min_confidence,
     validate_model,
     validate_preset,
     validate_questions,
@@ -1661,6 +1662,142 @@ def test_controls_signature_and_schema():
         ok("schema/%s_required_unchanged" % name,
            required == (["preset", "state"] if name == "laya_preset" else ["state", "questions"]),
            repr(required))
+
+
+def test_min_confidence_control():
+    """`min_confidence` -- core's per-call abstention gate (#361) -- is reachable over MCP.
+
+    #567 forwarded every other per-call control (task/lang/max_len/head_max_len) to these tools,
+    but not this one: a client could pin a checkpoint and size its budget over the wire, yet could
+    not ask Laya to abstain on an unsure answer -- even though `min_confidence` is a validated
+    keyword of `Agent.predict`, `Router.predict`/`predict_batch` and `laya.decide` on `main`.
+    """
+    import inspect
+
+    # The range/bool/non-finite rule is core's; this layer only re-labels the refusal, so it can
+    # never be wider or narrower than `check_min_confidence`.
+    ok("minconf/none_is_unset", validate_min_confidence(None) is None)
+    for value in (0, 0.0, 0.5, 1, 1.0, 0.94):
+        ok("minconf/ok_%r" % (value,), validate_min_confidence(value) == float(value),
+           repr(validate_min_confidence(value)))
+    for bad in (-0.1, 1.1, 2, True, False, [], {}, "0.5", float("nan"), float("inf")):
+        expect_tool_error("minconf/rejected_%r" % (bad,),
+                          lambda b=bad: validate_min_confidence(b), "invalid_min_confidence")
+
+    # laya_predict forwards it to core's predict, and only when set: a no-abstention call reaches
+    # core exactly as it did before the keyword was exposed here.
+    router = ControlRouter()
+    laya_predict(STATE, QUESTIONS, router=router)
+    ok("predict/minconf_unset_absent", router.predict_calls == [{}], repr(router.predict_calls))
+    router = ControlRouter()
+    laya_predict(STATE, QUESTIONS, min_confidence=0.85, router=router)
+    ok("predict/minconf_forwarded", router.predict_calls == [{"min_confidence": 0.85}],
+       repr(router.predict_calls))
+    router = ControlRouter()
+    laya_predict(STATE, QUESTIONS, lang="de", max_len=1024, min_confidence=0.9, router=router)
+    ok("predict/minconf_alongside_controls",
+       router.predict_calls == [{"lang": "de", "max_len": 1024, "min_confidence": 0.9}],
+       repr(router.predict_calls))
+    router = ControlRouter()
+    expect_tool_error("predict/bad_minconf",
+                      lambda: laya_predict(STATE, QUESTIONS, min_confidence=2, router=router),
+                      "invalid_min_confidence")
+    ok("predict/bad_minconf_no_call", router.predict_calls == [], repr(router.predict_calls))
+    agent = ControlAgent()
+    laya_predict(STATE, QUESTIONS, model="english", min_confidence=0.5, agent=agent)
+    ok("predict/agent_minconf", agent.calls == [{"min_confidence": 0.5}], repr(agent.calls))
+
+    # laya_shortlist carries it to the answering pass beside the budget (route stays budget-free).
+    small = {"dept": {"type": "choice", "instructions": "pick",
+                      "criteria": {"a": "A", "b": "B", "c": "C", "d": "D", "e": "E"}}}
+    router = ControlRouter(routed="multilingual")
+    laya_shortlist(STATE, small, k=2, head_max_len=384, min_confidence=0.8,
+                   router=router, embed_fn=_tie_embed)
+    ok("shortlist/minconf_reaches_predict",
+       router.predict_calls == [{"model": "multilingual", "head_max_len": 384,
+                                 "min_confidence": 0.8}], repr(router.predict_calls))
+    router = ControlRouter(routed="multilingual")
+    laya_shortlist(STATE, small, k=2, router=router, embed_fn=_tie_embed)
+    ok("shortlist/minconf_unset_absent",
+       "min_confidence" not in router.predict_calls[0], repr(router.predict_calls))
+    router = ControlRouter()
+    expect_tool_error("shortlist/bad_minconf",
+                      lambda: laya_shortlist(STATE, small, k=2, min_confidence=-1, router=router,
+                                             embed_fn=_tie_embed),
+                      "invalid_min_confidence")
+
+    # laya_preset inherits the control through laya_predict.
+    def builder(attr):
+        return {"probe": {"type": "noul", "instructions": "Does the `body` need a human?"}}
+    router = ControlRouter()
+    laya_preset("guard", STATE, min_confidence=0.7, router=router, preset_builder=builder)
+    ok("preset/minconf_forwarded", router.predict_calls == [{"min_confidence": 0.7}],
+       repr(router.predict_calls))
+
+    # The flagship: laya_decide uses core's abstention to null an unsure field while still
+    # reporting its confidence -- the one thing a values-consuming client needs and cannot get
+    # any other way over MCP. FakeRouter answers department at 0.94, urgency at 0.8, needs_human
+    # at 0.89, so a 0.9 gate keeps the first and nulls the other two.
+    router = TypeEchoRouter()
+    plain = laya_decide(STATE, DECIDE_SCHEMA, router=router)
+    ok("decide/minconf_unset_no_nul", plain["values"]["urgency"] == 2
+       and plain["values"]["needs_human"] is True, repr(plain["values"]))
+    abstained = laya_decide(STATE, DECIDE_SCHEMA, min_confidence=0.9, router=router)
+    ok("decide/keeps_confident_field", abstained["values"]["department"] == "billing",
+       repr(abstained["values"]))
+    ok("decide/nulls_low_score", abstained["values"]["urgency"] is None,
+       repr(abstained["values"]))
+    ok("decide/nulls_low_noul", abstained["values"]["needs_human"] is None,
+       repr(abstained["values"]))
+    ok("decide/confidence_survives_null",
+       set(abstained["confidence"]) == {"department", "urgency", "needs_human"}
+       and abstained["confidence"]["urgency"] == 0.8, repr(abstained["confidence"]))
+    # A threshold of 0 abstains over nothing -- the raw answers are byte-identical to no call.
+    zero = laya_decide(STATE, DECIDE_SCHEMA, min_confidence=0.0, router=router)
+    ok("decide/zero_is_no_abstention", zero["values"] == plain["values"], repr(zero["values"]))
+
+    # The tool is a thin surface over the documented core abstention, not a second projection.
+    import laya
+
+    core = laya.decide(router, STATE, schema=DECIDE_SCHEMA, min_confidence=0.9)
+    ok("decide/abstention_parity_with_core", abstained["values"] == core,
+       "tool=%r core=%r" % (abstained["values"], core))
+
+    # Refused before core, so a bad threshold costs no forward pass.
+    router = TypeEchoRouter()
+    expect_tool_error("decide/bad_minconf",
+                      lambda: laya_decide(STATE, DECIDE_SCHEMA, min_confidence=1.5, router=router),
+                      "invalid_min_confidence")
+
+    # Every tool that answers exposes the keyword, defaults it to None, and documents it.
+    tools = [laya_predict, laya_shortlist, laya_preset, laya_decide]
+    for fn in tools:
+        params = inspect.signature(fn).parameters
+        ok("sig/%s_has_min_confidence" % fn.__name__, "min_confidence" in params,
+           repr(sorted(params)))
+        ok("sig/%s_min_confidence_default_none" % fn.__name__,
+           params["min_confidence"].default is None, repr(params["min_confidence"].default))
+        ok("sig/%s_min_confidence_keyword_only" % fn.__name__,
+           params["min_confidence"].kind is inspect.Parameter.KEYWORD_ONLY)
+    by_name = {t.name: t for t in asyncio.run(mcp_server.list_tools())}
+    for name in ("laya_predict", "laya_shortlist", "laya_preset", "laya_decide"):
+        tool = by_name[name]
+        schema = tool.input_schema if hasattr(tool, "input_schema") else tool.inputSchema
+        props = schema.get("properties", {})
+        spec = props.get("min_confidence", {})
+        ok("schema/%s_exposes_min_confidence" % name, "min_confidence" in props,
+           repr(sorted(props)))
+        ok("schema/%s_min_confidence_nullable" % name,
+           {"type": "null"} in (spec.get("anyOf") or []), repr(spec))
+        ok("schema/%s_min_confidence_typed" % name,
+           any(opt.get("type") in ("number", "integer") for opt in (spec.get("anyOf") or [spec])),
+           repr(spec))
+        ok("schema/%s_min_confidence_not_required" % name,
+           "min_confidence" not in schema.get("required", []), repr(schema.get("required")))
+        ok("schema/%s_desc_documents_min_confidence" % name,
+           "min_confidence" in tool.description.lower(), repr(tool.description[-80:]))
+
+
 def test_question_validation_matches_the_agent():
     """MCP must reject a bad question the same way the agent does, and say so.
 
@@ -2002,6 +2139,7 @@ test_controls_route()
 test_controls_shortlist()
 test_controls_preset()
 test_controls_signature_and_schema()
+test_min_confidence_control()
 test_question_validation_matches_the_agent()
 test_a_bad_question_is_a_caller_error_not_a_server_fault()
 test_timeout_removed()
