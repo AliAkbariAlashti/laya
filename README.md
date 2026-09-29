@@ -1118,10 +1118,21 @@ failure; it does not establish calibrated confidence.
   The positive control passed on both checkpoints. These are narrow cancellation examples, not
   evidence that every negated state fails. Validate the exact checkpoint and wording you serve;
   using semantic keys alone does not avoid this failure.
-* **High-cardinality choice questions and token budgets:** Sequences split into an option prompt budget (`head_max_len`) and the remaining document/state budget. **`head_max_len` is a cap, not the head length:** the renderer fills it only as far as the question and its option descriptions need, and `build_sequence` sizes the state from the head it *actually built* (`room = max_len - head_len - 1`). The cap-based figure `max_len - head_max_len` is therefore a **lower bound** on the room a request really has, and at the shipped defaults it understates that room substantially:
-  * `laya` (English) defaults to 512 context (`head_max_len = 192`). The shipped question renders a **48-token** head, leaving **463 tokens for state**, not 320.
+* **High-cardinality choice questions and token budgets:** Sequences split into an option prompt budget (`head_max_len`) and the remaining document/state budget. **`head_max_len` is a cap, not the head length.** The renderer fills the option prompt budget only as far as the question and its option descriptions need, and `build_sequence` then sizes the state from the head it *actually built* (`room = max_len - head_len - 1`). The real room therefore depends on the question, not on the cap:
+  * `laya` (English) defaults to 512 context (`head_max_len = 192`). The shipped department question below renders a **48-token** head, leaving **463 tokens for state**, not 320.
   * `laya-multilingual` and `laya-typed-decisions` default to 1,024 context (`head_max_len = 256`). The shipped question renders a **45-token** head, leaving **978 tokens for state**, not 768 (mmBERT-base encoder supports up to 8,192 with RoPE).
-  Because the head grows with the question and its option descriptions, the room a given request has is `max_len - head_len - 1` for *that* request. Sizing a state to the cap-based figure is safe but wasteful: it truncates earlier than the library would and drops state the model would otherwise have read. The cap-based figure is never an overestimate, since `head_len <= head_max_len + 3`.
+  `max_len - head_max_len` is **not a safe figure in either direction**, so size a state to `max_len - head_len - 1` for the question you are actually asking:
+  * For a question that does not fill the cap it **understates** the room, as above — conservative, but it discards state the model would have read.
+  * For a high-cardinality question it **overstates** it. `per = max(4, (head_max_len - 16) // k)` floors at 4 tokens per option and `head_ids` keeps a floor of 8, so past roughly `head_max_len / 4` options the head grows *beyond* the cap. A state sized to the cap-based figure is then **truncated**, not merely conservative:
+
+    | | `k` options | head | real room | cap-based figure |
+    |---|---|---|---|---|
+    | `laya`, `max_len=512` | 77 | 319 | **192** | 320 |
+    | `laya`, `max_len=512` | 100 | 411 | **100** | 320 |
+    | `laya-multilingual`, `max_len=1024` | 100 | 411 | **612** | 768 |
+
+    The crossover is at `k ≈ head_max_len / 4` and the gap widens from there; `MAX_CHOICE_OPTIONS = 100` in `laya/serve.py` puts the overstating regime within reach over HTTP.
+
   At default settings, a 77-option question like Banking77 allocates only `(256 - 16) // 77` ≈ 3–4 tokens per label, which causes accuracy to fall off sharply (0.425 vs Jev's 0.870). If evaluating 50+ options in a single question:
   1. Raise `agent.cfg["head_max_len"] = 512` and `agent.cfg["max_len"] = 1024` (or up to 2048 / 4096 / 8192) so every option has enough tokens to remain distinct. Both are also per-request: `predict(state, questions, head_max_len=512, max_len=1024)` widens one question without changing the agent for everyone else, and every LangChain node takes the same two arguments ([LangChain guide](docs/langchain.md)). `laya --questions` takes the same two budgets as `--max-len` / `--head-max-len`.
   2. Or shortlist with embeddings and run one forward pass on the top `k` labels (`predict_shortlist`, example below). `predict` and `system_one` still score every criterion they are given.

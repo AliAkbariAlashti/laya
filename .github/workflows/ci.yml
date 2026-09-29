@@ -102,6 +102,7 @@ jobs:
           python tests/test_batch.py
           python tests/test_predict_long.py
           python tests/test_attention_dynamic_shapes.py
+          python tests/test_state_budget.py
           python tests/test_hooks.py
           python tests/test_hooks_api.py
           python tests/test_structured.py
