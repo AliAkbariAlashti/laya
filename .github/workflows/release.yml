@@ -35,7 +35,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip build twine
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install -e .
+          pip install -e . pytest
 
       - name: Tests must pass before anything is published
         run: |
@@ -56,6 +56,7 @@ jobs:
           python tests/test_decision_model.py
           python tests/test_head_checkpointing.py
           python tests/test_truncation.py
+          python -m pytest tests/test_truncation_direction.py -q
           python tests/test_packaging.py
           python tests/test_compose_env.py
           python tests/test_doc_tables.py
