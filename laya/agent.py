@@ -628,7 +628,7 @@ class Agent(HookRegistry):
             raise ValueError("question %r: definition must be a dict, got %s"
                              % (qid, type(qdef).__name__))
         t = qdef.get("type")
-        if t not in QTYPES:
+        if not isinstance(t, str) or t not in QTYPES:
             raise ValueError("question %r: unknown type %r; use one of %s" % (qid, t, sorted(QTYPES)))
         if "instructions" not in qdef:
             raise ValueError("question %r: no 'instructions'; add the text the model should answer" % (qid,))

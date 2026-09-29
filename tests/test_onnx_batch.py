@@ -175,6 +175,18 @@ check_raises("empty/bare dict rejected", TypeError,
              lambda: _bare_onnx().predict_batch({"body": "x"}, QUESTIONS))
 check_raises("empty/invalid question rejected before any run", ValueError,
              lambda: _bare_onnx().predict_batch(STATES, {"bad": {"type": "nope", "instructions": "?"}}))
+for bad_type in ([], {}):
+    invalid = _bare_onnx()
+    name = "invalid/question type %r" % (bad_type,)
+    try:
+        invalid.predict_batch(STATES, {"refund": {"type": bad_type, "instructions": "Refund requested?"}})
+        FAIL.append("%s: no error raised" % name)
+    except ValueError as e:
+        check(name, str(e), "question 'refund': unknown type %r; use one of ['choice', 'noul', 'score']"
+              % (bad_type,))
+    except Exception as e:
+        FAIL.append("%s: %s instead of ValueError: %s" % (name, type(e).__name__, e))
+    check("%s does not run the session" % name, invalid.session.calls, [])
 check("budget/max_len and head_max_len forward through the batch path",
       _bare_onnx().predict_batch(STATES, QUESTIONS, max_len=32, head_max_len=16),
       [_bare_onnx().system_one(s, QUESTIONS, max_len=32, head_max_len=16) for s in STATES])

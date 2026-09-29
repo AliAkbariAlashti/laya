@@ -684,6 +684,20 @@ class ValidatingRouter:
         raise AssertionError("validation should have rejected this before predict()")
 
 
+@pytest.mark.parametrize("bad_type", [[], {}], ids=["list", "dict"])
+def test_malformed_question_type_is_a_named_422(monkeypatch, bad_type):
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    client = TestClient(create_app(router=ValidatingRouter()), raise_server_exceptions=False)
+    body = dict(REQ)
+    body["questions"] = {"refund": {"type": bad_type, "instructions": "Is a refund requested?"}}
+
+    response = client.post("/v1/systemone", json=body)
+
+    assert response.status_code == 422, response.text
+    assert response.json()["detail"] == (
+        "question 'refund': unknown type %r; use one of ['choice', 'noul', 'score']" % (bad_type,))
+
+
 def test_a_nested_choice_label_is_a_caller_error_not_a_server_fault(monkeypatch):
     """A `criteria` list containing a list/dict label is the caller's mistake, so it must be 422.
 

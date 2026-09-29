@@ -407,7 +407,11 @@ if _empty_label is not None:
 # the same questions through the public entry point, not only the method under it
 router = Router()
 router.attach("english", agent)
-for label, qdef in (("choice without criteria", {"type": "choice", "instructions": "x"}),):
+for label, qdef in (
+    ("choice without criteria", {"type": "choice", "instructions": "x"}),
+    ("list type", {"type": [], "instructions": "Is it spam?"}),
+    ("dict type", {"type": {}, "instructions": "Is it spam?"}),
+):
     try:
         router.predict(STATE, {"q": qdef}, model="english")
         FAIL.append("rejected/router %s: no error raised" % label)
@@ -425,6 +429,22 @@ except ValueError as e:
     check_true("rejected/second question names it", "'broken'" in str(e), str(e))
 except Exception as e:
     FAIL.append("rejected/second question: %s instead of ValueError: %s" % (type(e).__name__, e))
+
+# A malformed type must name the question and the allowed values, including when it is second.
+# Lists and dicts used to fail in the type lookup with a bare "unhashable type" TypeError (#707).
+for bad_type in ([], ["noul"], {}, {"name": "noul"}, None, 7, True, "bogus"):
+    name = "rejected/question type %r" % (bad_type,)
+    try:
+        agent.system_one(STATE, {
+            "ok": {"type": "noul", "instructions": "Is it urgent?"},
+            "refund": {"type": bad_type, "instructions": "Is a refund requested?"},
+        })
+        FAIL.append("%s: no error raised" % name)
+    except ValueError as e:
+        check(name, str(e), "question 'refund': unknown type %r; use one of ['choice', 'noul', 'score']"
+              % (bad_type,))
+    except Exception as e:
+        FAIL.append("%s: %s instead of ValueError: %s" % (name, type(e).__name__, e))
 
 # ...and the shapes that are valid still answer, so this is not validation-only coverage
 GOOD = {
