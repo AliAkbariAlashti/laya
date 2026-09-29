@@ -97,6 +97,15 @@ check("project/false noul",
                       {"type": "object", "properties": {"x": {"type": "boolean"}}})["x"],
       False)
 
+# A score answer with no `probabilities` -- a cached/replayed decision, or a minimal runner
+# that only reports the expected level index -- must still add `minimum`: `score` is the
+# 0-based level index (DecisionModel._decode_answers), not the absolute field value, so a
+# schema whose levels do not start at 0 must not be projected as if they did.
+SEVERITY_SCHEMA = {"type": "object", "properties": {"x": {"type": "integer", "minimum": 3, "maximum": 7}}}
+for score, want in ((0, 3), (2.4, 5), (4, 7)):
+    got = answers_to_json({"x": {"type": "score", "score": score}}, SEVERITY_SCHEMA)["x"]
+    check("project/score with no probabilities honours minimum (score=%r)" % score, got, want)
+
 
 # --------------------------------------------------------------- rejections
 def _bad(schema):
