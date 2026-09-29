@@ -103,6 +103,10 @@ def build_parser():
     parser.add_argument("--batch-size", type=int, default=None, metavar="N",
                         help="states per forward pass in --batch mode; the default sends each "
                              "routed group in one pass")
+    parser.add_argument("--sort-by-length", action="store_true", dest="sort_by_length",
+                        help="with --batch-size N where 1 < N < the number of requests, group "
+                             "similarly sized states into the same forward pass so each pads to a "
+                             "shorter maximum; fewer padded tokens, same answers in input order")
     return parser
 
 
@@ -259,7 +263,20 @@ def run_batch(lines, args, router=None):
             overrides.update(budget_overrides(args))
             requests = [{"state": {key: line}, "questions": questions, **overrides}
                         for line in lines]
-            results = router.predict_batch(requests, batch_size=args.batch_size)
+            kwargs = {"batch_size": args.batch_size}
+            if args.sort_by_length:
+                # Sent only when asked for, as Router.predict_batch itself forwards it: a stub or
+                # an attached agent that predates the knob keeps working for every run that does
+                # not request it.
+                kwargs["sort_by_length"] = True
+                chunk = args.batch_size if args.batch_size and args.batch_size > 0 else len(lines)
+                if not 1 < chunk < len(lines):
+                    # Core documents this as a no-op rather than an error, so the shell says why
+                    # the run was not reordered instead of printing a silent same-speed result.
+                    print("note: --sort-by-length only takes effect with --batch-size N where "
+                          "1 < N < %d; the states still go in one forward pass" % len(lines),
+                          file=sys.stderr)
+            results = router.predict_batch(requests, **kwargs)
             for line, result in zip(lines, results):
                 if args.json:
                     print(json.dumps(result, ensure_ascii=False, default=str))

@@ -231,8 +231,8 @@ class BatchRouter:
         self.predict_batch_calls = []
         self.route_batch_calls = []
 
-    def predict_batch(self, requests, batch_size=None):
-        self.predict_batch_calls.append((requests, batch_size))
+    def predict_batch(self, requests, batch_size=None, **extra):
+        self.predict_batch_calls.append((requests, batch_size, extra))
         return [{"model": "laya-rl", "answers": {"difficulty": {"score": float(i)}}, "usage": {}}
                 for i in range(len(requests))]
 
@@ -267,12 +267,13 @@ with open(path, "w", encoding="utf-8") as handle:
 
 code, out, err, stub = run_batch_cli(["--batch", path, "--predict", "--batch-size", "8"])
 check("batch predict: exit code", code == 0, "got %r %s" % (code, err))
-requests, batch_size = stub.predict_batch_calls[0]
+requests, batch_size, extra = stub.predict_batch_calls[0]
 check("batch predict: exactly one predict_batch call", len(stub.predict_batch_calls) == 1)
 check("batch predict: blank lines skipped, lines stripped",
       [r["state"]["request"] for r in requests] == ["first ticket", "second ticket"],
       str([r["state"] for r in requests]))
 check("batch predict: --batch-size forwarded", batch_size == 8, str(batch_size))
+check("batch predict: no grouping key is sent unless asked for", extra == {}, str(extra))
 check("batch predict: router questions on every request",
       sorted(requests[0]["questions"]) == sorted(cli.PRESETS["router"]()),
       str(sorted(requests[0]["questions"])))
@@ -323,6 +324,79 @@ finally:
 check("batch -: reads stdin", code == 0
       and len(stub.predict_batch_calls[0][0]) == 2
       and len([l for l in out.splitlines() if l.strip()]) == 2, "code %r err %r" % (code, err))
+
+# ------------------------------------------------------------- --sort-by-length (#294 knob)
+#
+# `Agent.predict_batch` and `Router.predict_batch` have grouped similarly sized states into one
+# forward pass since #294, README teaches it as the library call, and `research/` reports 2.15x on
+# 10,000 tickets from it. `laya --batch` could set `--batch-size` but not the grouping that makes a
+# bounded pass cheap, so the one knob with a measurable effect on the other knob was reachable only
+# by writing Python. These run the real parser and the real `run_batch` over a recording router.
+import inspect as _inspect  # noqa: E402
+
+from laya.router import Router as _CoreRouter  # noqa: E402
+
+many = os.path.join(tmp, "four.txt")
+with open(many, "w", encoding="utf-8") as handle:
+    handle.write("one\ntwo\nthree\nfour\n")
+
+check("sort: --sort-by-length reaches the parser",
+      cli.build_parser().parse_args(["t", "--sort-by-length"]).sort_by_length is True)
+check("sort: it is off by default",
+      cli.build_parser().parse_args(["t"]).sort_by_length is False)
+# The flag is named after the parameter it drives, and core is the only place that decides the
+# name: a rename there has to fail here instead of silently dropping the grouping again.
+check("sort: the flag names a real Router.predict_batch parameter",
+      "sort_by_length" in _inspect.signature(_CoreRouter.predict_batch).parameters,
+      str(list(_inspect.signature(_CoreRouter.predict_batch).parameters)))
+
+code, out, err, stub = run_batch_cli(["--batch", many, "--predict", "--batch-size", "2",
+                                      "--sort-by-length"])
+requests, batch_size, extra = stub.predict_batch_calls[0]
+check("sort: batch size and grouping both reach predict_batch",
+      code == 0 and batch_size == 2 and extra == {"sort_by_length": True},
+      "code %r batch_size %r extra %r" % (code, batch_size, extra))
+check("sort: a grouping that can take effect is not annotated", err == "", err)
+check("sort: answers still print once per state", out.count("difficulty") == 4, out)
+
+code, out, err, stub = run_batch_cli(["--batch", many, "--predict", "--sort-by-length"])
+check("sort: asked for without --batch-size, it is still forwarded as core takes it",
+      code == 0 and stub.predict_batch_calls[0][2] == {"sort_by_length": True},
+      str(stub.predict_batch_calls[0][2]))
+check("sort: and the shell says a single pass cannot reorder",
+      "1 < N < 4" in err, "err %r" % err)
+
+code, out, err, stub = run_batch_cli(["--batch", many, "--predict", "--batch-size", "4",
+                                      "--sort-by-length"])
+check("sort: a pass as wide as the batch cannot reorder either",
+      code == 0 and "1 < N < 4" in err and stub.predict_batch_calls[0][2] == {
+          "sort_by_length": True}, "err %r" % err)
+
+code, out, err, stub = run_batch_cli(["--batch", many, "--sort-by-length"])
+check("sort: batch routing is untouched by a forward-pass knob",
+      code == 0 and stub.predict_batch_calls == [] and len(stub.route_batch_calls) == 1,
+      "predict=%r route=%r" % (stub.predict_batch_calls, len(stub.route_batch_calls)))
+
+# A flag nobody can find is a flag nobody uses. README is where `laya --batch` and `/predict/batch`
+# are taught, so the same pages that teach `--batch-size` have to teach the grouping that makes a
+# bounded pass cheap -- including the condition it needs, since a run without it changes nothing.
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+with open(os.path.join(_ROOT, "README.md"), encoding="utf-8") as handle:
+    readme = handle.read()
+
+
+def section(heading):
+    return readme.split(heading, 1)[1].split("\n## ", 1)[0]
+
+
+cli_page = section("### Command line")
+check("sort: the page that teaches `laya --batch` teaches the grouping and its condition",
+      "--batch-size" in cli_page and "--sort-by-length" in cli_page and "1 < N <" in cli_page,
+      repr(cli_page[:120]))
+server_page = section("## Try it locally: web GUI + JSON API")
+check("sort: the server page teaches both body fields",
+      "/predict/batch" in server_page and "batch_size" in server_page
+      and "sort_by_length" in server_page, repr(server_page[:120]))
 
 # --------------------------------------------------------------------- --questions FILE
 # The CLI could only ever answer the five built-in presets, while the library's whole input is a

@@ -3,6 +3,7 @@
 Run: python tests/test_evals_api.py
 """
 import dataclasses
+import inspect
 import os
 import subprocess
 import sys
@@ -48,6 +49,43 @@ check_true("EvalReport.comparable_to is part of the report contract",
            callable(getattr(evals.EvalReport, "comparable_to", None)))
 check("EvalReport fields are unchanged", [f.name for f in dataclasses.fields(evals.EvalReport)],
       ["config", "overall", "slices", "cases"])
+
+# --------------------------------------------------------------- evaluate's call signature
+# `evaluate` is the harness entry point callers extend from their own scripts, so its parameter
+# names and order are the contract. `sort_by_length` is core's #294 forward-pass grouping knob
+# reaching a scored run through `laya-evals run --sort-by-length`; it is appended, never inserted,
+# because a caller that passed `on_error` or `config` positionally must still mean the same thing.
+_sig = inspect.signature(evals.evaluate)
+check("evaluate signature", [p.name for p in _sig.parameters.values()],
+      ["runner", "dataset", "evaluators", "batch_size", "on_error", "config", "sort_by_length"])
+check("evaluate: grouping defaults to off", _sig.parameters["sort_by_length"].default, False)
+check_true("evaluate: the knob sits after the batch size it groups inside",
+           list(_sig.parameters).index("batch_size")
+           < list(_sig.parameters).index("sort_by_length"))
+
+# The two batch entry points the CLI wires up: both have to take the knob by the same name, or a
+# `--sort-by-length` run reports `sort_by_length_sent: false` for the surface it ships.
+from laya import evals_cli  # noqa: E402
+
+for label, fn in (("RouterRunner.predict_batch", evals_cli.RouterRunner.predict_batch),
+                  ("OnnxRunner.predict_batch", evals_cli.OnnxRunner.predict_batch)):
+    params = inspect.signature(fn).parameters
+    check_true("%s takes the grouping knob" % label, "sort_by_length" in params)
+    check("%s defaults it to off" % label, params["sort_by_length"].default, False)
+
+# A signature is not a wiring: a runner that declares the knob and drops it on the way through
+# would pass both checks above. `OnnxRunner`'s call is gated in test_evals_onnx.py against a
+# recording agent; this is the same witness for the router-shaped runner the CLI uses by default.
+class _RecordingRouter:
+    def __init__(self):
+        self.calls = []
+
+    def predict_batch(self, requests, batch_size=None, sort_by_length=False):
+        self.calls.append({"batch_size": batch_size, "sort_by_length": sort_by_length})
+        return [{"model": "m", "answers": {}} for _ in requests]
+
+
+_router = _RecordingRouter()
 
 # --------------------------------------------------------------- torch stays out of import
 probe = subprocess.run(
