@@ -132,6 +132,10 @@ export interface RouterOptions {
   revision?: string | null;
   /** Per-model revision overrides, keyed by model name or alias. */
   revisions?: Record<string, string | null>;
+  /** Per-model artifact SHA-256 digest maps, keyed by model name or alias. */
+  sha256Digests?: Record<string, Record<string, string> | null> | null;
+  /** Python-parity snake_case alias for `sha256Digests`. */
+  sha256_digests?: Record<string, Record<string, string> | null> | null;
   hooks?: HookArg;
   onPredictStart?: PredictHook;
   onPredictEnd?: PredictHook;
@@ -147,6 +151,47 @@ export interface RouteOptions {
   hooks?: HookArg;
   hooksRaise?: boolean;
 }
+
+/** Turn `LAYA_SHA256_DIGESTS` into per-checkpoint digest maps when it names models. */
+export function digestsFromEnv(
+  models: Record<string, unknown>,
+): Record<string, Record<string, string> | null> {
+  if (typeof process === "undefined" || !process.env) return {};
+  const raw = (process.env["LAYA_SHA256_DIGESTS"] ?? "").trim();
+  if (!raw) return {};
+  let data: unknown;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    return {};
+  }
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return {};
+  const entries = Object.entries(data);
+  if (entries.length === 0) return {};
+  const values = entries.map(([, v]) => v);
+  if (values.every((v) => typeof v === "string")) {
+    return {}; // flat: providers already applies it
+  }
+  if (!values.every((v) => typeof v === "object" && v !== null && !Array.isArray(v))) {
+    throw new Error(
+      `LAYA_SHA256_DIGESTS must be either {artifact: digest} for every checkpoint or {model: {artifact: digest}} per checkpoint; ${JSON.stringify(Object.keys(data).sort())} mixes the two or holds a value that is neither`,
+    );
+  }
+  const perModel: Record<string, Record<string, string> | null> = {};
+  for (const [k, v] of entries) {
+    perModel[normaliseName(k)] = v as Record<string, string>;
+  }
+  for (const name of Object.keys(models)) {
+    const norm = normaliseName(name);
+    if (!(norm in perModel)) {
+      perModel[norm] = {};
+    }
+  }
+  return perModel;
+}
+
+export const _digestsFromEnv = digestsFromEnv;
+export const _digests_from_env = digestsFromEnv;
 
 function toSpec(spec: string | ModelSpec | [string, string | null]): ModelSpec {
   if (typeof spec === "string") return { repo: spec, subfolder: null };
@@ -168,6 +213,10 @@ export class Router extends HookRegistry {
   token: string | null | undefined;
   revision: string | null;
   revisions: Partial<Record<ModelName, string | null>>;
+  sha256Digests: Record<string, Record<string, string> | null>;
+  get sha256_digests(): Record<string, Record<string, string> | null> {
+    return this.sha256Digests;
+  }
   maxLoaded: number;
   default: ModelName;
   autoTaskDetection: boolean;
@@ -200,6 +249,17 @@ export class Router extends HookRegistry {
     this.revisions = Object.fromEntries(
       Object.entries(opts.revisions ?? {}).map(([name, value]) => [normaliseName(name), value]),
     ) as Partial<Record<ModelName, string | null>>;
+    // Per checkpoint SHA-256 map: seeded from a model-named LAYA_SHA256_DIGESTS, then
+    // overridden checkpoint by checkpoint by the argument. Keyed and normalised exactly like
+    // revisions, so a misspelled model name fails here rather than leaving that checkpoint
+    // unverified.
+    this.sha256Digests = digestsFromEnv(this.models);
+    const rawDigests = opts.sha256Digests ?? opts.sha256_digests;
+    if (rawDigests) {
+      for (const [name, val] of Object.entries(rawDigests)) {
+        this.sha256Digests[normaliseName(name)] = val;
+      }
+    }
     this.maxLoaded = Math.max(1, Math.trunc(Number(opts.maxLoaded ?? opts.max_loaded ?? 2)));
     this.default = normaliseName(opts.default ?? "english");
     this.autoTaskDetection = Boolean(opts.autoTaskDetection ?? opts.auto_task_detection ?? false);
@@ -237,6 +297,9 @@ export class Router extends HookRegistry {
           token: this.token ?? undefined,
         };
         if (revision) opts.revision = revision;
+        if (Object.prototype.hasOwnProperty.call(this.sha256Digests, key)) {
+          opts.expectedSha256 = this.sha256Digests[key] ?? {};
+        }
         agent = await (Agent as unknown as {
           load(repo: string, opts?: Record<string, unknown>): Promise<unknown>;
         }).load(spec.repo, opts);
