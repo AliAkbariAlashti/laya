@@ -15,6 +15,33 @@ describe("email+presets", () => {
     expect(out).toContain("Please refund my order");
     expect(out).not.toContain("iPhone");
   });
+  it("cuts extended device footers (Python parity)", () => {
+    const request = "Please refund my order";
+    for (const footer of [
+      "Sent from my iPhone 15 Pro",
+      "Sent from my Android phone",
+      "Sent from my iPad Pro",
+      "Sent from my iPhone using Tapatalk",
+      "Sent from my iPhone device",
+      "Sent from my iPhone Max",
+      "Sent from my iPhone mini",
+      "Sent from my iPhone Plus",
+    ]) {
+      expect(cleanEmailBody(`${request}\n\n${footer}`), footer).toBe(request);
+    }
+  });
+  it("keeps device mentions inside the request (Python parity)", () => {
+    for (const sentence of [
+      "Sent from my iPhone by mistake.",
+      "Sent from my iPad yesterday.",
+      "Sent from my Android by mistake.",
+      "Sent from my mobile yesterday.",
+      "Sent from my iPhone using Tapatalk to report a problem.",
+    ]) {
+      const body = `Hi support,\n${sentence}\nPlease cancel the duplicate order.`;
+      expect(cleanEmailBody(body), sentence).toBe(body);
+    }
+  });
   it("keeps a closing sentence that is not a sign-off (Python parity)", () => {
     const body = "Please review the draft when you can.\nIt is two pages.\nThanks for the quick reply.";
     expect(cleanEmailBody(body)).toBe(body);

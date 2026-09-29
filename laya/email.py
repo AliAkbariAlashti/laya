@@ -89,7 +89,6 @@ _SIGNATURE_MARKERS = [
     # follow is judged in `_is_english_signoff` above, a callable because `re` cannot express its
     # rule. `Regards, Łukasz` is a sign-off, `Thanks for the reply` is not.
     _is_english_signoff,
-    re.compile(r"^\s*sent from my (iphone|android|mobile|ipad)", re.I),
     # Portuguese/Spanish sign-offs match only on their own: "Obrigado pelo retorno, mas ..." is a
     # request, not a signature, so unlike the English marker no trailing words are allowed
     re.compile(
@@ -102,11 +101,12 @@ _SIGNATURE_MARKERS = [
 # Mobile and mail-app footers. Only a line that is nothing *but* the footer matches -- "Enviado do meu
 # celular o comprovante ontem." is a request -- and such a line may run to 60 characters, since
 # Samsung's default ("Enviado do meu smartphone Samsung Galaxy.") is longer than a sign-off's 40.
-_DEVICE = (r"iphone|ipad|android|ios|celular|telemóvel|móvil|galaxy|smartphone|samsung|tablet|"
+_DEVICE = (r"iphone|ipad|android|ios|mobile|celular|telemóvel|móvil|galaxy|smartphone|samsung|tablet|"
            r"outlook|yahoo|mail|e-?mail|gmail|windows")
 _DEVICE_FOOTER = re.compile(
     r"^\s*((enviad[oa] (do|pelo|pela|via|desde|a partir do)( meu| minha| mi)?|sent from( my)?)"
-    r" (%s)( (%s|para|for|no|na|\d+))*|(obter o|get) outlook (para|for) (ios|android))[\s.!]*$"
+    r" (%s)( (%s|para|for|no|na|\d+|phone|device|pro|max|mini|plus|using [a-z][a-z0-9_.+-]*))*"
+    r"|(obter o|get) outlook (para|for) (ios|android))[\s.!]*$"
     % (_DEVICE, _DEVICE),
     re.I,
 )
