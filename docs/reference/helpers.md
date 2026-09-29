@@ -50,6 +50,12 @@
 
 ::: laya.common.ece_score
 
+::: laya.calibrate.fit_temperatures
+
+::: laya.calibrate.fit_one_temperature
+
+::: laya.calibrate.fit_temperature_map
+
 ::: laya.common.render_options
 
 ::: laya.common.proper_reward

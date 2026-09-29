@@ -12,6 +12,12 @@ import numpy as np
 import torch
 
 from ._compile import compile_model, independent_dims
+from .calibrate import (
+    _install_temperatures,
+    apply_calibration_payload,
+    calibration_payload,
+    fit_temperature_map,
+)
 from .common import (
     QTYPES,
     TEMP_MAX,
@@ -253,6 +259,13 @@ def _with_start_probe(hook_kwargs, probe):
     kwargs = dict(hook_kwargs)
     kwargs["on_predict_start"] = list(_as_sequence(hook_kwargs.get("on_predict_start"))) + [probe]
     return kwargs
+def _option_logits(logits, items, offset):
+    """Raw per-option logits, the rows `_decode_answers` divides by temperature.
+
+    Calibration record collection slices with this same helper, so a fitted map sees the
+    option width the decoder scales and not a second tokenization of the state.
+    """
+    return [logits[offset + j, : len(item["markers"])] for j, item in enumerate(items)]
 
 
 class Agent(HookRegistry):
@@ -296,6 +309,7 @@ class Agent(HookRegistry):
         hooks_raise: bool = True,
         hooks_concurrent: bool = True,
         hooks_timeout: Optional[float] = None,
+        calibration: Optional[str] = None,
     ):
         """Load a Laya checkpoint.
 
@@ -319,6 +333,10 @@ class Agent(HookRegistry):
         `Agent("convaiinnovations/laya", subfolder="multilingual")`. Only that subfolder is
         downloaded, so bundling does not cost every user the whole family.
 
+        `calibration` is an optional JSON path with `temperature` and `temperature_by_options`.
+        It is applied after the checkpoint config, so a fitted map overrides shipped scalars
+        without rewriting `model.safetensors`.
+
         `hooks` / `on_predict_start` / `on_predict_end` observe or shape every prediction; see
         `laya.hooks`. `hooks_raise=False` warns and continues when a hook fails,
         `hooks_concurrent=False` serialises hooks that are not safe to run in parallel, and
@@ -331,6 +349,9 @@ class Agent(HookRegistry):
         self._hooks_lock = threading.RLock() if not hooks_concurrent else None
         self._hooks_mutex = threading.Lock()
         self.model_id = model_id_or_path
+        # Retained so `save_calibration` can record which checkpoint the map was fitted for.
+        self.model_id_or_path = model_id_or_path
+        self.subfolder = subfolder
 
         from safetensors.torch import load_file
 
@@ -486,6 +507,8 @@ class Agent(HookRegistry):
                 "using %s. Treat confidence from the affected entries as uncalibrated."
                 % (TEMP_MIN, TEMP_MAX, ", ".join(rejected)),
                 RuntimeWarning, stacklevel=2)
+        if calibration:
+            self.load_calibration(calibration)
         # Autocast policy. CUDA, MPS and XPU all support fp16/bf16 autocast and the shipped
         # checkpoints are trained in reduced precision; on CUDA the checkpoint's `amp_dtype`
         # (bf16) is the default and LAYA_CUDA_AMP=fp16|bf16 overrides it. CPU bf16 is only a win
@@ -870,6 +893,7 @@ class Agent(HookRegistry):
                         internal: Dict[str, Dict], offset: int, lang: Optional[str] = None) -> Dict[str, Any]:
         """Turn one state's logit rows (starting at `offset`) into typed answers."""
         answers = {}
+        raw_rows = _option_logits(logits, items, offset)
         for j, qid in enumerate(ids):
             r = offset + j
             q = internal[qid]
@@ -879,7 +903,7 @@ class Agent(HookRegistry):
             if lang and lang.split("-")[0].lower() in self.lang_temperatures:
                 l_cfg = self.lang_temperatures[lang.split("-")[0].lower()]
                 t_scale = l_cfg["temperature_by_options"].get(temp_bucket(qt, k), l_cfg["temperature"][qt])
-            z = logits[r, :k] / t_scale
+            z = raw_rows[j] / t_scale
             p = np.exp(z - z.max())
             p = p / p.sum()
 
@@ -1376,6 +1400,44 @@ class Agent(HookRegistry):
 
     predict = system_one
 
+    def fit_temperatures(self, records, compute_ece: bool = False, seed: int = 0) -> Dict[str, Any]:
+        """Fit per-bucket temperatures from CPU records and store them on this agent.
+
+        `records` are `(qtype, logits, target, k)`. Build them with
+        `laya.calibrate.records_from_labeled` when you have labeled forwards; this method
+        does not download weights or write `model.safetensors`. `seed` only affects the
+        held-out ECE split when `compute_ece` is true. The checkpoint `cfg` is left as loaded.
+        """
+        result = fit_temperature_map(records, compute_ece=compute_ece, seed=seed)
+        # Already clamped inside the fitter; don't report that as a bad calibration file.
+        _install_temperatures(self, result["temperature"], result["temperature_by_options"], warn=False)
+        return result
+
+    def save_calibration(self, path: str) -> None:
+        """Write temperatures and the checkpoint they were fitted for. Does not write weights."""
+        payload = calibration_payload(
+            self.temperature,
+            self.temperature_by_options,
+            model_id_or_path=getattr(self, "model_id_or_path", None),
+            subfolder=getattr(self, "subfolder", None),
+            config=getattr(self, "cfg", None),
+        )
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2)
+            f.write("\n")
+
+    def load_calibration(self, path: str) -> None:
+        """Read a JSON map written by `save_calibration` onto this agent.
+
+        A file with no `version` is treated as version 1 and still loads. A newer file
+        whose recorded checkpoint does not match this agent warns and still loads.
+        Values that are not numbers, or that sit outside `[TEMP_MIN, TEMP_MAX]`, are clamped
+        with `clamp_temperature` the same way checkpoint load is.
+        """
+        with open(path) as f:
+            payload = json.load(f)
+        apply_calibration_payload(self, payload)
+
 
 RLAgent = Agent
 
@@ -1387,7 +1449,8 @@ def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str]
          lang_temperatures: Optional[Dict[str, Dict[str, Any]]] = None,
          hooks=None, on_predict_start=None, on_predict_end=None,
          hooks_raise: bool = True, hooks_concurrent: bool = True,
-         hooks_timeout: Optional[float] = None) -> Agent:
+         hooks_timeout: Optional[float] = None,
+         calibration: Optional[str] = None) -> Agent:
     """Load a Laya agent.
 
     `subfolder` picks one checkpoint out of a repo that bundles several:
@@ -1399,7 +1462,7 @@ def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str]
 
     `revision`/`expected_sha256` pin and verify the downloaded artifacts; see `Agent`.
     `hooks` / `on_predict_start` / `on_predict_end` observe or shape every prediction; see
-    `laya.hooks`.
+    `laya.hooks`. `calibration` is the same optional JSON path accepted by `Agent`.
     """
     return Agent(model_id_or_path, device=device, token=token, subfolder=subfolder, fast=fast,
                  compile=compile,
@@ -1407,4 +1470,4 @@ def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str]
                  lang_temperatures=lang_temperatures,
                  hooks=hooks, on_predict_start=on_predict_start, on_predict_end=on_predict_end,
                  hooks_raise=hooks_raise, hooks_concurrent=hooks_concurrent,
-                 hooks_timeout=hooks_timeout)
+                 hooks_timeout=hooks_timeout, calibration=calibration)
