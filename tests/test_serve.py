@@ -3,6 +3,7 @@
 A fake Router is injected so nothing loads a checkpoint; we only assert that the
 HTTP layer maps requests/responses and enforces auth as hs-jev expects.
 """
+import inspect
 import json
 import logging
 import os
@@ -18,6 +19,8 @@ from fastapi.testclient import TestClient  # noqa: E402
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 from laya.serve import (  # noqa: E402
+    BODY_CONTROLS,
+    BODY_REFUSALS,
     DEFAULT_MAX_TOKEN_BUDGET,
     MAX_BODY_BYTES,
     MAX_STATE_CHARS,
@@ -1538,3 +1541,209 @@ def test_the_probe_walks_exact_container_types_only():
     exact = len(json.dumps(state, ensure_ascii=False))
     assert serve_mod._state_length_lower_bound_over(state, serve_mod.MAX_STATE_CHARS) == 0
     assert serve_mod._state_length(state) == exact == 13
+
+# --------------------------------------------------------------------- per-call controls
+#
+# `Router.predict` takes nine arguments beyond `state` and `questions` that a JSON body could
+# state. `laya/serve.py` splits them into the two lists the tests below read, and the first test
+# pins those lists against core's own signature: a control added to `predict` cannot be silently
+# ignored by the HTTP surface, because it has to be placed on one side of that line first.
+
+NEW_CONTROLS = ("task", "lang", "lang_guess", "min_confidence")
+NEW_CONTROL_VALUES = {"task": "typed-decisions", "lang": "de", "lang_guess": "de",
+                      "min_confidence": 0.9}
+
+
+def test_every_predict_control_is_forwarded_or_refused():
+    """`BODY_CONTROLS` and `BODY_REFUSALS` must cover `Router.predict` exactly, both directions."""
+    from laya.router import Router
+
+    taken = set(inspect.signature(Router.predict).parameters) - {"self", "state", "questions"}
+    declared = set(BODY_CONTROLS) | set(BODY_REFUSALS)
+    assert not set(BODY_CONTROLS) & set(BODY_REFUSALS)
+    assert taken == declared, "predict() takes %s; serve declares %s" % (
+        sorted(taken), sorted(declared))
+
+
+@pytest.mark.parametrize("key", NEW_CONTROLS)
+def test_each_control_reaches_predict(monkeypatch, key):
+    client, fake = _budget_client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, key: NEW_CONTROL_VALUES[key]})
+    assert r.status_code == 200, r.text
+    assert fake.calls[0][key] == NEW_CONTROL_VALUES[key]
+
+
+def test_unset_controls_are_not_sent_as_none(monkeypatch):
+    """An absent control must stay absent rather than be forwarded as `None`.
+
+    Core reads `None` as "inherit what the Router was built with", so sending `lang_guess=None`
+    would override a deployment's `Router(lang_guess=...)`. It would also 500 on any router whose
+    `predict` does not take the keyword -- the `FakeRouter` this suite has always used.
+    """
+    client, fake = _budget_client(monkeypatch)
+    assert client.post("/v1/systemone", json=REQ).status_code == 200
+    assert not [key for key in NEW_CONTROLS if key in fake.calls[0]]
+
+
+@pytest.mark.parametrize("key", NEW_CONTROLS)
+def test_explicit_null_is_no_control(monkeypatch, key):
+    client, fake = _budget_client(monkeypatch)
+    assert client.post("/v1/systemone", json={**REQ, key: None}).status_code == 200
+    assert not [name for name in NEW_CONTROLS if name in fake.calls[0]]
+
+
+def test_min_confidence_zero_is_still_a_threshold(monkeypatch):
+    """`0.0` is falsy but is a value the caller chose; `if min_confidence:` would drop it."""
+    client, fake = _budget_client(monkeypatch)
+    assert client.post("/v1/systemone", json={**REQ, "min_confidence": 0.0}).status_code == 200
+    assert fake.calls[0]["min_confidence"] == 0.0
+
+
+@pytest.mark.parametrize("key", ["lang", "lang_guess"])
+@pytest.mark.parametrize("value", [True, 5, ["de"], {"code": "de"}])
+def test_a_language_control_must_be_a_code_string(monkeypatch, key, value):
+    """`Router` stringifies a language hint, so `true` becomes the code `"true"`.
+
+    That is a real, non-English code, so the JSON boolean would decide the checkpoint. A callable
+    hint -- core's other accepted form -- cannot cross an HTTP body either, which leaves the code
+    string as the only form to accept here.
+    """
+    client, fake = _budget_client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, key: value})
+    assert r.status_code == 422, r.text
+    assert "must be a language code string" in r.json()["detail"]
+    assert not fake.calls, "a refused request must not run inference"
+
+
+@pytest.mark.parametrize("value", [1.5, -0.1, True, "0.9"])
+def test_min_confidence_is_validated_by_core(monkeypatch, value):
+    """The bounds belong to `laya.confidence`, so serve must report core's own message.
+
+    Comparing against the `ValueError` core raises for the same value is what keeps the accepted
+    range from drifting: a restated `[0.0, 1.0]` check here would pass CI on the day core widened
+    it and start rejecting requests the abstention gate would have honoured.
+    """
+    from laya.confidence import check_min_confidence
+
+    try:
+        check_min_confidence(value)
+    except ValueError as error:
+        expected = str(error)
+    else:
+        raise AssertionError("core accepted %r; this probe needs a rejecting value" % (value,))
+
+    client, fake = _budget_client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, "min_confidence": value})
+    assert r.status_code == 422, r.text
+    assert r.json()["detail"] == expected
+    assert not fake.calls
+
+
+def test_an_infinite_threshold_is_refused_by_core(monkeypatch):
+    """JSON writes no NaN, but a number literal can parse to infinity.
+
+    `check_min_confidence` tests `math.isfinite` for exactly this. A range check written here would
+    happen to reject it too, and then keep passing on the day core's rule changed -- so the request
+    is sent as raw bytes: Python cannot serialise an infinity back to JSON, and `1e999` is what a
+    client that never round-tripped through Python would actually put on the wire.
+    """
+    client, fake = _budget_client(monkeypatch)
+    raw = (json.dumps(REQ)[:-1] + ', "min_confidence": 1e999}').encode("utf-8")
+    r = client.post("/v1/systemone", content=raw,
+                    headers={"Content-Type": "application/json"})
+    assert r.status_code == 422, r.text
+    assert "min_confidence must be a float in [0.0, 1.0]" in r.json()["detail"]
+    assert not fake.calls
+
+
+def test_an_unknown_task_gets_cores_answer_not_a_500(monkeypatch):
+    """`task` is forwarded verbatim, as the CLI forwards `--task`, and core names the valid set.
+
+    `route()` normalises a task through `normalise_name`, whose `ValueError` the existing mapping
+    reports as a 422 carrying its message. Listing the accepted tasks in `serve` instead would be
+    a second registry to keep in step -- the failure mode #544 and #638 removed elsewhere.
+    """
+    from laya.router import normalise_name
+
+    class RoutingRouter(BudgetRouter):
+        def predict(self, state, questions, model=None, **kwargs):
+            if "task" in kwargs:
+                normalise_name(kwargs["task"])  # core's guard, called exactly as route() calls it
+            return super().predict(state, questions, model=model, **kwargs)
+
+    monkeypatch.delenv("LAYA_API_KEY", raising=False)
+    client = TestClient(create_app(router=RoutingRouter()), raise_server_exceptions=False)
+
+    r = client.post("/v1/systemone", json={**REQ, "task": "not-a-task"})
+    assert r.status_code == 422, r.text
+    assert "unknown model" in r.json()["detail"]
+
+    ok = client.post("/v1/systemone", json={**REQ, "task": "typed-decisions"})
+    assert ok.status_code == 200, ok.text
+
+
+@pytest.mark.parametrize("key", BODY_REFUSALS)
+def test_a_hook_control_is_refused_not_dropped(monkeypatch, key):
+    """All five used to be read into the body and ignored, so a client got a silent no.
+
+    `laya.integrations.langchain::_reject_remote_hooks` already refuses the same five on a node
+    with a `base_url`, on the grounds that a hook runs in the server's process. The endpoint now
+    says that itself instead of answering as though the control had been honoured.
+    """
+    value = {"hooks": [], "on_predict_start": "cache", "on_predict_end": "audit",
+             "hooks_raise": False, "hooks_timeout": 5.0}[key]
+    client, fake = _budget_client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, key: value})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert key in detail
+    assert "cannot be sent to this endpoint" in detail
+    assert not fake.calls, "the refusal must come before inference"
+
+
+def test_a_refusal_names_every_hook_control_sent(monkeypatch):
+    client, fake = _budget_client(monkeypatch)
+    r = client.post("/v1/systemone", json={**REQ, "hooks_raise": True, "hooks_timeout": 5.0})
+    assert r.status_code == 422, r.text
+    detail = r.json()["detail"]
+    assert "hooks_raise" in detail and "hooks_timeout" in detail
+    assert not fake.calls
+
+
+@pytest.mark.parametrize("key", BODY_REFUSALS)
+def test_a_null_hook_control_is_not_a_refusal(monkeypatch, key):
+    """`{"hooks": null}` means "no per-call hooks", which is what core reads as inherit.
+
+    A Jev client that serialises its absent fields must keep working; only a value says the caller
+    asked for something this endpoint cannot do.
+    """
+    client, fake = _budget_client(monkeypatch)
+    assert client.post("/v1/systemone", json={**REQ, key: None}).status_code == 200
+
+
+def test_http_api_page_documents_exactly_the_forwarded_controls():
+    """The request-body table and the code must not drift apart in either direction.
+
+    Read back out of the markdown rather than substring-matched: a row this parse cannot see is a
+    field the documentation stopped describing, and a documented field with no code behind it is
+    the same lie in the other direction. The five refusals have to be named where the page says
+    why they are refused, so the reason travels with the field list.
+    """
+    path = os.path.join(ROOT, "docs", "http-api.md")
+    with open(path, encoding="utf-8") as handle:
+        lines = handle.read().splitlines()
+
+    header = lines.index("| field | required | meaning |")
+    rows = []
+    for line in lines[header + 2:]:
+        if not line.strip():
+            break
+        rows.append(line.split("|")[1].strip().strip("`"))
+    documented = set(rows) - {"state", "questions"}
+    assert documented == set(BODY_CONTROLS), "table says %s, serve forwards %s" % (
+        sorted(documented), sorted(BODY_CONTROLS))
+
+    page = "\n".join(lines)
+    prose = page[page.index("`model`, `task`, `lang`, `lang_guess`"):]
+    for key in BODY_REFUSALS:
+        assert "`%s`" % key in prose, "%s is not named where the refusal is explained" % key

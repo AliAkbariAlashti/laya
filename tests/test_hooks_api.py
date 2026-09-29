@@ -822,6 +822,24 @@ for path, name, anchor in BUDGET[1:]:
          (None, _widest.head_max_len, _widest.max_len, None, _raised.head_max_len))
 
 
+# --------------------------------------------------------------- the HTTP boundary
+# A hook is a callable that runs inside `predict`, so it cannot cross `/v1/systemone`. The
+# LangChain node refuses the five client-side (`_reject_remote_hooks`) and the packaged server
+# refuses them server-side. Those must stay the same five: if the server's list gained an argument
+# or dropped one, a chain step and a raw HTTP client would get different answers for one request
+# body -- and a caller that was told "no" on one path would be ignored on the other.
+from laya.integrations.langchain import _hook_kwargs as _lc_hook_kwargs  # noqa: E402
+from laya.serve import BODY_CONTROLS as _http_controls, BODY_REFUSALS as _http_refusals  # noqa: E402
+
+check("serve/BODY_REFUSALS is the hook argument set LangChain refuses", sorted(_http_refusals),
+      sorted(_lc_hook_kwargs(hooks=[object()], on_predict_start=object(),
+                             on_predict_end=object(), hooks_raise=False, hooks_timeout=1.0)))
+# A list that grew past hooks would refuse something a body can legitimately state.
+check("serve/BODY_REFUSALS names nothing but hooks",
+      [key for key in _http_refusals if "hook" not in key and "predict" not in key], [])
+check("serve forwards and refuses disjoint sets", sorted(set(_http_controls) & set(_http_refusals)), [])
+
+
 print("\n%d passed, %d failed" % (len(PASS), len(FAIL)))
 for f in FAIL:
     print("  FAIL", f)

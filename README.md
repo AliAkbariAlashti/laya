@@ -567,7 +567,11 @@ reachable on demand, or the server rebuilds one every time routing switches),
 and `LAYA_API_KEY` (when set, clients must
 send `Authorization: Bearer <key>`). A client's `model` field is honoured when it
 names a Laya checkpoint (`english`/`multilingual`/`typed-decisions`), otherwise
-the router auto-selects by script/language.
+the router auto-selects by script/language. The same body can also carry `task`,
+`lang`, `lang_guess`, `min_confidence`, `max_len` and `head_max_len` — the controls
+`Router.predict` takes that a JSON body can state — while the five hook arguments
+(`hooks`, `on_predict_start`, `on_predict_end`, `hooks_raise`, `hooks_timeout`) are refused
+with 422, because a hook is a callable that has to live where the server runs.
 
 When publishing the server under a reverse-proxy prefix such as `/laya`, set
 `LAYA_ROOT_PATH=/laya`. The proxy should strip that prefix before forwarding;
