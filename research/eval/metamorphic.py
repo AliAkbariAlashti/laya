@@ -235,6 +235,70 @@ def _evaluate_generated(cases, generated_by_case, score, gold_indices, batch_siz
     return {"report": _report(records), "cases": records}
 
 
+def auroc(scores, labels):
+    """Chance that a random correct case scores above a random wrong one.
+
+    Ties count half. Returns None unless both correct and wrong cases exist.
+    """
+    pairs = sorted(zip(scores, labels), key=lambda pair: pair[0])
+    ranks, start = [0.0] * len(pairs), 0
+    while start < len(pairs):
+        end = start
+        while end + 1 < len(pairs) and pairs[end + 1][0] == pairs[start][0]:
+            end += 1
+        for i in range(start, end + 1):
+            ranks[i] = (start + end) / 2 + 1
+        start = end + 1
+    positives = sum(1 for _, label in pairs if label)
+    negatives = len(pairs) - positives
+    if not positives or not negatives:
+        return None
+    rank_sum = sum(rank for rank, (_, label) in zip(ranks, pairs) if label)
+    return (rank_sum - positives * (positives + 1) / 2) / (positives * negatives)
+
+
+def selective_prediction(records, coverages=(0.5, 0.7, 0.8, 0.9)):
+    """Whether disagreement under the transforms predicts which baseline answers are wrong.
+
+    Per labelled case, with w the baseline winner:
+      confidence          baseline probability of w
+      agreement_<kind>    1 if the <kind> variant(s) also pick w, else the share that do
+      support_<kind>      mean probability the <kind> variant(s) give w
+      support_all         mean probability of w over the baseline and every variant
+    Reports AUROC per signal and, for the continuous signals, the accuracy of the
+    most-trusted fraction of cases at each coverage (ties broken by case order).
+    """
+    rows = []
+    for record in records:
+        baseline, variants = record["variants"][0], record["variants"][1:]
+        if baseline.get("correct") is None:
+            continue
+        winner = baseline["pred_index"]
+        row = {"correct": bool(baseline["correct"]), "confidence": baseline["probabilities"][winner]}
+        for kind in dict.fromkeys(v["kind"] for v in variants):
+            same = [v for v in variants if v["kind"] == kind]
+            row["agreement_" + kind] = sum(v["pred_index"] == winner for v in same) / len(same)
+            row["support_" + kind] = sum(v["probabilities"][winner] for v in same) / len(same)
+        row["support_all"] = sum(v["probabilities"][winner] for v in record["variants"]) / len(record["variants"])
+        rows.append(row)
+    wrong = sum(not r["correct"] for r in rows)
+    if not rows:
+        return {"n_labelled": 0}
+    signals = [key for key in rows[0] if key != "correct" and all(key in r for r in rows)]
+    labels = [r["correct"] for r in rows]
+    result = {"n_labelled": len(rows), "n_wrong": wrong,
+              "auroc": {key: auroc([r[key] for r in rows], labels) for key in signals},
+              "accuracy_at_coverage": {}}
+    for key in signals:
+        if key.startswith("agreement_"):
+            continue  # near-binary: the coverage cut would mostly depend on tie order
+        ranked = sorted(range(len(rows)), key=lambda i: -rows[i][key])
+        result["accuracy_at_coverage"][key] = {
+            str(c): sum(rows[i]["correct"] for i in ranked[:max(1, round(len(rows) * c))])
+            / max(1, round(len(rows) * c)) for c in coverages}
+    return result
+
+
 def _report(records):
     groups = {"option_order": [], "label_rename": []}
     for record in records:
@@ -254,6 +318,7 @@ def _report(records):
                            ece=harness.ece([v["confidence"] for v in labelled],
                                            [v["correct"] for v in labelled]))
         report["quality"][kind] = quality
+    report["selective_prediction"] = selective_prediction(records)
     return report
 
 

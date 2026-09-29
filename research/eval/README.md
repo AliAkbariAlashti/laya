@@ -392,3 +392,33 @@ For offline tests, pass `agent=None, score=fake_scorer` to `evaluate_variants`. 
 
 **Semantic agreement and distribution stability are different properties.**
 A shift from `[0.91, 0.06, 0.03]` to `[0.88, 0.08, 0.04]` preserves the decision while showing nonzero drift. Switching the winner is reported as disagreement, regardless of whether confidence rises or falls. No metric here automatically classifies either observation as a bug; acceptable variation depends on the use case, and the report deliberately defines no universal pass/fail threshold.
+
+### Selective prediction: does disagreement predict errors?
+
+Robustness agreement is not a correctness measure, but on labelled cases it can be tested as a *signal* of correctness: are the baseline answers that change under a transform more often wrong? When gold indices are given, the report adds a `selective_prediction` section computed per labelled case from the baseline winner `w`:
+
+| Signal | Definition |
+|---|---|
+| `confidence` | Baseline probability of `w` (the harness's maximum probability) |
+| `agreement_<kind>` | Share of the `<kind>` variants whose canonical argmax is also `w` |
+| `support_<kind>` | Mean probability the `<kind>` variants give `w` |
+| `support_all` | Mean probability of `w` over the baseline and every variant |
+
+`<kind>` is each transform present (`option_order`, `label_rename`). For every signal, `auroc` is the probability that a random correct case scores above a random wrong one (ties count half; `null` unless both correct and wrong cases exist). For the continuous signals, `accuracy_at_coverage` is the accuracy of the highest-scoring fraction of cases at 50, 70, 80 and 90% coverage; `agreement_*` is left out there because with one variant per kind it is binary, and the cut would depend on tie order. `n_labelled` and `n_wrong` give the sample size; unlabelled runs report `n_labelled: 0` only.
+
+This measures whether a signal ranks errors below correct answers; it does not set a threshold. Consistently wrong predictions stay invisible to every `agreement_*` and `support_*` signal. With one variant per kind, `agreement_*` is coarse; the `support_*` signals use the full probability vectors.
+
+#### Measured
+
+MASSIVE `en`, `--per-lang 300 --n-opts 20`, seed 13, laya 0.3.21, CPU (65 wrong answers). Differences vs `confidence` are bootstrap 95% intervals over cases (2,000 resamples):
+
+| Signal | AUROC | vs `confidence` |
+|---|---:|---:|
+| `confidence` | 0.827 | |
+| `support_all` | 0.877 | +0.050 (+0.010 to +0.096) |
+| `support_label_rename` | 0.866 | +0.039 (−0.018 to +0.094) |
+| `support_option_order` | 0.805 | −0.023 (−0.066 to +0.018) |
+| `agreement_label_rename` | 0.744 | −0.084 (−0.155 to −0.010) |
+| `agreement_option_order` | 0.678 | |
+
+With one variant per transform, only `support_all` clearly ranks errors below correct answers better than `confidence`; the binary `agreement_*` signals rank them worse. Keeping the top 70% of cases gives 93.3% accuracy by `support_all` and 91.0% by `confidence`.

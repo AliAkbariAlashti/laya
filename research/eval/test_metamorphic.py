@@ -246,5 +246,54 @@ class EvaluationTests(unittest.TestCase):
         self.assertEqual(payload["config"]["temperature"], [1.0] * 3)
 
 
+class SelectivePredictionTests(unittest.TestCase):
+    def test_auroc_known_values(self):
+        self.assertEqual(m.auroc([0.9, 0.8, 0.2, 0.1], [True, True, False, False]), 1)
+        self.assertEqual(m.auroc([0.1, 0.2, 0.8, 0.9], [True, True, False, False]), 0)
+        self.assertEqual(m.auroc([0.5, 0.5, 0.5, 0.5], [True, False, True, False]), 0.5)
+        self.assertAlmostEqual(m.auroc([0.9, 0.4, 0.6, 0.1], [True, True, False, False]), 0.75)
+        self.assertIsNone(m.auroc([0.9, 0.8], [True, True]))
+        self.assertIsNone(m.auroc([], []))
+
+    def test_disagreement_flags_confident_errors(self):
+        # "stable" cases follow the descriptions and are right at 0.7. "fragile"
+        # cases follow the label tokens and are wrong at 0.9; renaming moves their
+        # winner. Confidence ranks the errors on top; agreement under renaming
+        # ranks them at the bottom. Reordering keeps keys with their descriptions,
+        # so it cannot tell the two apart here.
+        stable = ({"utterance": "stable"}, deepcopy(CASE[1]))
+        fragile = ({"utterance": "fragile"}, deepcopy(CASE[1]))
+        label_weights = {"billing": 0.9, "technical": 0.05, "sales": 0.05, "A": 0.2, "B": 0.6, "C": 0.2}
+
+        def score(cases):
+            out = []
+            for state, questions in cases:
+                if state["utterance"] == "stable":
+                    out.extend(semantic_scorer([(state, questions)]))
+                else:
+                    out.append([label_weights[k] for k in questions["intent"]["criteria"]])
+            return out
+
+        report = m.evaluate([stable, stable, fragile, fragile], score, [0, 0, 1, 1])["report"]
+        sp = report["selective_prediction"]
+        self.assertEqual((sp["n_labelled"], sp["n_wrong"]), (4, 2))
+        self.assertEqual(sp["auroc"]["confidence"], 0)
+        self.assertEqual(sp["auroc"]["agreement_label_rename"], 1)
+        self.assertEqual(sp["auroc"]["support_label_rename"], 1)
+        self.assertEqual(sp["auroc"]["agreement_option_order"], 0.5)
+        self.assertEqual(sp["auroc"]["support_all"], 1)
+        self.assertEqual(sp["accuracy_at_coverage"]["confidence"]["0.5"], 0)
+        self.assertEqual(sp["accuracy_at_coverage"]["support_all"]["0.5"], 1)
+        self.assertNotIn("agreement_label_rename", sp["accuracy_at_coverage"])
+
+    def test_unlabelled_or_one_class(self):
+        report = m.evaluate([CASE], semantic_scorer)["report"]
+        self.assertEqual(report["selective_prediction"], {"n_labelled": 0})
+        sp = m.evaluate([CASE, CASE], semantic_scorer, [0, 0])["report"]["selective_prediction"]
+        self.assertEqual((sp["n_labelled"], sp["n_wrong"]), (2, 0))
+        self.assertIsNone(sp["auroc"]["confidence"])
+        self.assertEqual(sp["accuracy_at_coverage"]["confidence"]["0.5"], 1)
+
+
 if __name__ == "__main__":
     unittest.main()
