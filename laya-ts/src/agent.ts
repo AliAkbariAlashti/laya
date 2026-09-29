@@ -305,8 +305,13 @@ export class Agent extends HookRegistry {
     this.tok = opts.tok ?? defaultTokenizer();
     const raw = (cfg.temperature ?? [1.0, 1.0, 1.0]) as unknown;
     this.temperatureRaw = raw;
-    const rawList = Array.isArray(raw) ? raw : [raw, raw, raw];
-    this.temperature = [0, 1, 2].map((i) => clampTemperature(rawList[i] ?? 1.0));
+    // The decode indexes this by question type, so refuse any other shape here, as Python's
+    // Agent.__init__ does (#502): a short list silently fell back to 1.0 per missing type.
+    if (!Array.isArray(raw) || raw.length !== 3) {
+      throw new Error(`Incompatible model: temperature must be a list of 3 floats, got ${JSON.stringify(raw)}`);
+    }
+    const rawList: unknown[] = raw;
+    this.temperature = rawList.map((t) => clampTemperature(t));
     this.temperatureByOptionsRaw = (cfg.temperature_by_options ?? {}) as Record<string, unknown>;
     this.temperatureByOptions = Object.fromEntries(
       Object.entries(this.temperatureByOptionsRaw).map(([k, v]) => [k, clampTemperature(v)]),
@@ -316,7 +321,7 @@ export class Agent extends HookRegistry {
         ([k, v]) => [k, v, this.temperatureByOptions[k]] as [string, unknown, number],
       ),
       ...[0, 1, 2].map(
-        (i) => [`temperature[${i}]`, rawList[i] ?? 1.0, this.temperature[i]] as [string, unknown, number],
+        (i) => [`temperature[${i}]`, rawList[i], this.temperature[i]] as [string, unknown, number],
       ),
     ];
     const rejected: string[] = [];
