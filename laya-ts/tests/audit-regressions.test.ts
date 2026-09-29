@@ -145,6 +145,14 @@ describe("audit regressions", () => {
     expect(() => checkQuestion("q", { type: "choice", instructions: "?", criteria: { a: null, b: null } })).not.toThrow();
   });
 
+  it("rejects choice labels that share an answer key, as Python does (#496)", () => {
+    const check = (criteria: unknown[]) => () => checkQuestion("q", { type: "choice", instructions: "?", criteria });
+    expect(check(["a", "b", "a"])).toThrow('question "q": choice label 2 ("a") repeats label 0');
+    expect(check([1, "1"])).toThrow("choice label 1 (\"1\") repeats label 0");
+    expect(check([true, "true"])).toThrow("repeats label 0");
+    expect(check(["a", "A", 1, 2, true, false])).not.toThrow();
+  });
+
   it("rejects malformed provider output", async () => {
     const agent = new Agent({ provider: {
       async runEncoder(_batch: any) { return { lastHidden: [[[0, 0]]] }; },

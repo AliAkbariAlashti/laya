@@ -191,6 +191,21 @@ export function checkQuestion(qid: string, qdef: unknown): void {
             `bool), got ${JSON.stringify(label)}`,
         );
       }
+      // toInternal turns the list into an object, so each label's String() is its answer key;
+      // two labels on one key would silently drop an option. Python rejects them (#496).
+      const seen = new Map<string, number>();
+      crit.forEach((label: unknown, i) => {
+        const key = String(label);
+        const first = seen.get(key);
+        if (first === undefined) {
+          seen.set(key, i);
+          return;
+        }
+        throw new Error(
+          `question ${qidStr(qid)}: choice label ${i} (${JSON.stringify(label)}) repeats label ${first}; the ` +
+            `labels are the answer keys, so every option needs its own (1 and "1" are one key)`,
+        );
+      });
     }
   } else if (t === "score") {
     if (!Array.isArray(crit)) {
