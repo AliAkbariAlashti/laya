@@ -83,6 +83,16 @@ describe("lang_temperatures", () => {
     ).toThrow('Language override "de" temperature must be a list of 3 floats');
   });
 
+  it("rejects a base temperature that is not a list of 3 floats, as Python does (#502)", () => {
+    for (const temperature of [[1, 1], [1, 1, 1, 1], 2, "1"]) {
+      expect(() => new Agent({ provider: fakeProvider(), temperature } as any)).toThrow(
+        "Incompatible model: temperature must be a list of 3 floats",
+      );
+    }
+    expect(() => new Agent({ provider: fakeProvider(), cfg: { temperature: [1, 2] } } as any)).toThrow("list of 3");
+    expect(new Agent({ provider: fakeProvider(), temperature: [1, 2, 3] } as any).temperature).toEqual([1, 2, 3]);
+  });
+
   it("a null entry is an empty override (base raw temperature, no buckets)", async () => {
     const a = new Agent({
       provider: fakeProvider(),
