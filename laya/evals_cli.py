@@ -348,8 +348,17 @@ def _cmd_run(args) -> int:
 
 
 def _cmd_compare(args) -> int:
-    report = evals.EvalReport(**{k: v for k, v in _load_report(args.report).items()
-                                 if k in ("config", "overall", "slices", "cases")})
+    # `_identity_of` rather than a bare `config` slice, because a report may carry its identity
+    # at the top level -- `research/evals/act_head_eval.py` puts `schema` there -- and
+    # `EvalReport.comparable_to` reads the candidate's identity out of `config`. Filtering to the
+    # four known keys dropped a top-level `schema` before the report was built, so a candidate
+    # that disagreed with its baseline passed the gate while the same disagreement stated in
+    # `config` was refused. The baseline has always gone through `_identity_of`; this makes the
+    # candidate side symmetric.
+    document = _load_report(args.report)
+    report = evals.EvalReport(
+        config=evals._identity_of(document),
+        **{k: v for k, v in document.items() if k in ("overall", "slices", "cases")})
     baseline = _load_report(args.baseline)
     ok, deltas = report.compare(baseline, _parse_pairs(args.tolerance))
     _print_deltas(deltas)

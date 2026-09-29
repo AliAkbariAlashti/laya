@@ -126,7 +126,13 @@ class Dataset:
 
 
 def _canonical(value: Any) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    # `sort_keys=False` on purpose. `examples/hooks/cache.py:22-25` states the rule this mirrors:
+    # "Deliberately not `sort_keys=True`: a choice question's criteria order is positional, so two
+    # orders are two questions, and `_question_schema` in `laya/router.py` keeps them apart for the
+    # same reason." `sort_keys` reorders *dict* keys and leaves *lists* alone, so with a list-valued
+    # `criteria` -- the shape a dataset row actually has -- this was already order-preserving; the
+    # flag only ever mattered for a dict-valued one, where folding is the wrong direction.
+    return json.dumps(value, sort_keys=False, separators=(",", ":"), ensure_ascii=False,
                       default=str)
 
 
@@ -170,6 +176,12 @@ def questions_fingerprint(dataset: "Dataset") -> str:
     rewrites. That is deliberate and asymmetric: two `noul` questions that render alike but are
     written differently would then be refused, which is the safe direction to be wrong in.
     Normalizing them would widen the change past what the identity needs.
+
+    `labels` is hashed for the same reason `instructions` is: it is validated
+    (`laya/agent.py:722-726` -> `_resolve_noul_labels`) and carried into the internal question
+    (`laya/agent.py:748-749`), and `_resolve_noul_labels` (`laya/common.py:92`) turns it into the
+    option text the model reads. Leaving it out let two question sets with different rendered
+    options hash alike, which is the one thing this function exists to prevent.
     """
     schemas = set()
     for example in dataset.examples:
@@ -177,6 +189,7 @@ def questions_fingerprint(dataset: "Dataset") -> str:
             body = question if isinstance(question, dict) else {}
             schemas.add(_canonical({"qid": qid, "type": body.get("type"),
                                     "instructions": _as_tokenized_instructions(body),
+                                    "labels": body.get("labels"),
                                     "criteria": body.get("criteria")}))
     digest = hashlib.sha256()
     for schema in sorted(schemas):

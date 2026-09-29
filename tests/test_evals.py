@@ -970,6 +970,84 @@ def test_cli_compare_refuses_two_different_runs(tmp_path, capsys):
     assert "diff=" in captured.out and "choice_accuracy" in captured.out
 
 
+def test_questions_fingerprint_covers_labels():
+    """`labels` decides the option text, so it belongs in the key.
+
+    The same argument `test_questions_fingerprint_covers_the_instructions` makes for
+    `instructions`. `labels` is validated (`laya/agent.py:722-726` -> `_resolve_noul_labels`),
+    carried into the internal question (`laya/agent.py:748-749`), and resolved into the option
+    text the model actually reads (`laya/common.py:92`). Two question sets differing only in
+    `labels` therefore ask the model different things, and hashing them alike let the gate pass
+    a comparison it exists to refuse.
+    """
+    def with_labels(labels):
+        q = {"verdict": {"type": "noul", "instructions": "Is this a refund?"}}
+        if labels is not None:
+            q["verdict"]["labels"] = labels
+        return Dataset([Example("s", q, {"verdict": "true"})])
+
+    default = evals.questions_fingerprint(with_labels(None))
+    custom = evals.questions_fingerprint(with_labels(
+        {"false": "denied: no money was requested",
+         "true": "approved: the customer asked for money back"}))
+    assert custom != default, "a change in `labels` left the fingerprint unchanged"
+    # And the change is real: these are not two spellings of one thing.
+    from laya.common import _resolve_noul_labels
+    assert _resolve_noul_labels() != _resolve_noul_labels(
+        {"false": "denied: no money was requested",
+         "true": "approved: the customer asked for money back"})
+
+
+def test_questions_fingerprint_keeps_criteria_order():
+    """A choice question's criteria order is positional, so two orders are two questions.
+
+    `examples/hooks/cache.py:22-25` states the rule and `Router._question_schema`
+    (`laya/router.py:141`) applies it with `sort_keys=False`. Worth pinning here for the dict
+    form: `json.dumps(sort_keys=True)` reorders *dict keys* and leaves *lists* alone, so a
+    list-valued `criteria` -- the shape a dataset row has -- was already safe. The flag only
+    mattered for a dict-valued one, where folding is the wrong direction to be wrong in.
+    """
+    def with_criteria(criteria):
+        q = {"pick": {"type": "choice", "instructions": "Pick one", "criteria": criteria}}
+        return Dataset([Example("s", q, {"pick": "a"})])
+
+    assert evals.questions_fingerprint(with_criteria(["alpha", "beta"])) != \
+        evals.questions_fingerprint(with_criteria(["beta", "alpha"]))
+    assert evals.questions_fingerprint(with_criteria({"a": "alpha", "b": "beta"})) != \
+        evals.questions_fingerprint(with_criteria({"b": "beta", "a": "alpha"}))
+
+
+def test_a_top_level_schema_on_the_candidate_still_refuses(tmp_path, capsys):
+    """The identity fallback is two-sided.
+
+    `_identity_of` reads a report's identity from `config` *or* the top level, and its own comment
+    says why: `research/evals/act_head_eval.py` puts `schema` there. But `comparable_to` applied
+    it to the baseline only -- the candidate's identity came from `self.config`, and
+    `laya/evals_cli.py` had already dropped a top-level `schema` when it built the `EvalReport`.
+    So the *same* disagreement was refused when the candidate stated it in `config` and passed
+    when it stated it at the top level.
+    """
+    from laya import evals_cli
+
+    def write(name, doc):
+        (tmp_path / name).write_text(json.dumps(doc), encoding="utf-8")
+        return str(tmp_path / name)
+
+    shared = {"overall": {"choice_accuracy": 0.8}, "cases": [], "slices": {}}
+    baseline = write("b.json", dict(shared, schema="act-head-eval/2"))
+
+    # Same mismatch, candidate states it in `config` -- refused.
+    assert evals_cli.main(["compare", write("in_config.json", dict(
+        shared, config={"schema": "act-head-eval/1"})), "--baseline", baseline]) == 1
+    capsys.readouterr()
+
+    # Candidate states it at the top level -- must refuse too, not pass.
+    assert evals_cli.main(["compare", write("top_level.json", dict(
+        shared, schema="act-head-eval/1")), "--baseline", baseline]) == 1
+    err = capsys.readouterr().err
+    assert "schema" in err
+
+
 # ------------------------------------------------------------------ CLI run
 # One score row inside 0.25 of its label, one 0.3 away (inside 0.5 but not 0.25), plus a choice and
 # an noul row so every default metric is in the report too.
