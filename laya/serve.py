@@ -86,6 +86,17 @@ _PUBLISHED_MODEL_IDS = {
     "convaiinnovations/laya-typed-decisions": "typed-decisions",
 }
 
+# Every control ``Router.predict`` takes beyond ``state`` and ``questions``, split by whether a
+# JSON body can mean it. ``tests/test_serve.py`` pins the two lists against
+# ``inspect.signature(Router.predict)``, so a control added to the core call has to be placed on
+# one side of that line -- forwarded or refused -- before the suite goes green again. The line is
+# not drawn by value type: a hook is a callable that runs in the server process, and
+# ``hooks_raise`` / ``hooks_timeout`` govern how the hooks the *operator* installed execute, so
+# none of those five has a meaning a request could give it. Which checkpoint answers, which
+# language it reads, how many tokens it gets and where it abstains are all plain data.
+BODY_CONTROLS = ("model", "max_len", "head_max_len", "task", "lang", "lang_guess", "min_confidence")
+BODY_REFUSALS = ("hooks", "on_predict_start", "on_predict_end", "hooks_raise", "hooks_timeout")
+
 
 def _env_bool(name: str, default: bool) -> bool:
     v = os.environ.get(name)
@@ -160,6 +171,65 @@ def _validate_budget_param(body: Dict[str, Any], key: str, max_cap: int) -> Opti
             detail="%s exceeds server limit (%d > %d)" % (key, val, max_cap),
         )
     return val
+
+
+def _refuse_body_refusals(body: Dict[str, Any]) -> None:
+    """Reject a request that sends one of ``BODY_REFUSALS`` (422) instead of ignoring it.
+
+    A hook is a callable that runs inside ``predict`` -- it can cache a decision, gate one or
+    rewrite its state -- and ``laya-serve`` has no way to receive or run one, which is why
+    ``laya.integrations.langchain`` already refuses them on a node with a ``base_url``
+    (``_reject_remote_hooks``). ``hooks_raise`` and ``hooks_timeout`` belong with them: they say
+    how the hooks the deployment installed execute, so honouring a caller's value would let a
+    request change server-side behaviour. Today all five are read into the body and dropped, so a
+    client that asks for one is told nothing.
+    """
+    from fastapi import HTTPException
+
+    given = sorted(key for key in BODY_REFUSALS if key in body and body[key] is not None)
+    if given:
+        raise HTTPException(
+            status_code=422,
+            detail="%s run inside the server process and cannot be sent to this endpoint; "
+                   "install them where laya-serve runs, or drop them" % ", ".join(given))
+
+
+def _validate_language_param(body: Dict[str, Any], key: str) -> Optional[str]:
+    """Return a ``lang`` / ``lang_guess`` value, requiring the code-string form (422).
+
+    ``Router`` reads both through ``_english_from_code``, which stringifies its input, so a JSON
+    ``true`` would become the code ``"true"`` -- a real, non-English one -- and decide the
+    checkpoint. A callable hint, the other form core accepts, cannot cross an HTTP body. Explicit
+    ``null`` stays "no hint", which is what lets a deployment's ``Router(lang_guess=...)`` answer.
+    """
+    from fastapi import HTTPException
+
+    val = body.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise HTTPException(status_code=422,
+                            detail='%s must be a language code string such as "de", or null' % key)
+    return val
+
+
+def _validate_min_confidence(body: Dict[str, Any]) -> Optional[float]:
+    """Round-trip the body's ``min_confidence`` through core's validator, reporting its 422.
+
+    Validation happens here rather than inside ``predict`` so a bad threshold is refused before the
+    request takes an inference slot, and through ``laya.confidence`` rather than a copy of its
+    bounds so the accepted range cannot drift from what the abstention gate itself enforces.
+    """
+    from fastapi import HTTPException
+
+    if body.get("min_confidence") is None:
+        return None
+    from .confidence import check_min_confidence
+
+    try:
+        return check_min_confidence(body["min_confidence"])
+    except ValueError as error:
+        raise HTTPException(status_code=422, detail=str(error)) from None
 
 
 def _resolve_max_loaded() -> Optional[int]:
@@ -466,15 +536,31 @@ def create_app(router: Optional[Any] = None):
         state = body.get("state")
         questions = body["questions"]
         _check_request_limits(state, questions)
+        _refuse_body_refusals(body)
         model = _resolve_model(body.get("model"))
         max_budget_cap = _resolve_max_token_budget()
         max_len = _validate_budget_param(body, "max_len", max_budget_cap)
         head_max_len = _validate_budget_param(body, "head_max_len", max_budget_cap)
+        # Each control is sent only when the client sent it: core reads an absent argument as
+        # "inherit what the Router was built with", so passing None would override a deployment's
+        # own `Router(lang_guess=...)` or abstention threshold with the server's default.
         predict_kwargs = {}
         if max_len is not None:
             predict_kwargs["max_len"] = max_len
         if head_max_len is not None:
             predict_kwargs["head_max_len"] = head_max_len
+        # An unknown task is left to `route`, which normalises it through `normalise_name` and
+        # raises; the `except ValueError` below turns that into a 422 naming the task, so the
+        # accepted set is core's and not a list restated here.
+        if body.get("task") is not None:
+            predict_kwargs["task"] = body["task"]
+        for key in ("lang", "lang_guess"):
+            value = _validate_language_param(body, key)
+            if value is not None:
+                predict_kwargs[key] = value
+        min_confidence = _validate_min_confidence(body)
+        if min_confidence is not None:
+            predict_kwargs["min_confidence"] = min_confidence
         if gate is None:
             gate = asyncio.Lock()
         try:
