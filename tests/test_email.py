@@ -475,6 +475,41 @@ check(
     clean_email_body("%s\n\n%s" % (BODY, "Regards, Jose\u0301")),
     BODY,
 )
+# ...in every script, not only the Latin one. `\u0300-\u036f` is the Latin combining block
+# alone, so a name carrying a mark from any other script -- a Devanagari virama, an Arabic
+# shadda, a Hebrew point, a Thai tone mark -- failed the tail and the signature stayed in the
+# body. The port's `\p{M}` covers every mark, which is what these names need.
+for label, tail in [
+    ("devanagari", "Thanks, \u0928\u092e\u0938\u094d\u0924\u0947"),
+    ("devanagari name", "Thanks, \u0930\u0935\u093f"),
+    ("arabic", "Thanks, \u0645\u062d\u0645\u0651\u062f"),
+    ("hebrew", "Regards, \u05e9\u05c1\u05dc\u05d5\u05dd"),
+    ("thai", "Thanks, \u0e2a\u0e38\u0e0a\u0e32\u0e15\u0e34\u0e4c"),
+    ("bengali", "Thanks, \u0985\u09ae\u09bf\u09a4"),
+    ("tamil", "Thanks, \u0bb5\u0bc6\u0bb3\u0bcd\u0bb3\u0bbf"),
+]:
+    check("signoff cut/mark beyond latin-1, " + label,
+          clean_email_body("%s\n\n%s" % (BODY, tail)), BODY)
+
+# ...and a mark with no base is left where it is. Stripping one that opens the tail, or that
+# follows a space, would join the tokens around it and cut a line the port keeps: `laya-ts`
+# requires each token's first character to be `\p{Lu}\p{Lt}\p{Lo}`, which a leading mark fails.
+# ZWJ and ZWNJ are `Cf` rather than `M`, so they are untouched here and in the port alike.
+for label, body in [
+    ("mark after a space", "Hi,\n\nPlease refund invoice 4411.\nThanks, Jose \u0301Smith"),
+    ("mark opening the name", "Hi,\n\nPlease refund invoice 4411.\nThanks, \u0301Jose"),
+    ("mark standing alone", "Hi,\n\nPlease refund invoice 4411.\nThanks, \u0301 Jose"),
+    ("zwnj is not a mark", "Hi,\n\nPlease refund invoice 4411.\nThanks, \u0915\u094d\u200c\u0937"),
+]:
+    check("signoff kept/" + label, clean_email_body(body), body)
+
+# ...and dropping the marks must not turn a lowercase name into one: the letter a mark rides on
+# is what the case rule asks about, so a marked lowercase name is still not a sign-off.
+for label, body in [
+    ("greek lowercase, accented", "Hi,\n\nPlease refund invoice 4411.\nThanks, \u03b1\u0301\u03bb\u03c6\u03b1"),
+    ("latin lowercase, decomposed", "Hi,\n\nPlease refund invoice 4411.\nThanks, jose\u0301"),
+]:
+    check("signoff kept/" + label, clean_email_body(body), body)
 
 
 # ------------------------------------------------- the word, without the disclaimer
