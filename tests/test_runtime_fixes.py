@@ -18,7 +18,7 @@ import torch.nn as nn
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from laya.agent import MPS_AMP_MIN_ROWS_DEFAULT, Agent, _amp_context, _cuda_amp_dtype, _mps_amp_min_rows  # noqa: E402
+from laya.agent import MPS_AMP_MIN_ROWS_DEFAULT, Agent, _InferenceRWLock, _amp_context, _cuda_amp_dtype, _mps_amp_min_rows  # noqa: E402
 from laya.common import DecisionModel, build_sequence, serialize_state  # noqa: E402
 
 PASS, FAIL = [], []
@@ -295,7 +295,7 @@ check("oom-fallback/second OOM counts too", oom.cpu_fallback_count, 2)
 
 
 class ConcurrentOOMModel(ImmovableModel):
-    """Make an in-flight GPU call fail if another call reaches the shared model."""
+    """Make concurrent GPU calls hit OOM so fallback serialization can be exercised."""
 
     def __init__(self):
         self.active = 0
@@ -313,8 +313,6 @@ class ConcurrentOOMModel(ImmovableModel):
             self.first_gpu_started.set()
             self.release_first.wait(2)
         try:
-            if concurrent_call:
-                raise RuntimeError("Expected all tensors to be on the same device, cuda:0 and cpu")
             if self.placed == "cuda":
                 raise RuntimeError("CUDA out of memory. Tried to allocate 2.00 GiB")
             return torch.zeros((1, 2)), torch.zeros((1, 2))
@@ -326,7 +324,7 @@ class ConcurrentOOMModel(ImmovableModel):
 race_model = ConcurrentOOMModel()
 race_agent = _bare_agent(race_model, dtype=torch.float16)
 race_agent.device = torch.device("cuda")
-race_agent._infer_lock = threading.RLock()
+race_agent._infer_lock = _InferenceRWLock()
 
 
 class DeviceAgnosticInput:
